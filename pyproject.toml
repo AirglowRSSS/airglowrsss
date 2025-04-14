@@ -34,4 +34,4 @@ exclude=["dagster_airglow_tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["dagster_airglow_tests"]
-norecursedirs = ["dagster_airglow_tests/integration_tests"]
+norecursedirs = ["tests/integration_tests"]

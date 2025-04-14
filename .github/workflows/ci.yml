@@ -37,7 +37,8 @@ jobs:
 
     - name: Test with pytest
       run: |
-        pytest
+        PYTHONPATH=src pytest tests
+
 
     - name: Extract branch name
       shell: bash
