@@ -140,8 +140,9 @@ def upload_results(context: dg.AssetExecutionContext,
 )
 def analyze_data_x(context: dg.AssetExecutionContext,
                    unzip_chunked_archive: dict[str, str],
-                   s3: S3ResourceNCSA) -> str:
-    return analyze_data(context, unzip_chunked_archive, "X", s3)
+                   s3: S3ResourceNCSA,
+                   mysql: MySQLResource) -> str:
+    return analyze_data(context, unzip_chunked_archive, "X", s3, mysql)
 
 
 @dg.asset(
@@ -150,8 +151,9 @@ def analyze_data_x(context: dg.AssetExecutionContext,
 )
 def analyze_data_xr(context: dg.AssetExecutionContext,
                     unzip_chunked_archive: dict[str, str],
-                    s3: S3ResourceNCSA) -> str:
-    return analyze_data(context, unzip_chunked_archive, "XR", s3)
+                    s3: S3ResourceNCSA,
+                    mysql: MySQLResource) -> str:
+    return analyze_data(context, unzip_chunked_archive, "XR", s3, mysql)
 
 
 @dg.asset(
@@ -160,8 +162,9 @@ def analyze_data_xr(context: dg.AssetExecutionContext,
 )
 def analyze_data_xg(context: dg.AssetExecutionContext,
                     unzip_chunked_archive: dict[str, str],
-                    s3: S3ResourceNCSA) -> str:
-    return analyze_data(context, unzip_chunked_archive, "XG", s3)
+                    s3: S3ResourceNCSA,
+                    mysql: MySQLResource) -> str:
+    return analyze_data(context, unzip_chunked_archive, "XG", s3, mysql)
 
 
 def analyze_data(context: dg.AssetExecutionContext,
