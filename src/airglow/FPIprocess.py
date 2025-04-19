@@ -7,8 +7,6 @@ from dagster_mysql import MySQLResource
 
 import airglow.FPI as FPI
 import glob
-#from lmfit import Parameters
-#from optparse import OptionParser
 import datetime
 import numpy as np
 import os
@@ -981,15 +979,6 @@ def process_instr(instr_name ,year, doy,
         plt.close(fig)
 
     if send_to_website:
-        import configparser
-        import pymysql
-        pymysql.install_as_MySQLdb()
-        # Then your existing code will work:
-        import MySQLdb as mdb
-        from sshtunnel import SSHTunnelForwarder
-        import paramiko
-        from scp import SCPClient
-
         site_id = site['sql_id']
         utc = pytz.utc # Define timezones
 
@@ -1104,8 +1093,6 @@ def process_site(site_name, year, doy, reference='laser'):
     for instr_name in instr_names:
         print('Starting (%s, %s, %s, %s, reference=%s)' % (instr_name, site_name, year, doy, reference))
         process_instr(instr_name, year, doy, reference)
-
-
 
 
 
