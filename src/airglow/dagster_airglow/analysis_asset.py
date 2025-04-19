@@ -168,8 +168,7 @@ def analyze_data(context: dg.AssetExecutionContext,
                  unzip_chunked_archive: dict[str, str],
                  sky_line_tag: str,
                  s3: S3ResourceNCSA,
-                 mysql: MySQLResource
-) -> str:
+                 mysql: MySQLResource) -> str:
     """
     Analyze the data and return the analysis result.
     :param context: The asset execution context.
