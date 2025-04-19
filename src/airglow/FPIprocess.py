@@ -3,6 +3,7 @@
 
 #import matplotlib
 #matplotlib.use('AGG')
+from dagster_mysql import MySQLResource
 
 import airglow.FPI as FPI
 import glob
@@ -252,7 +253,9 @@ def get_all_sky_images(direc,sky_line_tag='X'):
 
 
 
-def process_instr(instr_name ,year, doy, reference='laser', sky_line_tag='X', use_npz = False,
+def process_instr(instr_name ,year, doy,
+                  mysql:MySQLResource,
+                  reference='laser', sky_line_tag='X', use_npz = False,
                   wind_err_thresh=100., temp_err_thresh=100., cloud_thresh = [-22.,-10.],
                   send_to_website=False, enable_share=False, send_to_madrigal=False,
                   enable_windfield_estimate=False, notify_the_humans = False,
@@ -261,7 +264,7 @@ def process_instr(instr_name ,year, doy, reference='laser', sky_line_tag='X', us
                   madrigal_stub='/home/jmakela/tmp/mango/madrigal/', share_stub='/home/jmakela/tmp/mango/share/',
                   temp_plots_stub = '/home/jmakela/tmp/mango/temporary_plots/',
                   web_images_stub = '/home/airglowgroup/public_html/Data/SummaryImages/',
-                  web_logs_stub = '/home/airglowgroup/public_html/Data/SummaryLogs/'
+                  web_logs_stub = '/home/airglowgroup/public_html/Data/SummaryLogs/',
 ):
     '''
     Process all the data from the instrument with name instr_name on
