@@ -72,7 +72,7 @@ class CloudStorage:
     def download_file(self, key: str, local_path: str) -> bool:
         """Download file from cloud storage to local path."""
         try:
-            self.logger.info(f"Downloading {key} to {local_path}")
+            self.logger.info(f"Downloading {key} to {local_path} from {self.bucket}")
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             self.client_s3.download_file(self.bucket, key, local_path)
             return True

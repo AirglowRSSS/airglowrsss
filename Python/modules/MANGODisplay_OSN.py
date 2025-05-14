@@ -178,9 +178,10 @@ def download_fpi_data(cloud_storage, config, site, date, sky_line_tag, fpi_dir):
     # Create the filename and file path
     fpi_datestr = date.strftime('%Y%m%d')
     fpi_filename = f"{instr_name}_{site}_{fpi_datestr}_{sky_line_tag.lower()}.npz"
+    print(f"download_fpi: {fpi_filename}")
     
     # Handle the case for older files that might not have the tag
-    cloud_key = f"{config.aws_results_prefix}{fpi_filename}"
+    cloud_key = f"{config.aws_results_prefix}{date.strftime('%Y')}/{fpi_filename}"
     local_fpi_path = os.path.join(fpi_dir, fpi_filename)
     
     # Create directory if it doesn't exist
@@ -332,6 +333,7 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
     # Download FPI data for each site
     for fpi_site in analysis_parameters['sites_fpi']:
         files, _ = download_fpi_data(cloud_storage, config, fpi_site, fpi_dt, sky_line_tag.lower(), fpi_dir)
+        print(files)
         downloaded_files.extend(files)
 
     # Convert to xarray
@@ -396,6 +398,7 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
 
     for fpi in analysis_parameters['sites_fpi']:
         fname = os.path.join(fpi_dir, f"{fpiinfo.get_instr_at(fpi, fpi_dt)[0]}_{fpi}_{fpi_dt.strftime('%Y%m%d')}_{sky_line_tag.lower()}.npz")
+        print(fname)
         if (not exists(fname)) and (sky_line_tag == 'XR'):
             # Some of the older npz files for redline don't have a tag
             fname = os.path.join(fpi_dir, f"{fpiinfo.get_instr_at(fpi, fpi_dt)[0]}_{fpi}_{fpi_dt.strftime('%Y%m%d')}.npz")
@@ -628,7 +631,7 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
     # Upload the movie to OSN
     if os.path.exists(mp4file):
         logger.info(f"Uploading movie {mp4file} to OSN")
-        cloud_key = f"{config.aws_mango_movies_prefix}MANGO_{analysis_parameters['date'].strftime('%Y%m%d')}_{linetag}.mp4"
+        cloud_key = f"{config.aws_mango_movies_prefix}{analysis_parameters['date'].strftime('%Y')}/MANGO_{analysis_parameters['date'].strftime('%Y%m%d')}_{linetag}.mp4"
         cloud_storage.upload_file(mp4file, cloud_key)
         logger.info(f"Movie uploaded to {cloud_key}")
     else:
