@@ -628,7 +628,7 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
  #   os.system(cmd)
     generate_video(png_pattern, mp4file)
     
-    # Upload the movie to OSN
+    # Upload the movie to OSN with year directory structure
     if os.path.exists(mp4file):
         logger.info(f"Uploading movie {mp4file} to OSN")
         cloud_key = f"{config.aws_mango_movies_prefix}{analysis_parameters['date'].strftime('%Y')}/MANGO_{analysis_parameters['date'].strftime('%Y%m%d')}_{linetag}.mp4"
