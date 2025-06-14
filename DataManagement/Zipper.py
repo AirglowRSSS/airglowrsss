@@ -184,10 +184,14 @@ def activeinstruments():
     code['blo']['bwc']['00'] = {'send_dir':'/home/airglow/airglow/Sending/', 'local_dir':'/home/airglow/airglow/skyalert-logger/skyalert-logs/', 'email':UIemail}
 
     # DASI FPI at Christmas Valley, Oregon starting from 18? Nov 2021
-    code['cvo']['fpi']['10'] = {'send_dir':'C:/Sending/', 'local_dir':'C:/FPI_Data/', 'split':'C:/cygwin64/bin/split','email':UIemail}
-    code['cvo']['bwc']['00'] = {'send_dir':'C:/Sending/', 'local_dir':'C:/Users/dasi01/Documents/Interactiveastronomy/SkyAlert/','email':UIemail}
-    code['cvo']['x3t']['00'] = {'send_dir':'C:/Sending/', 'local_dir':'/cygdrive/c/Scripts/Python/modules/', 'url':'http://raspberryfpi.local/log.txt','email':UIemail}
-    code['cvo']['x3t']['01'] = {'send_dir':'C:/Sending/', 'local_dir':'/cygdrive/c/Scripts/Python/modules/','url':'http://homeassistant.local:8123/api/history/period','email':UIemail}
+#    code['cvo']['fpi']['10'] = {'send_dir':'C:/Sending/', 'local_dir':'C:/FPI_Data/', 'split':'C:/cygwin64/bin/split','email':UIemail}
+#    code['cvo']['bwc']['00'] = {'send_dir':'C:/Sending/', 'local_dir':'C:/Users/dasi01/Documents/Interactiveastronomy/SkyAlert/','email':UIemail}
+#    code['cvo']['x3t']['00'] = {'send_dir':'C:/Sending/', 'local_dir':'/cygdrive/c/Scripts/Python/modules/', 'url':'http://raspberryfpi.local/log.txt','email':UIemail}
+#    code['cvo']['x3t']['01'] = {'send_dir':'C:/Sending/', 'local_dir':'/cygdrive/c/Scripts/Python/modules/','url':'http://homeassistant.local:8123/api/history/period','email':UIemail}
+    code['cvo']['fpi']['10'] = {'send_dir':'/home/airglow/airglow/Sending/', 'local_dir':'/home/airglow/airglow/data/', 'split':'/usr/bin/split','email':UIemail}
+    code['cvo']['bwc']['00'] = {'send_dir':'/home/airglow/airglow/Sending/', 'local_dir':'/home/airglow/airglow/skyalert-logger/skyalert-logs/', 'email':UIemail}
+
+
 
     # Last index is for remote2 admin related issues (not site based)
     code['ADMIN']={'email':['jmakela@illinois.edu','bharding@ssl.berkeley.edu']}

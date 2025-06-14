@@ -20,16 +20,18 @@ def main():
     load_dotenv()
     # Set up correct folder options
     folders = {
-       '/cygdrive/c/Sending/',
-       '/cygdrive/d/Sending/',
-       '/cygdrive/f/Sending/',
-       '/home/gps/Sending/',
-       '/home/airglow/Sending/',
-       '/home/scintmon/Sending/',
-       '/data/Sending/',
-       'C:/Sending/',
-       'D:/Sending/',
-       'F:/Sending/'
+#       '/cygdrive/c/Sending/',
+#       '/cygdrive/d/Sending/',
+#       '/cygdrive/f/Sending/',
+#       '/home/gps/Sending/',
+#       '/home/airglow/Sending/',
+#       '/home/scintmon/Sending/',
+#       '/data/Sending/',
+#       'C:/Sending/',
+#       'D:/Sending/',
+#       'F:/Sending/'
+        '/home/airglow/airglow/Sending/',
+        '/data/Sending/'
     }
 
     # destiny = 'tx@remote2.ece.illinois.edu:/rdata/airglow/rx/.'
