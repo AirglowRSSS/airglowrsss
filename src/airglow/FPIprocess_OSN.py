@@ -11,7 +11,8 @@ from pathlib import Path
 import fpiinfo
 import FPIprocess
 from cloud_storage import CloudStorage, Configuration
-
+from dagster_mysql import MySQLResource
+from dagster import EnvVar
 
 def setup_logging():
     """Set up logging configuration."""
@@ -139,7 +140,7 @@ def upload_directory_to_cloud(local_dir, cloud_prefix, cloud_storage):
                 logger.error(f"Error uploading {local_path}: {str(e)}")
 
 
-def clean_up_post_FPIprocess(created_files, target_dir, config, cloud_storage):
+def clean_up_post_FPIprocess(created_files, target_dir, config, cloud_storage, year):
     """Clean up temporary files and upload results to cloud storage."""
     logger = logging.getLogger(__name__)
     
@@ -149,21 +150,21 @@ def clean_up_post_FPIprocess(created_files, target_dir, config, cloud_storage):
     # Upload processed results to cloud storage
     results_dir = Path(config.fpi_process_kwargs['results_stub'])
     if results_dir.exists():
-        cloud_results_prefix = f"{config.aws_results_prefix}"
+        cloud_results_prefix = f"{config.aws_results_prefix}{year}/"
         upload_directory_to_cloud(results_dir, cloud_results_prefix, cloud_storage)
         logger.info(f"Uploaded results to cloud storage: {cloud_results_prefix}")
 
     # Upload temporary plots to cloud storage
     temp_plots_dir = Path(config.fpi_process_kwargs['temp_plots_stub'])
     if temp_plots_dir.exists():
-        cloud_results_prefix = f"{config.aws_summaryimages_prefix}"
+        cloud_results_prefix = f"{config.aws_summaryimages_prefix}{year}/"
         upload_directory_to_cloud(temp_plots_dir, cloud_results_prefix, cloud_storage)
         logger.info(f"Uploaded plots to cloud storage: {cloud_results_prefix}")
 
     # Upload madrigal files to cloud storage
     madrigal_dir = Path(config.fpi_process_kwargs['madrigal_stub'])
     if madrigal_dir.exists():
-        cloud_results_prefix = f"{config.aws_madrigal_prefix}"
+        cloud_results_prefix = f"{config.aws_madrigal_prefix}{year}/"
         upload_directory_to_cloud(madrigal_dir, cloud_results_prefix, cloud_storage)
         logger.info(f"Uploaded madrigal files to cloud storage: {cloud_results_prefix}")
 
@@ -199,6 +200,14 @@ def process_fpi_data(site, year, doy, env_file='.env'):
     
     # Get date string from year and day of year
     instr_name, site_name, datestr, instrsitedate = get_instrument_info(site, year, doy)
+
+    # Set up mysql instance
+    mysql = MySQLResource(
+        host=EnvVar("MYSQL_HOST").get_value(),
+        user=EnvVar("MYSQL_USER").get_value(),
+        password=EnvVar("MYSQL_PASSWORD").get_value(),
+        database=EnvVar("MYSQL_DATABASE").get_value(),
+    )
     
     logger.info(f"Processing {instrsitedate}")
     
@@ -219,11 +228,11 @@ def process_fpi_data(site, year, doy, env_file='.env'):
     
             # Process the FPI data
             logger.info(f"Processing FPI data for {instr_name} on day {doy} of {year}")
-            FPIprocess.process_instr(instr_name, year, doy, **config.fpi_process_kwargs)
+            FPIprocess.process_instr(instr_name, year, doy, mysql=mysql, **config.fpi_process_kwargs)
     
     # Clean up and upload results
     logger.info("Cleaning up and uploading results")
-    clean_up_post_FPIprocess(created_files, target_dir, config, cloud_storage)
+    clean_up_post_FPIprocess(created_files, target_dir, config, cloud_storage, year)
     
     logger.info(f"FPI processing complete for {instrsitedate}")
 
