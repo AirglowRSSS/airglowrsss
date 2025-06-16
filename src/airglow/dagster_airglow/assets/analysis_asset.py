@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 # Third-party imports
 import dagster as dg
-from dagster import AssetKey, EnvVar
+from dagster import EnvVar
 from dagster_mysql import MySQLResource
 from dagster_ncsa import S3ResourceNCSA
 
@@ -274,10 +274,22 @@ def analyze_data_pipeline(
     :return: The analysis result.
     """
     # Convert the metadata produced by the unzip_chunked_archive asset to an
-    # AnalysisConfig object.
-    upstream_metadata = context.instance.get_latest_materialization_event(
-        AssetKey("unzip_chunked_archive")).asset_materialization.metadata
-    analysis_config = AnalysisConfig(**upstream_metadata['analysis_config'].data)
+    # AnalysisConfig object. Only use records from this run to avoid
+    # cross-contamination
+    materialization_records = context.instance.get_records_for_run(
+        run_id=context.run_id,
+        of_type=dg.DagsterEventType.ASSET_MATERIALIZATION
+    ).records
+
+    # Index by asset key so we can find the one we want in multi-step DAG
+    materialization_dict = {
+        record.asset_key.to_python_identifier(): record.asset_materialization.metadata
+        for record in materialization_records
+    }
+
+    upstream_metadata = materialization_dict['unzip_chunked_archive']['analysis_config'].data
+
+    analysis_config = AnalysisConfig(**upstream_metadata)
     context.log.info(f"Analysis config: {analysis_config}")
     return analyze_data(context, analysis_config, s3, mysql)
 
