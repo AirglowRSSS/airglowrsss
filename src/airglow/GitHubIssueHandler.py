@@ -33,6 +33,8 @@ class SiteIssueManager:
             "LaserProcessingError": "error:laser_general",
             "InstrumentProcessingError": "error:instrument",
             "BadDopplerReferenceError": "error:bad_doppler_reference",
+            "NoLaserImagesError": "error:no_laser_images",
+            "NoSkyImagesError": "error:no_sky_images",
             # Add other error types as needed
         }
 
