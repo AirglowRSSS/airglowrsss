@@ -389,7 +389,6 @@ def analyze_data(
                 raise
 
             # Enhanced processing loop with comprehensive error handling
-            # This replaces the original try/except block around line 216
             for sky_line_tag in ["X", "XR", "XG"]:
                 processing_stats["total_processed"] += 1
                 processing_stats["sky_line_tags_processed"].append(sky_line_tag)
