@@ -3,7 +3,7 @@ import os
 import tempfile
 import traceback
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # Third-party imports
 import dagster as dg
@@ -68,6 +68,46 @@ class DagsterErrorHandler:
             self.logger.error(f"Failed to initialize GitHub issue manager: {e}")
             self.issue_manager = None
     
+    def _get_site_assignees(self) -> List[str]:
+        """
+        Get the list of GitHub usernames to assign issues for this site.
+        Returns a list of GitHub usernames based on site configuration.
+        """
+        try:
+            # Get site information from fpiinfo
+            site_info = fpiinfo.get_site_info(self.site)
+            
+            # Check if assignees are defined in the site info
+            if isinstance(site_info, dict) and 'github_assignees' in site_info:
+                assignees = site_info['github_assignees']
+                if isinstance(assignees, list):
+                    return assignees
+                elif isinstance(assignees, str):
+                    return [assignees]  # Single assignee as string
+            
+            # Fallback: try to get from email addresses and convert to GitHub usernames
+            # This assumes you have a mapping of email -> GitHub username
+            if isinstance(site_info, dict) and 'email' in site_info:
+                emails = site_info['email']
+                if isinstance(emails, list):
+                    # You could maintain a mapping of email -> GitHub username
+                    # For now, we'll extract the username part before @ and hope it matches
+                    github_usernames = []
+                    for email in emails:
+                        if '@' in email:
+                            username = email.split('@')[0]
+                            # You might want to validate these usernames exist on GitHub
+                            github_usernames.append(username)
+                    return github_usernames
+                elif isinstance(emails, str) and '@' in emails:
+                    return [emails.split('@')[0]]
+            
+        except Exception as e:
+            self.logger.warning(f"Could not get assignees for site {self.site}: {e}")
+        
+        # Return empty list if no assignees found
+        return []
+    
     def _handle_processing_error(self, error: Exception, metadata: Dict[str, Any]) -> None:
         """
         Handle processing errors with enhanced logging and GitHub issue creation.
@@ -103,6 +143,11 @@ class DagsterErrorHandler:
                 # Determine error type for proper labeling
                 error_type = type(error).__name__
                 
+                # Get assignees for this site
+                assignees = self._get_site_assignees()
+                if assignees:
+                    self.logger.info(f"Assigning GitHub issue to: {', '.join(assignees)}")
+                
                 # Use our extended error labels if the original doesn't have it
                 if hasattr(self.issue_manager, 'ERROR_LABELS') and error_type not in self.issue_manager.ERROR_LABELS:
                     if error_type in self.EXTENDED_ERROR_LABELS:
@@ -110,7 +155,8 @@ class DagsterErrorHandler:
                         self.issue_manager.ERROR_LABELS[error_type] = self.EXTENDED_ERROR_LABELS[error_type]
                         self.logger.info(f"Added missing error type '{error_type}' to issue manager")
                 
-                self.issue_manager.handle_processing_issue(
+                # Create the issue with assignees
+                issue = self.issue_manager.handle_processing_issue(
                     site_id=self.site,
                     message=str(error),
                     category=IssueType.ERROR,
@@ -124,6 +170,15 @@ class DagsterErrorHandler:
                         **metadata
                     }
                 )
+                
+                # Assign the issue to the appropriate users
+                if issue and assignees:
+                    try:
+                        issue.edit(assignees=assignees)
+                        self.logger.info(f"Successfully assigned issue to: {', '.join(assignees)}")
+                    except Exception as assign_error:
+                        self.logger.warning(f"Failed to assign issue to {assignees}: {assign_error}")
+                
                 self.logger.info(f"Created GitHub issue for error: {error_type} at site {self.site}")
                     
             except Exception as github_error:
@@ -160,7 +215,13 @@ class DagsterErrorHandler:
         # Create GitHub issue if manager is available
         if self.issue_manager:
             try:
-                self.issue_manager.handle_processing_issue(
+                # Get assignees for this site
+                assignees = self._get_site_assignees()
+                if assignees:
+                    self.logger.info(f"Assigning GitHub warning issue to: {', '.join(assignees)}")
+                
+                # Create the warning issue
+                issue = self.issue_manager.handle_processing_issue(
                     site_id=self.site,
                     message=warning_message,
                     category=IssueType.WARNING,
@@ -171,6 +232,14 @@ class DagsterErrorHandler:
                         **metadata
                     }
                 )
+                
+                # Assign the issue to the appropriate users
+                if issue and assignees:
+                    try:
+                        issue.edit(assignees=assignees)
+                        self.logger.info(f"Successfully assigned warning issue to: {', '.join(assignees)}")
+                    except Exception as assign_error:
+                        self.logger.warning(f"Failed to assign warning issue to {assignees}: {assign_error}")
                 
                 self.logger.info(f"Created GitHub issue for warning at site {self.site}")
                 
@@ -193,7 +262,11 @@ def get_instrument_info(site, year, doy):
     datestr = nominal_dt.strftime("%Y%m%d")
     instrsitedate = instr_name + "_" + site_name + "_" + datestr
 
-    return instr_name, site_name, datestr, instrsitedate
+    # What tags we expect at this site
+    site_info = fpiinfo.get_site_info(site)
+    expected_tags = site_info['expected_tags']
+    
+    return instr_name, site_name, datestr, instrsitedate, expected_tags
 
 
 def download_fpi_data(
@@ -332,7 +405,7 @@ def analyze_data(
     year = int(config.year)
 
     # Get date string from year and day of year
-    instr_name, site_name, datestr, instrsitedate = get_instrument_info(
+    instr_name, site_name, datestr, instrsitedate, expected_tags = get_instrument_info(
         config.site, year, doy
     )
 
@@ -340,6 +413,7 @@ def analyze_data(
     context.log.info("Site name: %s", site_name)
     context.log.info("Date string: %s", datestr)
     context.log.info("Instrument site date: %s", instrsitedate)
+    context.log.info(f"Expected sky tags: {expected_tags}")
 
     # Create a temporary directory context manager
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -389,7 +463,8 @@ def analyze_data(
                 raise
 
             # Enhanced processing loop with comprehensive error handling
-            for sky_line_tag in ["X", "XR", "XG"]:
+            # This replaces the original try/except block around line 216
+            for sky_line_tag in expected_tags:#["X", "XR", "XG"]:
                 processing_stats["total_processed"] += 1
                 processing_stats["sky_line_tags_processed"].append(sky_line_tag)
                 
@@ -491,12 +566,12 @@ def analyze_data(
             
             # Log final processing statistics
             context.log.info(f"Processing completed. Stats: {processing_stats}")
-           
-#            # Handle final processing results
-#            if processing_stats["errors"] > 0:
-#                if processing_stats["successful"] == 0:
-#                    # All processing failed
-#                    warning_message = f"All processing failed: {processing_stats['errors']} errors occurred across all sky line tags"
+            
+            # Handle final processing results
+            if processing_stats["errors"] > 0:
+                if processing_stats["successful"] == 0:
+                    # All processing failed
+                    warning_message = f"All processing failed: {processing_stats['errors']} errors occurred across all sky line tags"
 #                    error_handler._handle_warning(
 #                        warning_message=warning_message,
 #                        metadata={
@@ -506,13 +581,13 @@ def analyze_data(
 #                        }
 #                    )
 #                    
-#                    if config.fail_asset_on_all_errors:
-#                        # Fail the asset if configured to do so
-#                        raise RuntimeError(f"All processing failed. {processing_stats['errors']} errors occurred.")
-#                    else:
-#                        # Don't fail the asset, but return error status
-#                        context.log.error(warning_message)
-#                        return f"failed_all_processing_{processing_stats['errors']}_errors"
+                    if config.fail_asset_on_all_errors:
+                        # Fail the asset if configured to do so
+                        raise RuntimeError(f"All processing failed. {processing_stats['errors']} errors occurred.")
+                    else:
+                        # Don't fail the asset, but return error status
+                        context.log.error(warning_message)
+                        return f"failed_all_processing_{processing_stats['errors']}_errors"
 #                else:
 #                    # Partial success - log warning but don't fail
 #                    error_handler._handle_warning(
