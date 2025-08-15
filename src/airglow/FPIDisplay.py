@@ -616,31 +616,47 @@ def NetworkSummary(network, times, bin_time = np.arange(17,32,0.5),
 
 
 def DataSummary(files, times, bin_time = np.arange(17,32,0.5),
-                Tmin=500, Tmax=1500, Dmin=-200, Dmax=200, Imin=0, Imax=200, cloudy_temperature=-15.0,
-                reference='Zenith'):
-#
-# Function to display a two dimensional summary of data.  The
-# y-axis is hours while the x-axis is the day.  The function
-# stacks data in columns so daily/seasonal trends can be observed
-#
-# INPUTS:
-#   files - a list of files to be included in the summary plot
-#   times - a list of datetimes for plotting (x-axis)
-# OPTIONAL INPUTS:
-#   bin_time - array of times to bin data on to (default np.arange(17,32,0.5))
-#   Tmin, Tmax - the min/max values for temperatures to be plotted (default 500,1500)
-#   Dmin, Dmax - the min/max values for the Doppler shifts to be plotted (default -200, 200)
-#   reference - the type of Doppler reference to use
-# OUTPUTS:
-#   (Temperature_Fig, Temperature_Ax) - references to figure and axis of temperature plot
-#   (Zonal_Fig, Zonal_Ax) - references to figure and axis of zonal plot
-#   (Meridional_Fig, Meridional_Ax) - references to figure and axis of meridional plot
-#   (Intensity_Fig, Intesity_Ax) - references to the figure and axis for the airglow intensity plot
-#
-# HISTORY:
-#   Written by Jonathan J. Makela on 2 Dec 2012
-#   Added Intensity figures on 28 May 2013 (jjm)
-#   Corrected to work with new file format on 22 Aug 2013
+                Tmin=500, Tmax=1500, Dmin=-200, Dmax=200, Imin=0, Imax=200, 
+                cloudy_temperature=-15.0, reference='zenith', 
+                use_cloud_storage=False, cloud_storage=None, temp_dir=None):
+    """
+    Function to display a two dimensional summary of data.  The
+    y-axis is hours while the x-axis is the day.  The function
+    stacks data in columns so daily/seasonal trends can be observed
+    
+    INPUTS:
+        files - a list of files to be included in the summary plot
+                If use_cloud_storage=True, these should be cloud storage keys
+                If use_cloud_storage=False, these should be local file paths
+        times - a list of datetimes for plotting (x-axis)
+    OPTIONAL INPUTS:
+        bin_time - array of times to bin data on to (default np.arange(17,32,0.5))
+        Tmin, Tmax - the min/max values for temperatures to be plotted (default 500,1500)
+        Dmin, Dmax - the min/max values for the Doppler shifts to be plotted (default -200, 200)
+        reference - the type of Doppler reference to use
+        use_cloud_storage - boolean flag to use cloud storage (default False)
+        cloud_storage - CloudStorage instance (required if use_cloud_storage=True)
+        temp_dir - temporary directory for downloaded files (used only with cloud storage)
+    OUTPUTS:
+        (Temperature_Fig, Temperature_Ax) - references to figure and axis of temperature plot
+        (Zonal_Fig, Zonal_Ax) - references to figure and axis of zonal plot
+        (Meridional_Fig, Meridional_Ax) - references to figure and axis of meridional plot
+        (Intensity_Fig, Intesity_Ax) - references to the figure and axis for the airglow intensity plot
+    
+    HISTORY:
+        Written by Jonathan J. Makela on 2 Dec 2012
+        Added Intensity figures on 28 May 2013 (jjm)
+        Corrected to work with new file format on 22 Aug 2013
+        Updated to support cloud storage operations
+    """
+    import os
+    
+    # Validate cloud storage parameters
+    if use_cloud_storage:
+        if cloud_storage is None:
+            raise ValueError("cloud_storage parameter is required when use_cloud_storage=True")
+        if temp_dir is None:
+            temp_dir = cloud_storage.config.temp_dir
 
     # Sort the files given
     files.sort()
@@ -668,186 +684,230 @@ def DataSummary(files, times, bin_time = np.arange(17,32,0.5),
 
     # Work with the data from the files provided
     for f in files:
-        # Load the file
-        npzfile = np.load(f,allow_pickle=True, encoding='latin1')
+        try:
+            # Handle file loading based on storage type
+            if use_cloud_storage:
+                # Create local filename for temporary download
+                local_filename = os.path.join(temp_dir, os.path.basename(f))
+                
+                # Download file from cloud storage
+                if not cloud_storage.download_file(f, local_filename):
+                    print(f"Warning: Failed to download {f}")
+                    continue
+                
+                # Use the local filename for processing
+                file_to_load = local_filename
+            else:
+                # Use the file path directly
+                file_to_load = f
 
-        # Save data to FPI_Results and site dictionaries
-        FPI_Results = npzfile['FPI_Results']
-        FPI_Results = FPI_Results.reshape(-1)[0]
-        site = npzfile['site']
-        site = site.reshape(-1)[0]
-        npzfile.close()
+            # Load the file
+            npzfile = np.load(file_to_load, allow_pickle=True, encoding='latin1')
 
-        # Calculate the day of year
-        # TODO: GENERALIZE SO IT ISNT JUST PLOTTING OVER A YEAR
-    #       doy = FPI_Results['sky_times'][0].timetuple().tm_yday
+            # Save data to FPI_Results and site dictionaries
+            FPI_Results = npzfile['FPI_Results']
+            FPI_Results = FPI_Results.reshape(-1)[0]
+            site = npzfile['site']
+            site = site.reshape(-1)[0]
+            npzfile.close()
 
-        doy = (FPI_Results['sky_times'][0]-dates.num2date(times[0])).days
-        if (doy < 1) or (doy > N):
-            continue
+            # Calculate the day of year
+            # TODO: GENERALIZE SO IT ISNT JUST PLOTTING OVER A YEAR
+            doy = (FPI_Results['sky_times'][0]-dates.num2date(times[0])).days
+            if (doy < 1) or (doy > N):
+                if use_cloud_storage:
+                    # Clean up temporary file
+                    try:
+                        os.remove(local_filename)
+                    except:
+                        pass
+                continue
 
-        # Find the zero offset of the Doppler shift
-        (ref_Dop, e_ref_Dop) = FPI.DopplerReference(FPI_Results,reference=reference)
+            # Find the zero offset of the Doppler shift
+            (ref_Dop, e_ref_Dop) = FPI.DopplerReference(FPI_Results,reference=reference)
 
-        # Calculate the vertical wind and interpolate it
-        ind = FPI.all_indices('Zenith',FPI_Results['direction'])
-        w = (FPI_Results['LOSwind'][ind]-ref_Dop[ind]) # -1 because LOS is towards instrument
-        sigma_w = FPI_Results['sigma_LOSwind'][ind]
-        dt = []
-        for x in FPI_Results['sky_times'][ind]:
-            diff = (x - FPI_Results['sky_times'][0])
-            dt.append(diff.seconds+diff.days*86400.)
-        dt = np.array(dt)
+            # Calculate the vertical wind and interpolate it
+            ind = FPI.all_indices('Zenith',FPI_Results['direction'])
+            w = (FPI_Results['LOSwind'][ind]-ref_Dop[ind]) # -1 because LOS is towards instrument
+            sigma_w = FPI_Results['sigma_LOSwind'][ind]
+            dt = []
+            for x in FPI_Results['sky_times'][ind]:
+                diff = (x - FPI_Results['sky_times'][0])
+                dt.append(diff.seconds+diff.days*86400.)
+            dt = np.array(dt)
 
-        # Remove outliers
-        ind = abs(w) < 200.
+            # Remove outliers
+            ind = abs(w) < 200.
 
-        if sum(ind) <= 1:
-            # No good data, just use all ind
-            ind = abs(w) > 0.
+            if sum(ind) <= 1:
+                # No good data, just use all ind
+                ind = abs(w) > 0.
 
-        if sum(ind) <= 1:
-            continue
+            if sum(ind) <= 1:
+                if use_cloud_storage:
+                    # Clean up temporary file
+                    try:
+                        os.remove(local_filename)
+                    except:
+                        pass
+                continue
 
-        # Interpolate
-        w2 = interpolate.interp1d(dt[ind],w[ind],bounds_error=False,fill_value=0.0)
-        sigma_w2 = interpolate.interp1d(dt[ind],sigma_w[ind],bounds_error=False,fill_value=0.0)
-        dt = []
+            # Interpolate
+            w2 = interpolate.interp1d(dt[ind],w[ind],bounds_error=False,fill_value=0.0)
+            sigma_w2 = interpolate.interp1d(dt[ind],sigma_w[ind],bounds_error=False,fill_value=0.0)
+            dt = []
 
-        for x in FPI_Results['sky_times']:
-            diff = (x - FPI_Results['sky_times'][0])
-            dt.append(diff.seconds+diff.days*86400.)
-        w = w2(dt)
-        sigma_w = sigma_w2(dt)
+            for x in FPI_Results['sky_times']:
+                diff = (x - FPI_Results['sky_times'][0])
+                dt.append(diff.seconds+diff.days*86400.)
+            w = w2(dt)
+            sigma_w = sigma_w2(dt)
 
-        # Fill in the arrays with binned data
-        for x in np.unique(FPI_Results['direction']):
-            # Use zenith for temperatures
-            # TODO: GENERALIZE THIS TO ALLOW USER TO DETERMINE WHICH DIRECTION
-            if x == 'Zenith':
-                ind = FPI.all_indices(x, FPI_Results['direction'])
+            # Fill in the arrays with binned data
+            for x in np.unique(FPI_Results['direction']):
+                # Use zenith for temperatures
+                # TODO: GENERALIZE THIS TO ALLOW USER TO DETERMINE WHICH DIRECTION
+                if x == 'Zenith':
+                    ind = FPI.all_indices(x, FPI_Results['direction'])
 
-                # Grab the data
-                st = FPI_Results['sky_times'][ind]
-                T = FPI_Results['T'][ind]
-                eT = FPI_Results['sigma_T'][ind]
-                I = FPI_Results['skyI'][ind]
-                eI = FPI_Results['sigma_skyI'][ind]
-                dop = (FPI_Results['LOSwind'][ind]-ref_Dop[ind])
-                # TODO: ERROR BASED ON BOTH LOS AND ZENITH REFERENCE
-                edop = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2+sigma_w[ind]**2)
+                    # Grab the data
+                    st = FPI_Results['sky_times'][ind]
+                    T = FPI_Results['T'][ind]
+                    eT = FPI_Results['sigma_T'][ind]
+                    I = FPI_Results['skyI'][ind]
+                    eI = FPI_Results['sigma_skyI'][ind]
+                    dop = (FPI_Results['LOSwind'][ind]-ref_Dop[ind])
+                    # TODO: ERROR BASED ON BOTH LOS AND ZENITH REFERENCE
+                    edop = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2+sigma_w[ind]**2)
 
-                # Check if clouds are provided
-                if 'Clouds' in FPI_Results.keys():
-                    if FPI_Results['Clouds'] is not None:
-                        clouds = FPI_Results['Clouds']['mean'][ind]
-                        idx = clouds < cloudy_temperature
-                        st = st[idx]
-                        T = T[idx]
-                        eT = eT[idx]
-                        I = I[idx]
-                        eI = eI[idx]
-                        dop = dop[idx]
-                        edop = edop[idx]
+                    # Check if clouds are provided
+                    if 'Clouds' in FPI_Results.keys():
+                        if FPI_Results['Clouds'] is not None:
+                            clouds = FPI_Results['Clouds']['mean'][ind]
+                            idx = clouds < cloudy_temperature
+                            st = st[idx]
+                            T = T[idx]
+                            eT = eT[idx]
+                            I = I[idx]
+                            eI = eI[idx]
+                            dop = dop[idx]
+                            edop = edop[idx]
 
-                # Find bad data points
-                idx = (eT < 100) & (eT > 0)
-                st = st[idx]
-                T = T[idx]
-                eT = eT[idx]
-                I = I[idx]
-                eI = eI[idx]
-                dop = dop[idx]
-                edop = edop[idx]
+                    # Find bad data points
+                    idx = (eT < 100) & (eT > 0)
+                    st = st[idx]
+                    T = T[idx]
+                    eT = eT[idx]
+                    I = I[idx]
+                    eI = eI[idx]
+                    dop = dop[idx]
+                    edop = edop[idx]
 
-                if len(st) > 0:
+                    if len(st) > 0:
+                        # Bin the data
+                        (bin_T, bin_eT) = FPI.bin_and_mean(st,T,eT,bin_time)
+
+                        # Save to array
+                        all_T[:,doy-1] = bin_T
+                        all_eT[:,doy-1] = bin_eT
+
+                        # Bin the intensity data
+                        (bin_I, bin_eI) = FPI.bin_and_mean(st,I,eI,bin_time)
+
+                        # Save to array
+                        all_I[:,doy-1] = bin_I
+                        all_eI[:,doy-1] = bin_eI
+
+                        (bin_dop, bin_edop) = FPI.bin_and_mean(st,dop,edop,bin_time)
+
+                        # Save to array
+                        all_W[:,doy-1] = bin_dop
+                        all_eW[:,doy-1] = bin_edop
+
+                # Use east for zonal wind
+                # TODO: GENERALIZE THIS TO ALLOW USER TO DETERMINE WHICH DIRECTION
+                if x == 'East':
+                    ind = FPI.all_indices(x,FPI_Results['direction'])
+
+                    # Grab the data
+                    st = FPI_Results['sky_times'][ind]
+                    dop = (FPI_Results['LOSwind'][ind]-ref_Dop[ind]-w[ind]*np.cos(FPI_Results['ze'][ind]*np.pi/180.))/np.sin(FPI_Results['ze'][ind]*np.pi/180.)
+                    # TODO: ERROR BASED ON BOTH LOS AND ZENITH REFERENCE
+                    edop = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2+sigma_w[ind]**2)
+
+                    # Check if clouds are provided
+                    if 'Clouds' in FPI_Results.keys():
+                        if FPI_Results['Clouds'] is not None:
+                            clouds = FPI_Results['Clouds']['mean'][ind]
+                            idx = clouds < cloudy_temperature
+                            st = st[idx]
+                            dop = dop[idx]
+                            edop = edop[idx]
+
+                    # Find bad data points
+                    idx = (edop < 50) & (edop > 0)
+                    st = st[idx]
+                    dop = dop[idx]
+                    edop = edop[idx]
+
                     # Bin the data
-                    (bin_T, bin_eT) = FPI.bin_and_mean(st,T,eT,bin_time)
+                    if len(st) > 0:
+                        (bin_dop, bin_edop) = FPI.bin_and_mean(st,dop,edop,bin_time)
 
-                    # Save to array
-                    all_T[:,doy-1] = bin_T
-                    all_eT[:,doy-1] = bin_eT
+                        # Save to array
+                        all_U[:,doy-1] = bin_dop
+                        all_eU[:,doy-1] = bin_edop
 
-                    # Bin the intensity data
-                    (bin_I, bin_eI) = FPI.bin_and_mean(st,I,eI,bin_time)
+                # Use north for meridional wind
+                # TODO: GENERALIZE THIS TO ALLOW USER TO DETERMINE WHICH DIRECTION
+                if x == 'North':
+                    ind = FPI.all_indices(x,FPI_Results['direction'])
 
-                    # Save to array
-                    all_I[:,doy-1] = bin_I
-                    all_eI[:,doy-1] = bin_eI
+                    # Grab the data
+                    st = FPI_Results['sky_times'][ind]
+                    dop = (FPI_Results['LOSwind'][ind]-ref_Dop[ind]-w[ind]*np.cos(FPI_Results['ze'][ind]*np.pi/180.))/np.sin(FPI_Results['ze'][ind]*np.pi/180.)
+                    # TODO: ERROR BASED ON BOTH LOS AND ZENITH REFERENCE
+                    edop = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2+sigma_w[ind]**2)
 
-                    (bin_dop, bin_edop) = FPI.bin_and_mean(st,dop,edop,bin_time)
+                    # Check if clouds are provided
+                    if 'Clouds' in FPI_Results.keys():
+                        if FPI_Results['Clouds'] is not None:
+                            clouds = FPI_Results['Clouds']['mean'][ind]
+                            idx = clouds < cloudy_temperature
+                            st = st[idx]
+                            dop = dop[idx]
+                            edop = edop[idx]
 
-                    # Save to array
-                    all_W[:,doy-1] = bin_dop
-                    all_eW[:,doy-1] = bin_edop
+                    # Find bad data points
+                    idx = (edop < 50) & (edop > 0)
+                    st = st[idx]
+                    dop = dop[idx]
+                    edop = edop[idx]
 
-            # Use east for zonal wind
-            # TODO: GENERALIZE THIS TO ALLOW USER TO DETERMINE WHICH DIRECTION
-            if x == 'East':
-                ind = FPI.all_indices(x,FPI_Results['direction'])
+                    # Bin the data
+                    if len(st) > 0:
+                        (bin_dop, bin_edop) = FPI.bin_and_mean(st,dop,edop,bin_time)
 
-                # Grab the data
-                st = FPI_Results['sky_times'][ind]
-                dop = (FPI_Results['LOSwind'][ind]-ref_Dop[ind]-w[ind]*np.cos(FPI_Results['ze'][ind]*np.pi/180.))/np.sin(FPI_Results['ze'][ind]*np.pi/180.)
-                # TODO: ERROR BASED ON BOTH LOS AND ZENITH REFERENCE
-                edop = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2+sigma_w[ind]**2)
+                        # Save to array
+                        all_V[:,doy-1] = bin_dop
+                        all_eV[:,doy-1] = bin_edop                # Bin the data
 
-                # Check if clouds are provided
-                if 'Clouds' in FPI_Results.keys():
-                    if FPI_Results['Clouds'] is not None:
-                        clouds = FPI_Results['Clouds']['mean'][ind]
-                        idx = clouds < cloudy_temperature
-                        st = st[idx]
-                        dop = dop[idx]
-                        edop = edop[idx]
+            # Clean up temporary file if using cloud storage
+            if use_cloud_storage:
+                try:
+                    os.remove(local_filename)
+                except:
+                    pass
 
-                # Find bad data points
-                idx = (edop < 50) & (edop > 0)
-                st = st[idx]
-                dop = dop[idx]
-                edop = edop[idx]
-
-                # Bin the data
-                if len(st) > 0:
-                    (bin_dop, bin_edop) = FPI.bin_and_mean(st,dop,edop,bin_time)
-
-                    # Save to array
-                    all_U[:,doy-1] = bin_dop
-                    all_eU[:,doy-1] = bin_edop
-
-            # Use north for meridional wind
-            # TODO: GENERALIZE THIS TO ALLOW USER TO DETERMINE WHICH DIRECTION
-            if x == 'North':
-                ind = FPI.all_indices(x,FPI_Results['direction'])
-
-                # Grab the data
-                st = FPI_Results['sky_times'][ind]
-                dop = (FPI_Results['LOSwind'][ind]-ref_Dop[ind]-w[ind]*np.cos(FPI_Results['ze'][ind]*np.pi/180.))/np.sin(FPI_Results['ze'][ind]*np.pi/180.)
-                # TODO: ERROR BASED ON BOTH LOS AND ZENITH REFERENCE
-                edop = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2+sigma_w[ind]**2)
-
-                # Check if clouds are provided
-                if 'Clouds' in FPI_Results.keys():
-                    if FPI_Results['Clouds'] is not None:
-                        clouds = FPI_Results['Clouds']['mean'][ind]
-                        idx = clouds < cloudy_temperature
-                        st = st[idx]
-                        dop = dop[idx]
-                        edop = edop[idx]
-
-                # Find bad data points
-                idx = (edop < 50) & (edop > 0)
-                st = st[idx]
-                dop = dop[idx]
-                edop = edop[idx]
-
-                # Bin the data
-                if len(st) > 0:
-                    (bin_dop, bin_edop) = FPI.bin_and_mean(st,dop,edop,bin_time)
-
-                    # Save to array
-                    all_V[:,doy-1] = bin_dop
-                    all_eV[:,doy-1] = bin_edop                # Bin the data
+        except Exception as e:
+            print(f"Error processing {f}: {str(e)}")
+            # Clean up temporary file on error if using cloud storage
+            if use_cloud_storage:
+                try:
+                    os.remove(local_filename)
+                except:
+                    pass
+            continue
 
     # Formatter for the local time axis
     def LT(x, pos):
