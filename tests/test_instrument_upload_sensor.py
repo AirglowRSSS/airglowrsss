@@ -1,4 +1,7 @@
 from unittest.mock import MagicMock
+import os
+os.environ['GITHUB_TOKEN'] = 'token'
+os.environ['GITHUB_REPO'] = 'my/repo'
 
 from airglow.dagster_airglow.sensors import (cloud_cover_files_for_site,
                                              group_files_by_date,
