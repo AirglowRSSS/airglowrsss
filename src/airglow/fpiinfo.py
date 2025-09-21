@@ -217,6 +217,8 @@ _sites['uao'] = {
 	            'MTM_Search': {'ze': 56.55, 'az': 105.72, 'exptime': 180,
 		            'n_exp': 0, 'last_exp': None, 'delay':0},
                 },
+        'github_assignees': ['jonathanjmakela'],
+        'expected_tags': ['XR']
     }
 
 _sites['ann'] = {
@@ -621,6 +623,8 @@ _sites['mor'] = {
 	            'West': {'ze': 45, 'az': -90, 'exptime': 180,
 		            'n_exp': 0, 'last_exp': None, 'delay':0,},
                 },
+        'github_assignees': ['jonathanjmakela'],
+        'expected_tags': ['X']
     }
 
 _sites['car'] = {
@@ -761,6 +765,8 @@ _sites['low'] = {
 	            'West': {'ze': -45, 'az': 90, 'exptime': 180,
 		            'n_exp': 0, 'last_exp': None, 'delay':0},
                 },
+        'github_assignees': ['jonathanjmakela','bharding512'],
+        'expected_tags': ['XG','XR']
     }
 
 
@@ -791,6 +797,8 @@ _sites['blo'] = {
 	            'West': {'ze': -45, 'az': 90, 'exptime': 180,
 		            'n_exp': 0, 'last_exp': None, 'delay':0},
                 },
+        'github_assignees': ['jonathanjmakela','bharding512'],
+        'expected_tags': ['XG','XR']
     }
 
 
@@ -821,6 +829,8 @@ _sites['cvo'] = {
 	            'West': {'ze': -45, 'az': 90, 'exptime': 180,
 		            'n_exp': 0, 'last_exp': None, 'delay':0},
                 },
+        'github_assignees': ['jonathanjmakela','bharding512'],
+        'expected_tags': ['XG','XR']
     }
 
 # TODO: If we ever end up controlling these peruvian sites, make sure
