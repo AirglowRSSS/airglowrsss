@@ -13,7 +13,7 @@ from dagster_ncsa import S3ResourceNCSA
 
 # Local imports
 from airglow import FPIprocess, fpiinfo
-from airglow.exceptions import NoSkyImagesError
+from airglow.exceptions import NoSkyImagesError, BadLaserError
 from airglow.GitHubIssueHandler import SiteIssueManager, IssueType
 from airglow.github_config import github_config
 
@@ -546,6 +546,91 @@ def analyze_data(
                         warning_message=warning_message,
                         metadata=step_context
                     )
+
+                except BadLaserError as base_laser_error:
+                    # There is an issue with the laser images - try analyzing with zenith reference
+                    warning_message = f"Bad laser images for {instr_name} on {datestr}. Attempting zenith reference."
+                    context.log.warning(warning_message)
+
+                    try:
+                        # Call FPIprocess.process_instr with comprehensive error handling
+                        warning = FPIprocess.process_instr(
+                            instr_name,
+                            year,
+                            doy,
+                            reference='zenith',
+                            mysql=mysql,
+                            sky_line_tag=sky_line_tag,
+                            fpi_dir=fpi_dir,
+                            bw_dir=bw_dir,
+                            send_to_madrigal=True,
+                            send_to_website=True,
+                            x300_dir=x300_dir,
+                            results_stub=results_stub,
+                            madrigal_stub=madrigal_stub,
+                            share_stub=share_stub,
+                            temp_plots_stub=temp_plots_stub,
+                        )
+                        
+                        # Handle any warnings returned by the processing function
+                        if warning:
+                            processing_stats["warnings"] += 1
+                            error_handler._handle_warning(
+                                warning_message=str(warning),
+                                metadata=step_context
+                            )
+                        
+                        # Upload results if processing was successful
+                        try:
+                            results_path = EnvVar("RESULTS_PATH").get_value()
+                            upload_results(
+                                context, s3, results_stub, f"{results_path}/{year}"
+                            )
+
+                            summary_path = EnvVar("SUMMARY_IMAGES_PATH").get_value()
+                            upload_results(
+                                context, s3, temp_plots_stub, f"{summary_path}/{year}"
+                            )
+
+                            madrigal_path = EnvVar("MADRIGAL_PATH").get_value()
+                            upload_results(
+                                context, s3, madrigal_stub, f"{madrigal_path}/{year}"
+                            )
+                            
+                            processing_stats["successful"] += 1
+                            context.log.info(f"Successfully processed and uploaded results for {sky_line_tag}")
+                            
+                        except Exception as upload_error:
+                            # Handle upload errors separately - processing succeeded but upload failed
+                            error_handler._handle_processing_error(
+                                upload_error,
+                                {**step_context, "error_location": "results_upload"}
+                            )
+                            # Don't fail the entire processing for upload errors
+                            processing_stats["warnings"] += 1
+
+                        processing_stats["warnings"] += 1
+                        error_handler._handle_warning(
+                            warning_message=str(f"Bad laser images - analyzed with zenith reference for {instr_name} on {datestr}"),
+                            metadata=step_context
+                        )
+
+                    except Exception as processing_error:
+                        # Handle any other processing errors
+                        processing_stats["errors"] += 1
+                        
+                        # Get the error type name for proper labeling
+                        error_type = type(processing_error).__name__
+                        context.log.error(f"Processing error with zenith reference in {sky_line_tag}: {error_type} - {str(processing_error)}")
+                        
+                        error_handler._handle_processing_error(
+                            processing_error,
+                            step_context
+                        )
+                        
+                        # Decide whether to continue or fail - continue processing other tags
+                        context.log.warning(f"Continuing processing despite error in {sky_line_tag}: {error_type}")
+                        continue
                     
                 except Exception as processing_error:
                     # Handle any other processing errors
