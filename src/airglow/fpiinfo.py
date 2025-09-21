@@ -2058,8 +2058,6 @@ def get_instr_info(instr_name, dn = datetime.datetime.now()):
                        'center':  (254.37, 248.56),
         }
     
-
-
     return instrument
 
 def get_all_instr_names():
