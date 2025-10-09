@@ -668,6 +668,8 @@ _sites['car'] = {
                     'East_20': {'ze': -20, 'az':90, 'exptime':210,
                             'n_exp': 0, 'last_exp': None, 'delay':0,},
                 },
+        'github_assignees': ['jonathanjmakela'],
+        'expected_tags': ['XR']
     }
 
 
