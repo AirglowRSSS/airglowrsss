@@ -1946,6 +1946,23 @@ def get_instr_info(instr_name, dn = datetime.datetime.now()):
                        }
         instrument['skyI_quality_thresh'] = [0.112,0.0355]
 
+                # On Aug 9, 2025, the CAR FPI was serviced again.
+        if dn >= datetime.datetime(2025,8,9):
+            instrument['default_params'] = {# instrument params to be used if the laser fails (i.e., zenith reference)
+                                'R': 0.66198036,
+                            'alpha': 8.6778e-05,
+                                'I': 1272.91220,
+                                'B': 1439.37217,
+                               'a1': 0.08355247,
+                               'a2': -0.07684470,
+                               'b0': 0.30174463,
+                               'b1': -0.26186465,
+                               'b2': -0.01362499,
+                           'center':  (247.54, 258.77),
+            }
+            instrument['skyI_quality_thresh'] = [0.150,0.0475]
+            instrument['N1'] = 300
+
 
     # In 2018, the minime06 instrument was moved to SAO, and slightly new instrument parameters are needed
     if instr_name == 'minime06' and dn > datetime.datetime(2018,1,1):

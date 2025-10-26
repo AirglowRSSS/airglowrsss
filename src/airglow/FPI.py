@@ -485,7 +485,7 @@ def Laser_FringeModel(params, r):
 
     # apply gaussian blur
     b = b0 + b1*np.cos(x) + b2*np.sin(x)
-    if b0:
+    if b0 is not None and not np.isnan(b0):
         fringeblur = np.zeros(len(fringe))
         for i in range(len(fringeblur)):
             z = (r - r[i])/b[i]
