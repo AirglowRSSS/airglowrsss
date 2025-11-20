@@ -631,7 +631,7 @@ _sites['car'] = {
         'Location':     (-7.38, -36.52, 460),
         'Name':         'Cariri',
         'Abbreviation': 'car',
-        'Timezone':     'America/Recife',
+        'Timezone':     'UTC',
         'BufferTime':   45,
         'CloudThresh':  -25.0,
         'scpUser':      'MiniME',
@@ -1702,6 +1702,9 @@ def get_site_info(site_name, dn=datetime.datetime.now()):
     if site_name == 'mor' and dn < datetime.datetime(2015,7,30):
         # We changed the MOR FPI to follow UTC time on 7/30/15
         site_info['Timezone'] = 'Africa/Casablanca'
+    if site_name == 'car' and dn < datetime.datetime(2025,10,25):
+        # We changed the CAR FPI to follow UTC time on 10/25/25
+        site_info['Timezone'] = 'America/Recife'
 
     return site_info
 
@@ -2004,6 +2007,12 @@ def get_instr_info(instr_name, dn = datetime.datetime.now()):
 
     if (instr_name == 'minime11') and (dn > datetime.datetime(2023, 6, 13)):
         instrument['default_params']['center'] = (255.5, 258.3) # Presumably got bumped when Jonathan visited
+
+    if (instr_name == 'minime10') and (dn > datetime.datetime(2025, 8, 19)):
+        instrument['default_params']['center'] = (272.92, 281.91) # Presumably got bumped during a visit
+
+    if (instr_name == 'minime12') and (dn > datetime.datetime(2025, 7, 23)):
+        instrument['default_params']['center'] = (250.01, 250.91) # Presumably got bumped during a visit
 
     return instrument
 
