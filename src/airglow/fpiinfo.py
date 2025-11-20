@@ -668,6 +668,8 @@ _sites['car'] = {
                     'East_20': {'ze': -20, 'az':90, 'exptime':210,
                             'n_exp': 0, 'last_exp': None, 'delay':0,},
                 },
+        'github_assignees': ['jonathanjmakela'],
+        'expected_tags': ['XR']
     }
 
 
@@ -1947,6 +1949,23 @@ def get_instr_info(instr_name, dn = datetime.datetime.now()):
                        }
         instrument['skyI_quality_thresh'] = [0.112,0.0355]
 
+                # On Aug 9, 2025, the CAR FPI was serviced again.
+        if dn >= datetime.datetime(2025,8,9):
+            instrument['default_params'] = {# instrument params to be used if the laser fails (i.e., zenith reference)
+                                'R': 0.66198036,
+                            'alpha': 8.6778e-05,
+                                'I': 1272.91220,
+                                'B': 1439.37217,
+                               'a1': 0.08355247,
+                               'a2': -0.07684470,
+                               'b0': 0.30174463,
+                               'b1': -0.26186465,
+                               'b2': -0.01362499,
+                           'center':  (247.54, 258.77),
+            }
+            instrument['skyI_quality_thresh'] = [0.150,0.0475]
+            instrument['N1'] = 300
+
 
     # In 2018, the minime06 instrument was moved to SAO, and slightly new instrument parameters are needed
     if instr_name == 'minime06' and dn > datetime.datetime(2018,1,1):
@@ -2006,14 +2025,61 @@ def get_instr_info(instr_name, dn = datetime.datetime.now()):
                        }
 
     if (instr_name == 'minime11') and (dn > datetime.datetime(2023, 6, 13)):
-        instrument['default_params']['center'] = (255.5, 258.3) # Presumably got bumped when Jonathan visited
+        instrument['default_params'] = {# instrument params to be used if the laser fails (i.e., zenith reference)
+                             'R': 6.44513e-01,
+                         'alpha': 8.65755e-05,
+                             'I': 1.93641e+02,
+                             'B': 3.15287e+02,
+                            'a1': -1.05101e-03,
+                            'a2': -2.05980e-02,
+                            'b0': 5.00000e-01,
+                            'b1': 0.00000e+00,
+                            'b2': 0.00000e+00,
+                       'center':  (255.5, 258.3),
+        }
 
     if (instr_name == 'minime10') and (dn > datetime.datetime(2025, 8, 19)):
-        instrument['default_params']['center'] = (272.92, 281.91) # Presumably got bumped during a visit
+        instrument['default_params'] = {# instrument params to be used if the laser fails (i.e., zenith reference)
+                             'R': 7.29715e-01,
+                         'alpha': 8.65801e-05,
+                             'I': 1.85031e+03,
+                             'B': 3.54120e+02,
+                            'a1': -3.55102e-03,
+                            'a2': -1.63115e-02,
+                            'b0': 3.24543e+00,
+                            'b1': 9.40814e-01,
+                            'b2': -9.03348e-01,
+                       'center':  (272.92, 281.91),
+        }
 
-    if (instr_name == 'minime12') and (dn > datetime.datetime(2025, 7, 23)):
-        instrument['default_params']['center'] = (250.01, 250.91) # Presumably got bumped during a visit
+    if (instr_name == 'minime12') and (dn > datetime.datetime(2025, 7, 20)):
+        instrument['default_params'] = {# instrument params to be used if the laser fails (i.e., zenith reference)
+                             'R': 6.68530e-01,
+                         'alpha': 8.66079e-05,
+                             'I': 7.57981e+02,
+                             'B': 3.02959e+02,
+                            'a1': 9.92800e-02,
+                            'a2': -2.94262e-02,
+                            'b0': 2.21234e+00,
+                            'b1': 1.14225e+00,
+                            'b2': -4.93045e-01,
+                       'center':  (250.01, 250.91),
+        }
 
+    if (instr_name == 'minime05') and (dn > datetime.datetime(2025, 8, 30)):
+        instrument['default_params'] = {# instrument params to be used if the laser fails (i.e., zenith reference)
+                             'R': 8.59079e-01,
+                         'alpha': 8.83178e-05,
+                             'I': 1.13497e+03,
+                             'B': 3.15351e+02,
+                            'a1': 1.21026e-01,
+                            'a2': -6.25589e-02,
+                            'b0': 1.18220e+00,
+                            'b1': 1.63310e-01,
+                            'b2': -3.62640e-02,
+                       'center':  (254.37, 248.56),
+        }
+    
     return instrument
 
 def get_all_instr_names():
