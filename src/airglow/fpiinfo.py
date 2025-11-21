@@ -669,7 +669,7 @@ _sites['car'] = {
                             'n_exp': 0, 'last_exp': None, 'delay':0,},
                 },
         'github_assignees': ['jonathanjmakela'],
-        'expected_tags': ['XR']
+        'expected_tags': ['X','XR']
     }
 
 
