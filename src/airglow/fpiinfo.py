@@ -669,7 +669,7 @@ _sites['car'] = {
                             'n_exp': 0, 'last_exp': None, 'delay':0,},
                 },
         'github_assignees': ['jonathanjmakela'],
-        'expected_tags': ['X','XR']
+        'expected_tags': ['XR']
     }
 
 
@@ -1707,6 +1707,9 @@ def get_site_info(site_name, dn=datetime.datetime.now()):
     if site_name == 'car' and dn < datetime.datetime(2025,10,25):
         # We changed the CAR FPI to follow UTC time on 10/25/25
         site_info['Timezone'] = 'America/Recife'
+    if site_name == 'car' and dn < datetime.datetime(2025,10,1):
+        # We changed to XR after Oct 2025
+        site_info['expected_tags'] = ['X']
 
     return site_info
 
