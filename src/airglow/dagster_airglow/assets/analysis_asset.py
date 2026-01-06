@@ -22,11 +22,29 @@ class AnalysisConfig(dg.Config):
     """Model representing the output from the unzip_chunked_archive asset."""
 
     site: str = "uao"
-    year: str = "2025"
     observation_date: str = "20250429"
-    fpi_data_path: str = "fpi/minime05/uao/2025/20250429"
-    cloud_cover_path: str = "cloudsensor/uao/2025"
     fail_asset_on_all_errors: bool = False  # Set to True if you want the asset to fail when all processing fails
+
+    @property
+    def year(self) -> str:
+        """Extract year from observation_date (format: YYYYMMDD)."""
+        return self.observation_date[:4]
+
+    @property
+    def cloud_cover_path(self) -> str:
+        """Construct cloud cover path from site and year."""
+        return f"cloudsensor/{self.site}/{self.year}"
+
+    @property
+    def fpi_data_path(self) -> str:
+        """Construct FPI data path from site, year, and observation_date."""
+        # Parse observation_date to get datetime
+        nominal_dt = datetime.strptime(self.observation_date, "%Y%m%d")
+
+        # Get instrument name from fpiinfo
+        instr_name = fpiinfo.get_instr_at(self.site, nominal_dt)[0]
+
+        return f"fpi/{instr_name}/{self.site}/{self.year}/{self.observation_date}"
 
 
 class DagsterErrorHandler:

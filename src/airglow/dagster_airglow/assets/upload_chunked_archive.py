@@ -108,10 +108,7 @@ def unzip_chunked_archive(
 
     analysis_config = AnalysisConfig(
         site=config.site,
-        year=year,
         observation_date=config.observation_date,
-        fpi_data_path=data_path,
-        cloud_cover_path=cloud_cover_path,
     )
 
     delete_raw_config = DeleteRawConfig(
