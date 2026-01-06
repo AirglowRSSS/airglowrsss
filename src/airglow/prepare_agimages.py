@@ -2,7 +2,7 @@
 #matplotlib.use('Agg')
 import sys
 import numpy as np
-import asiinfo
+import airglow.asiinfo as asiinfo
 
 try:
     import Image, ImageFile
@@ -10,7 +10,7 @@ except ImportError:
     from PIL import Image, ImageFile
 
 import glob
-import ASI
+import airglow.ASI as ASI
 
 try:
     from skimage import filters
@@ -24,7 +24,7 @@ import datetime
 import multiprocessing as mp
 #import matplotlib.pyplot as plt
 
-import bu_process
+import airglow.bu_process as bu_process
 
 NUM_PROCESSORS = 16
 

@@ -11,29 +11,31 @@ from matplotlib import ticker, gridspec, dates
 from cartopy import crs, feature
 import gc
 import numpy as np
-import prepare_agimages
+import airglow.prepare_agimages as prepare_agimages
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import calendar
 import pytz
-import plotmangodasi as pmd
-import fpiinfo
+import airglow.plotmangodasi as pmd
+import airglow.fpiinfo as fpiinfo
 from os.path import exists
 import shutil
 import matplotlib.pyplot as plt
-from optparse import OptionParser
-import BoltwoodSensor
+#from optparse import OptionParser
+import argparse
+import airglow.BoltwoodSensor as BoltwoodSensor
 import subprocess
-import asiinfo
+import airglow.asiinfo as asiinfo
 import ephem
-import MANGO_L2
-import prepare_agimages
+import airglow.MANGO_L2 as MANGO_L2
+#import prepare_agimages
 import pandas as pd
 import xarray as xr
 from matplotlib.lines import Line2D
 import logging
 from pathlib import Path
-from cloud_storage import CloudStorage, Configuration
+from airglow.cloud_storage import CloudStorage, Configuration
 import cv2
+import warnings
 
 
 def setup_logging():
@@ -75,7 +77,7 @@ def read_FPI(fname, reference='zenith'):
 
 def Process_FPI(FPI_Results, desired_dir, reference='zenith'):
     """Process FPI data for a specific direction."""
-    import FPI
+    import airglow.FPI as FPI
     from scipy import interpolate
     # desired_dir is the direction to process
     
@@ -276,6 +278,8 @@ def create_video_with_opencv(png_pattern, mp4file, framerate=15):
 
 # Example usage to replace your original code
 def generate_video(png_pattern, mp4file):
+    logger = logging.getLogger(__name__)
+
     logger.info(f"Generating video from pattern: {png_pattern}")
     result = create_video_with_opencv(png_pattern, mp4file, framerate=15)
     if result:
@@ -445,6 +449,12 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
     # Load parameters
     params = get_parameters(sky_line_tag, analysis_parameters)
 
+    # Use custom ymin/ymax values for the fpi wind plots
+    if 'wind_min' in analysis_parameters:
+        params['ymin'] = analysis_parameters['wind_min']
+    if 'wind_max' in analysis_parameters:
+        params['ymax'] = analysis_parameters['wind_max']
+
     my_colors = {}
     my_colors['cvo'] = '#1f77b4'
     my_colors['blo'] = '#ff7f0e'
@@ -602,7 +612,10 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
         axes00.annotate(text1, xy=(text_x, -0.05), xycoords='axes fraction', ha='left', va='bottom', fontsize=8)
         axes00.annotate(text2, xy=(text_x, -0.05 - 0.05), xycoords='axes fraction', ha='left', va='bottom', fontsize=8)
 
-        spec.tight_layout(fig)
+        # Suppress warning about tight_layout compatibility
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*not compatible with tight_layout.*')
+            spec.tight_layout(fig)
 
         # Create output directory if it doesn't exist
         os.makedirs(system_parameters['output_directory'], exist_ok=True)
@@ -646,21 +659,50 @@ if __name__=="__main__":
     # Main module allows this to be run via command line
     logger = setup_logging()
 
-    # Parse the command line
-    usage = "usage: MANGODisplay_OSN.py -y YEAR -d DOY -t EMISSION_TAG [-e ENV_FILE]"
-    parser = OptionParser(usage=usage)
-    parser.add_option("-y", "--year", dest="year", help="Year to be run", metavar="YEAR", type="int", default=0)
-    parser.add_option("-d", "--doy", dest="doy", help="Day of year to be run", metavar="DOY", type="int", default=0)
-    parser.add_option("-t", "--tag", dest="sky_line_tag", help="XG for greenline, X or XR for redline", metavar="TAG", type="str", default="XG")
-    parser.add_option("-l", "--download", dest="download", help="Download data, False to not download", metavar="DOWNLOAD", type="str", default="True")
-    parser.add_option("-e", "--env", dest="env_file", help="Path to .env file", metavar="ENV_FILE", type="str", default=".env")
+#    # Parse the command line
+#    usage = "usage: MANGODisplay_OSN.py -y YEAR -d DOY -t EMISSION_TAG [-e ENV_FILE] [-r]"
+#    parser = OptionParser(usage=usage)
+#    parser.add_option("-y", "--year", dest="year", help="Year to be run", metavar="YEAR", type="int", default=0)
+#    parser.add_option("-d", "--doy", dest="doy", help="Day of year to be run", metavar="DOY", type="int", default=0)
+#    parser.add_option("-t", "--tag", dest="sky_line_tag", help="XG for greenline, X or XR for redline", metavar="TAG", type="str", default="XG")
+#    parser.add_option("-l", "--download", dest="download", help="Download data, False to not download", metavar="DOWNLOAD", type="str", default="True")
+#    parser.add_option("-e", "--env", dest="env_file", help="Path to .env file", metavar="ENV_FILE", type="str", default=".env")
+#    parser.add_option("-r", "--remove", dest="delete_working_files", help="Delete working files", default=False)
+#
+#    (options, args) = parser.parse_args()
+#    year = options.year
+#    doy = options.doy
+#    sky_line_tag = options.sky_line_tag
+#    download = options.download
+#    env_file = options.env_file
+#    delete_working_files = options.delete_working_files
 
-    (options, args) = parser.parse_args()
-    year = options.year
-    doy = options.doy
-    sky_line_tag = options.sky_line_tag
-    download = options.download
-    env_file = options.env_file
+    # Parse the command line
+    parser = argparse.ArgumentParser(
+        description="MANGODisplay_OSN.py",
+        usage="%(prog)s -y YEAR -d DOY -t EMISSION_TAG [-e ENV_FILE] [-l] [-r]"
+    )
+    parser.add_argument("-y", "--year", dest="year", help="Year to be run", 
+                        metavar="YEAR", type=int, default=0)
+    parser.add_argument("-d", "--doy", dest="doy", help="Day of year to be run", 
+                        metavar="DOY", type=int, default=0)
+    parser.add_argument("-t", "--tag", dest="sky_line_tag", 
+                        help="XG for greenline, X or XR for redline", 
+                        metavar="TAG", type=str, default="XG")
+    parser.add_argument("-l", "--download", dest="download", 
+                        action="store_true", help="Download data")
+    parser.add_argument("-e", "--env", dest="env_file", help="Path to .env file", 
+                        metavar="ENV_FILE", type=str, default=".env")
+    parser.add_argument("-r", "--retain", dest="delete_working_files", 
+                        action="store_false", help="Retain working files")
+
+    args = parser.parse_args()
+    year = args.year
+    doy = args.doy
+    sky_line_tag = args.sky_line_tag
+    download = args.download
+    env_file = args.env_file
+    delete_working_files = args.delete_working_files
 
     # Defaults if no date is given
     if (doy == 0) or (year == 0):
@@ -681,9 +723,9 @@ if __name__=="__main__":
 
     # System parameters that need to be set
     system_parameters = {
-        'ASI_directory': '/home/jmakela/tmp/mango/asi/',
-        'FPI_directory': '/home/jmakela/tmp/mango/fpi/',
-        'output_directory': '/home/jmakela/tmp/mango/movies/'
+        'ASI_directory': '/home/airglow/tmp/mango/asi/',
+        'FPI_directory': '/home/airglow/tmp/mango/fpi/',
+        'output_directory': '/home/airglow/tmp/mango/movies/'
     }
 
     # Create directories if they don't exist
@@ -709,11 +751,11 @@ if __name__=="__main__":
             analysis_parameters['sites_asi'] = ['cfs', 'cvo', 'eio', 'mdk', 'mto', 'par']
             analysis_parameters['sites_fpi'] = ['cvo', 'low', 'blo', 'uao']
             analysis_parameters['emission'] = 'red'
-            analysis_parameters['Tlo'] = 8
-            analysis_parameters['Thi'] = 30
+            analysis_parameters['Tlo'] = 8#8#np.nan
+            analysis_parameters['Thi'] = 30#30#np.nan
 
         logger.info(f"Starting processing for {year} DOY {doy} with tag {sky_line_tag}")
-        MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, config)
+        MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, config, delete_working_files=delete_working_files)
         logger.info(f"Processing complete for {year} DOY {doy} with tag {sky_line_tag}")
     except Exception as error:
         logger.error(f"Error {doy} {year} {sky_line_tag}: {str(error)}")

@@ -3,7 +3,7 @@ try:
     import Image
 except ImportError:
     from PIL import Image
-import ASI
+import airglow.ASI
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.cm as cm
@@ -12,7 +12,7 @@ from scipy import ndimage
 from scipy import interpolate
 from matplotlib import dates
 import bottleneck as bn
-import TifImagePlugin
+import airglow.TifImagePlugin
 
 def DisplayRaw(f, cmin=None, cmax=None, dark=None, flips=None, info=True, sitename=None, filt=None, kernel_size = 1):
     # Function to display information about a raw ASI TIF image and

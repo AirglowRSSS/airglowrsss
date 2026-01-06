@@ -3,12 +3,12 @@ import matplotlib
 import numpy as np
 from scipy.io import loadmat, savemat
 import matplotlib.pyplot as plt
-import TifImagePlugin
+import airglow.TifImagePlugin as TifImagePlugin
 import datetime
 import os
 import array
 import glob
-import ASI
+import airglow.ASI as ASI
 
 BASE_IMAGING_DIRECTORY = '/rdata/airglow/zama/asi'
 

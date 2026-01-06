@@ -11,10 +11,11 @@ from glob import glob
 from pandas import date_range
 from scipy import interpolate
 import pytz,cv2
-import FPI,ASI
+import airglow.FPI as FPI
+import airglow.ASI as ASI
 import gc
 import matplotlib
-import fpiinfo
+import airglow.fpiinfo as fpiinfo
 
 def changeHistogram(data1,nbins=12):
     ind=~np.isnan(data1)

@@ -1,7 +1,7 @@
 import matplotlib
 #matplotlib.use('AGG')
 
-import ASIDisplay
+import airglow.ASIDisplay as ASIDisplay
 import numpy as np
 import os
 try:

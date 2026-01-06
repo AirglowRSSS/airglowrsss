@@ -2,7 +2,7 @@ from numpy import *
 import numpy as np
 import multiprocessing as mp
 
-NUM_PROCESSORS = 4
+#NUM_PROCESSORS = 4
 
 n_stds = None
 Bf     = None
@@ -12,7 +12,6 @@ x0_max = None
 y0_max = None
 
 def Gabor_Kernel(n_stds, theta_k, Bf, Btheta, frequency, DC = False):
-
     u     = frequency
 
     lam = 1./u
@@ -20,10 +19,15 @@ def Gabor_Kernel(n_stds, theta_k, Bf, Btheta, frequency, DC = False):
     sigma_x   = lam*sqrt(2*log(2))/(2*pi*tanh(Bf/2.*log(2)))
     sigma_y   = lam*sqrt(2*log(2))/(2*pi)*1./tan(Btheta/2.)
 
-    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
-    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+#    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
+#    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+    x0 = np.ceil(np.max([np.abs(n_stds * sigma_x * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1]))
+    y0 = np.ceil(np.max([np.abs(n_stds * sigma_y * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1]))
+
 
     Y, X = np.mgrid[-y0:y0 + 1, -x0:x0 + 1]
     g     = zeros([X.shape[0], X.shape[1]], dtype = 'complex')
@@ -52,7 +56,6 @@ def Gabor_Kernel_PLL(args):
     global y0_max
 
     frequency, theta_k = args
-
     u     = frequency
 
     lam = 1./u
@@ -60,10 +63,14 @@ def Gabor_Kernel_PLL(args):
     sigma_x   = lam*sqrt(2*log(2))/(2*pi*tanh(Bf/2.*log(2)))
     sigma_y   = lam*sqrt(2*log(2))/(2*pi)*1./tan(Btheta/2.)
 
-    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
-    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+#    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
+#    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+    x0 = np.ceil(np.max([np.abs(n_stds * sigma_x * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1]))
+    y0 = np.ceil(np.max([np.abs(n_stds * sigma_y * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1]))
 
     # make all of the kernels the same size
     x0 = x0_max
@@ -91,10 +98,14 @@ def Gabor_Kernel_Sigma(n_stds, theta_k, sigma_x, sigma_y, frequency, DC = False)
     u     = frequency
     lam = 1./u
 
-    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
-    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+#    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
+#    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+    x0 = np.ceil(np.max([np.abs(n_stds * sigma_x * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1]))
+    y0 = np.ceil(np.max([np.abs(n_stds * sigma_y * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1]))
 
     Y, X = np.mgrid[-y0:y0 + 1, -x0:x0 + 1]
 
@@ -131,10 +142,14 @@ def Gabor_Kernel_FT(n_stds, theta_k, Bf, Btheta, frequency, DC = False):
     sigma_x   = lam*sqrt(2*log(2))/(2*pi*tanh(Bf/2.*log(2)))
     sigma_y   = lam*sqrt(2*log(2))/(2*pi)*1./tan(Btheta/2.)
 
-    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
-    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+#    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
+#    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+    x0 = np.ceil(np.max([np.abs(n_stds * sigma_x * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1]))
+    y0 = np.ceil(np.max([np.abs(n_stds * sigma_y * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1]))
 
     Y, X = np.mgrid[-y0:y0 + 1, -x0:x0 + 1]
     V, U = np.mgrid[-1/2.:1/2.:1j*X.shape[0], -1/2.:1/2.:1j*X.shape[1]]
@@ -156,10 +171,15 @@ def Gabor_Kernel_FT_Sigma(n_stds, theta_k, sigma_x, sigma_y, frequency, DC = Fal
     u     = frequency
     lam = 1./u
 
-    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
-    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
-                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+#    x0 = np.ceil(max(np.abs(n_stds * sigma_x * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1))
+#    y0 = np.ceil(max(np.abs(n_stds * sigma_y * np.cos(theta_k)),
+#                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1))
+    x0 = np.ceil(np.max([np.abs(n_stds * sigma_x * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_y * np.sin(theta_k)), 1]))
+    y0 = np.ceil(np.max([np.abs(n_stds * sigma_y * np.cos(theta_k)),
+                     np.abs(n_stds * sigma_x * np.sin(theta_k)), 1]))
+
 
     Y, X = np.mgrid[-y0:y0 + 1, -x0:x0 + 1]
     V, U = np.mgrid[-1/2.:1/2.:1j*X.shape[0], -1/2.:1/2.:1j*X.shape[1]]
@@ -221,8 +241,8 @@ def Create_FilterBank_Gabor(n_stdsarg, carriers, orientations, Bfarg, Bthetaarg,
     x0_max = np.ceil(np.max(xa))
     y0_max = np.ceil(np.max(ya))
 
-    print('x0_max: %d' % x0_max)
-    print('y0_max: %d' % y0_max)
+#    print('x0_max: %d' % x0_max)
+#    print('y0_max: %d' % y0_max)
 
     for l, u_l in enumerate(carriers):
         g.append([])
@@ -250,7 +270,7 @@ def Create_FilterBank_Gabor(n_stdsarg, carriers, orientations, Bfarg, Bthetaarg,
             g[l][k] = g_LIST[p]
             p = p + 1
 
-    print("finished.")
+#    print("finished.")
 
     return g
 
@@ -544,7 +564,8 @@ def flower_plot(u, theta, Bf, Btheta):
             hp_ellipse.set_facecolor('none')
 
     xlim(-1,1); ylim(-1,1);
-    title('Filter Bank ($B_f = %0.2f$, $B_{\\theta} = %0.2f^{\circ}$)' % (Bf, degrees(Btheta)));
+    title(r'Filter Bank ($B_f = %0.2f$, $B_{\theta} = %0.2f^{\circ}$)' % (Bf, degrees(Btheta)))
+#    title('Filter Bank ($B_f = %0.2f$, $B_{\\theta} = %0.2f^{\circ}$)' % (Bf, degrees(Btheta)));
     xlabel('$u$'); ylabel('$v$');
     axvline(0.5, color='k', linestyle='dashed', linewidth=2)
     axvline(-0.5, color='k', linestyle='dashed', linewidth=2)
@@ -570,7 +591,8 @@ def flower_plot_sigma(u, theta, sigma_x, sigma_y):
             hp_ellipse.set_facecolor('none')
 
     xlim(-1,1); ylim(-1,1);
-    title('Filter Bank ($B_f = %0.2f$, $B_{\\theta} = %0.2f^{\circ}$)' % (Bf, degrees(Btheta)));
+    title(r'Filter Bank ($B_f = %0.2f$, $B_{\theta} = %0.2f^{\circ}$)' % (Bf, degrees(Btheta)))
+#    title('Filter Bank ($B_f = %0.2f$, $B_{\\theta} = %0.2f^{\circ}$)' % (Bf, degrees(Btheta)));
     xlabel('$u$'); ylabel('$v$');
     axvline(0.5, color='k', linestyle='dashed', linewidth=2)
     axvline(-0.5, color='k', linestyle='dashed', linewidth=2)

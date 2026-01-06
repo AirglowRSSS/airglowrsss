@@ -1,3 +1,10 @@
+# At the very top, before any other imports
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='google.protobuf')
+
 import matplotlib.pyplot as plt
 import xarray as xr
 import h5py
@@ -5,11 +12,11 @@ import pandas as pd
 import pytz
 from scipy.signal import medfilt2d
 import subprocess
-import fpiinfo
-import BoltwoodSensor
-import asiinfo
+import airglow.fpiinfo as fpiinfo
+import airglow.BoltwoodSensor as BoltwoodSensor
+import airglow.asiinfo as asiinfo
 import ephem
-import gabor
+import airglow.gabor as gabor
 import multiprocessing as mp
 import numpy.fft as fft
 from skimage.feature import peak_local_max
