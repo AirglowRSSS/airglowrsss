@@ -205,6 +205,36 @@ _sites['mro'] = {
         'borders':      True,
     }
 
+_sites['ovi'] = {
+        'Location':     (37+14/60.+20/3600.,-(118+16/60.+55/3600.),0.),
+        'Name':         'Owens Valley Radio Observatory',
+        'Abbreviation': 'OVI',
+        'Timezone':     'US/Pacific',
+        'sql_id':       None,
+        'share':        False,
+        'borders':      True,
+    }
+
+_sites['lao'] = {
+        'Location':     (37+37/60.+19/3600.,-(97+37/60.+36/3600.),0.),
+        'Name':         'Lake Afton Observatory',
+        'Abbreviation': 'LAO',
+        'Timezone':     'US/Central',
+        'sql_id':       None,
+        'share':        False,
+        'borders':      True,
+    }
+
+_sites['pfo'] = {
+        'Location':     (33+36/60.+43/3600.,-(116+27/60.+32/3600.),0.),
+        'Name':         'Pinyon Flats Observatory',
+        'Abbreviation': 'PFO',
+        'Timezone':     'US/Pacific',
+        'sql_id':       None,
+        'share':        False,
+        'borders':      True,
+    }
+
 _sites['bdr'] = {
         'Location':     (31+14/60.+13/3600.,-(98+18/60.+53/3600.),0.),
         'Name':         'Big Dog Ranch',
