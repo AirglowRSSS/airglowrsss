@@ -742,13 +742,13 @@ if __name__=="__main__":
     # Run the code
     try:
         if sky_line_tag == 'XG':
-            analysis_parameters['sites_asi'] = ['cvo', 'low', 'blo', 'cfs', 'mro', 'bdr', 'new']
+            analysis_parameters['sites_asi'] = ['bdr', 'blo', 'cfs', 'cvo', 'low', 'mro', 'new', 'ovi', 'pfo']
             analysis_parameters['sites_fpi'] = ['cvo', 'low', 'blo']
             analysis_parameters['emission'] = 'green'
             analysis_parameters['Tlo'] = 2
             analysis_parameters['Thi'] = 20
         elif sky_line_tag == 'XR':
-            analysis_parameters['sites_asi'] = ['cfs', 'cvo', 'eio', 'mdk', 'mto', 'par']
+            analysis_parameters['sites_asi'] = ['cfs', 'cvo', 'eio', 'mdk', 'mto', 'par', 'lao']
             analysis_parameters['sites_fpi'] = ['cvo', 'low', 'blo', 'uao']
             analysis_parameters['emission'] = 'red'
             analysis_parameters['Tlo'] = 8#8#np.nan
