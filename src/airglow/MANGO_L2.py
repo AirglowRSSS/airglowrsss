@@ -72,26 +72,118 @@ def load_hdf5_to_xarray(file_path, kernel_size=7, runClassifier = False):
 #           Longitude (float) - longtitude for each pixel, in deg E (dims: north, east)
 #           CCDTemperature (float) - CCD temperature, in C (dim: time)
 
+#    # Read in the HDF5 file into a temporary array
+#    data_arrays = {}
+#    with h5py.File(file_path, 'r') as hdf:
+#        for key in hdf.keys():
+#            # Check if the item is a dataset
+#            if isinstance(hdf[key], h5py.Dataset):
+#                # Load the dataset into an xarray DataArray
+#                data_arrays[key] = xr.DataArray(hdf[key][...], name=key)
+#
+#    # Convert Unix times to datetime objects
+#    unix_times_start = data_arrays['UnixTime'][0].values
+#    start_times = pd.to_datetime(unix_times_start, unit='s', utc=True)
+#    
+#    unix_times_stop = data_arrays['UnixTime'][1].values
+#    stop_times = pd.to_datetime(unix_times_stop, unit='s', utc=True)
+#    
+#    # Calculate integration time and ensure it's a float
+#    integration_time_values = (stop_times - start_times).total_seconds()
+#    integration_time_values = integration_time_values.astype(float)
+#    
+#    # Ensure 'time' is numpy.datetime64
+#    start_times_np = np.array(start_times, dtype='datetime64[ns]')
+#
+#    # Rename the dimensions of the ImageData
+#    image_data = data_arrays['ImageData'].rename({'dim_0': 'time', 'dim_1': 'north', 'dim_2': 'east'})
+#    image_data.attrs['description'] = 'Pixel values of image at each time step'
+#
+#    # Process other variables
+#    azimuth = data_arrays['Azimuth'].rename({'dim_0': 'north', 'dim_1': 'east'})
+#    azimuth.attrs['units'] = 'Degrees'
+#    azimuth.attrs['description'] = 'Azimuth of each pixel'
+#    elevation = data_arrays['Elevation'].rename({'dim_0': 'north', 'dim_1': 'east'})
+#    elevation.attrs['units'] = 'Degrees'
+#    elevation.attrs['description'] = 'Elevation of each pixel'
+#    latitude = data_arrays['Latitude'].rename({'dim_0': 'north', 'dim_1': 'east'})
+#    latitude.attrs['units'] = 'Degrees N'
+#    latitude.attrs['description'] = 'Geodetic latitude of each pixel'
+#    longitude = data_arrays['Longitude'].rename({'dim_0': 'north', 'dim_1': 'east'})
+#    longitude.attrs['units'] = 'Degrees E'
+#    longitude.attrs['description'] = 'Geodetic longitude of each pixel'
+#    CCDTemperature = data_arrays['CCDTemperature'].rename({'dim_0': 'time'})
+#    CCDTemperature.attrs['units'] = 'Celcius'
+#    CCDTemperature.attrs['description'] = 'Temperature of CCD'
+#
+#    north_array = xr.DataArray(data_arrays['PixelCoordinates'][0][0,:], dims=('north'))
+#    north_array.attrs['units'] = 'km'
+#    north_array.attrs['description'] = 'Distance in north direction from site at airglow layer'
+#    east_array = xr.DataArray(data_arrays['PixelCoordinates'][1][:,0], dims=('east'))
+#    east_array.attrs['units'] = 'km'
+#    east_array.attrs['description'] = 'Distance in east direction from site at airglow layer'
+
     # Read in the HDF5 file into a temporary array
     data_arrays = {}
     with h5py.File(file_path, 'r') as hdf:
-        for key in hdf.keys():
-            # Check if the item is a dataset
-            if isinstance(hdf[key], h5py.Dataset):
-                # Load the dataset into an xarray DataArray
-                data_arrays[key] = xr.DataArray(hdf[key][...], name=key)
+        # Detect format version by checking if 'Elevation' exists at root
+        is_old_format = 'Elevation' in hdf
+    
+        if is_old_format:
+            # Old format: keys at root level
+            key_mapping = {
+                'ImageData': 'ImageData',
+                'UnixTime': 'UnixTime',
+                'Elevation': 'Elevation',
+                'Azimuth': 'Azimuth',
+                'Latitude': 'Latitude',
+                'Longitude': 'Longitude',
+                'CCDTemperature': 'CCDTemperature',
+                'PixelCoordinates': 'PixelCoordinates'
+            }
+        else:
+            # New format: keys nested in groups
+            key_mapping = {
+                'ImageData': 'ImageData',
+                'UnixTime': 'UnixTime',
+                'Elevation': 'Coordinates/Elevation',
+                'Azimuth': 'Coordinates/Azimuth',
+                'Latitude': 'Coordinates/Latitude',
+                'Longitude': 'Coordinates/Longitude',
+                'CCDTemperature': 'DataQuality/CCDTemperature',
+#                'PixelCoordinates': 'Coordinates/XYGrid'
+                'PixelCoordinates': 'Coordinates/PixelCoordinates'
+            }
+    
+        # Load datasets using the appropriate paths
+        for logical_name, hdf_path in key_mapping.items():
+            if hdf_path in hdf and isinstance(hdf[hdf_path], h5py.Dataset):
+                data_arrays[logical_name] = xr.DataArray(hdf[hdf_path][...], name=logical_name)
+
+#    # Convert Unix times to datetime objects
+#    unix_times_start = data_arrays['UnixTime'][0].values
+#    start_times = pd.to_datetime(unix_times_start, unit='s', utc=True)
+#
+#    unix_times_stop = data_arrays['UnixTime'][1].values
+#    stop_times = pd.to_datetime(unix_times_stop, unit='s', utc=True)
 
     # Convert Unix times to datetime objects
-    unix_times_start = data_arrays['UnixTime'][0].values
+    if is_old_format:
+        # Old format: [2, n_times] - first index is start/stop
+        unix_times_start = data_arrays['UnixTime'][0].values
+        unix_times_stop = data_arrays['UnixTime'][1].values
+    else:
+        # New format: [n_times, 2] - second index is start/stop
+        unix_times_start = data_arrays['UnixTime'][:, 0].values
+        unix_times_stop = data_arrays['UnixTime'][:, 1].values
+
     start_times = pd.to_datetime(unix_times_start, unit='s', utc=True)
-    
-    unix_times_stop = data_arrays['UnixTime'][1].values
     stop_times = pd.to_datetime(unix_times_stop, unit='s', utc=True)
-    
+
     # Calculate integration time and ensure it's a float
     integration_time_values = (stop_times - start_times).total_seconds()
     integration_time_values = integration_time_values.astype(float)
-    
+
     # Ensure 'time' is numpy.datetime64
     start_times_np = np.array(start_times, dtype='datetime64[ns]')
 
@@ -99,19 +191,23 @@ def load_hdf5_to_xarray(file_path, kernel_size=7, runClassifier = False):
     image_data = data_arrays['ImageData'].rename({'dim_0': 'time', 'dim_1': 'north', 'dim_2': 'east'})
     image_data.attrs['description'] = 'Pixel values of image at each time step'
 
-    # Process other variables
+    # Process other variables (rest of code unchanged)
     azimuth = data_arrays['Azimuth'].rename({'dim_0': 'north', 'dim_1': 'east'})
     azimuth.attrs['units'] = 'Degrees'
     azimuth.attrs['description'] = 'Azimuth of each pixel'
+
     elevation = data_arrays['Elevation'].rename({'dim_0': 'north', 'dim_1': 'east'})
     elevation.attrs['units'] = 'Degrees'
     elevation.attrs['description'] = 'Elevation of each pixel'
+
     latitude = data_arrays['Latitude'].rename({'dim_0': 'north', 'dim_1': 'east'})
     latitude.attrs['units'] = 'Degrees N'
     latitude.attrs['description'] = 'Geodetic latitude of each pixel'
+
     longitude = data_arrays['Longitude'].rename({'dim_0': 'north', 'dim_1': 'east'})
     longitude.attrs['units'] = 'Degrees E'
     longitude.attrs['description'] = 'Geodetic longitude of each pixel'
+
     CCDTemperature = data_arrays['CCDTemperature'].rename({'dim_0': 'time'})
     CCDTemperature.attrs['units'] = 'Celcius'
     CCDTemperature.attrs['description'] = 'Temperature of CCD'
@@ -119,6 +215,7 @@ def load_hdf5_to_xarray(file_path, kernel_size=7, runClassifier = False):
     north_array = xr.DataArray(data_arrays['PixelCoordinates'][0][0,:], dims=('north'))
     north_array.attrs['units'] = 'km'
     north_array.attrs['description'] = 'Distance in north direction from site at airglow layer'
+
     east_array = xr.DataArray(data_arrays['PixelCoordinates'][1][:,0], dims=('east'))
     east_array.attrs['units'] = 'km'
     east_array.attrs['description'] = 'Distance in east direction from site at airglow layer'
