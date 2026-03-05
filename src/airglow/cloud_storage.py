@@ -55,15 +55,16 @@ class CloudStorage:
     def list_objects(self, prefix: str) -> List[str]:
         """List objects in the bucket with the given prefix, excluding the directory itself."""
         try:
-            response = self.client_s3v4.list_objects_v2(
-                Bucket=self.bucket,
-                Prefix=prefix
-            )
+            paginator = self.client_s3v4.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
             
-            if 'Contents' in response:
-                # Filter out objects that match the prefix exactly (which is the directory itself)
-                return [obj['Key'] for obj in response['Contents'] if obj['Key'] != prefix]
-            return []
+            return [
+                obj['Key']
+                for page in pages
+                if 'Contents' in page
+                for obj in page['Contents']
+                if obj['Key'] != prefix
+            ]
             
         except ClientError as e:
             self.logger.error(f"Error listing objects with prefix {prefix}: {str(e)}")

@@ -287,7 +287,7 @@ def generate_video(png_pattern, mp4file):
     else:
         logger.error(f"Failed to generate video: {mp4file}")
 
-def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, config, delete_working_files=True):
+def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, config, delete_working_files=True, clim_percentile=(2, 98)):
     """
     Runs the full process of creating a fusion movie with MANGO imaging data and
     FPI data overplotted. Results in a mp4 file. All data downloaded and created
@@ -468,6 +468,30 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
     # Ensure output directory exists
     os.makedirs(system_parameters['output_directory'], exist_ok=True)
 
+    # Pre-compute a single fixed colormap range across all sites and all frames
+    # to prevent per-frame clim variation that causes flickering in the output movie.
+    # Subsample frames to keep memory under ~10M values: use every Nth frame where
+    # N = max(1, n_times // 30), ensuring at least 30 representative frames per site.
+    _clim_samples = []
+    for _site in ds.keys():
+        if 'FilteredImageData' not in ds[_site]:
+            continue
+        _fid = ds[_site]['FilteredImageData']
+        _mask = (ds[_site]['Elevation'] > analysis_parameters['el_cutoff']).values
+        _n = len(ds[_site].time)
+        _step = max(1, _n // 30)
+        for _ti in range(0, _n, _step):
+            _frame = _fid.isel(time=_ti).values
+            _valid = _frame[_mask]
+            _clim_samples.append(_valid[np.isfinite(_valid)])
+    if _clim_samples:
+        _all_data = np.concatenate(_clim_samples)
+        vmin = float(np.nanpercentile(_all_data, clim_percentile[0]))
+        vmax = float(np.nanpercentile(_all_data, clim_percentile[1]))
+    else:
+        vmin, vmax = None, None
+    logger.info(f"Colormap limits: vmin={vmin}, vmax={vmax}")
+
     # THIS WOULD BE THE LOOP START
     for target_time in unique_times:
         fig = plt.figure(figsize=params['figsize'])
@@ -493,7 +517,7 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
                     longitude = data.Longitude
                     mask = data.Elevation > analysis_parameters['el_cutoff']
 
-                    pc = axes00.pcolormesh(longitude, latitude, data.FilteredImageData.where(mask), transform=crs.PlateCarree(), cmap=params['cmap'])
+                    pc = axes00.pcolormesh(longitude, latitude, data.FilteredImageData.where(mask), transform=crs.PlateCarree(), cmap=params['cmap'], vmin=vmin, vmax=vmax)
 
         # Set the title and limits of the map
         axes00.set_title('%s UT' % pd.to_datetime(str(target_time)))
