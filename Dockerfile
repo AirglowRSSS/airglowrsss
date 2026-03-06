@@ -4,4 +4,4 @@ COPY pyproject.toml /project/
 
 RUN pip install .
 COPY src/airglow/ /project/airglow/
-RUN pip install -e .
+RUN pip install -e ".[dagster]"
