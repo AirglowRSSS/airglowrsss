@@ -4,5 +4,6 @@ WORKDIR /project
 
 COPY pyproject.toml README.md /project/
 COPY src/ /project/src/
+COPY src/airglow/ /project/airglow/
 
 RUN pip install -e ".[dagster]"
