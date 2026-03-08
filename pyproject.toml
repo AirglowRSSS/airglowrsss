@@ -43,5 +43,9 @@ code_location_name = "src"
 where = ["src"]
 exclude = ["dagster_airglow_tests"]
 
+[tool.setuptools.package-dir]
+"" = "src"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
