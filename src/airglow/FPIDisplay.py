@@ -1495,7 +1495,7 @@ def PlotDiagnosticDay(f, cloud_thresh = [-22.,-10.],\
 
     ax = fig.add_subplot(428, projection='polar')
     ax.plot(valid_az_rad, valid_ze, 'kx', label = 'valid')
-    valid_idx = [d is not 'Unknown' for d in direction]
+    valid_idx = [d != 'Unknown' for d in direction]
     invalid_idx = [not i for i in valid_idx]
     ax.plot(az_rad[np.where(valid_idx)], all_ze[np.where(valid_idx)], 'k.', label = 'actual')
     ax.plot(az_rad[np.where(invalid_idx)], all_ze[np.where(invalid_idx)], 'r.', label = 'unrecognized')
@@ -1684,7 +1684,7 @@ def __add_skyline2diagnostic(fig,npzpath,sky_line_tag='X',sky_quality_thresh = N
 
     ax = fig.add_subplot(6,2,12, projection='polar')
     ax.plot(valid_az_rad, valid_ze, 'kx', label = 'valid')
-    valid_idx = [d is not 'Unknown' for d in direction]
+    valid_idx = [d != 'Unknown' for d in direction]
     invalid_idx = [not i for i in valid_idx]
     ax.plot(az_rad[np.where(valid_idx)], all_ze[np.where(valid_idx)], 'k.', label = 'actual')
     ax.plot(az_rad[np.where(invalid_idx)], all_ze[np.where(invalid_idx)], 'r.', label = 'unrecognized')
@@ -2203,14 +2203,18 @@ def DisplayRaw(f, cmin=None, cmax=None):
     print ('CCD Temperature: %.1f C' % d.info['CCDTemperature'])
     print ('SkyScanner Direction (az, ze): (%.1f, %.1f)' % (d.info['azAngle'], d.info['zeAngle']))
 
-    p = plt.matshow(np.reshape(d.getdata(),d.size))
+#    p = plt.matshow(np.reshape(d.getdata(),d.size))
+    p = plt.matshow(np.asarray(d))
     if cmin is not None:
         plt.clim([cmin,cmax])
-        plt.title(d.info['LocalTime'].strftime('%Y-%m-%d %H:%M:%S LT'))
-        plt.colorbar(ax=p.axes,orientation='vertical',shrink=0.8)
+    else:
+        plt.clim([np.percentile(d,5), np.percentile(d,95)])
+        
+    plt.title(d.info['LocalTime'].strftime('%Y-%m-%d %H:%M:%S LT'))
+    plt.colorbar(ax=p.axes,orientation='vertical',shrink=0.8)
 
-        p.axes.get_xaxis().set_visible(False)
-        p.axes.get_yaxis().set_visible(False)
+    p.axes.get_xaxis().set_visible(False)
+    p.axes.get_yaxis().set_visible(False)
 
     return p
 
