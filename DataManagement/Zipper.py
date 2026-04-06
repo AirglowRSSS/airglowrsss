@@ -1,36 +1,132 @@
 #!/usr/bin/python
-'''
-Script to Zip, Split and Move recent data to Sending Folder
-  -s to add SITE - XXX location name
-  -i to add INSTRUMENT - XXX instrument name
-  -n to add NUMBER - # instrument number/letter
-  -p to add PRIORDAYS - # Send additional days back
-  -y to add YEAR - (USE WITH -d) #### Send a specific Year-Doy back
-  -d to add DOY - (USE WITH -y) ### Send a specific Year-Doy back
-  -S to add Search - (USE WITH -S) ### Search all IMG files, Sort, Zip, and Split them.
+"""Script to Zip, Split and Move recent data to Sending Folder.
+
+CLI flags:
+    -s SITE        3-letter site code
+    -i INSTRUMENT  instrument code: fpi, bwc, nfi, asi, pic, sky, scn, tec, x3t
+    -n NUMBER      instrument number/letter (zero-padded to 2 chars)
+    -p DAYSPRIOR   number of prior days to process (default 1)
+    -y YEAR        specific year (used with -d)
+    -d DOY         specific day-of-year (used with -y)
+    -S SEARCH_DIR  directory to search for all .img files
 
 History: 2 Oct 2012 - initial script written
         17 Jul 2012 - new server update
         12 Feb 2014 - Updated to v3.0 - txtcheck
         31 Mar 2016 - Added email addresses so emails can be sent directly
-        31 Aug 2020 - Addd search function by L. Navarro
+        31 Aug 2020 - Added search function by L. Navarro
 
 Written by Daniel J. Fisher (dfisher2@illinois.edu)
-'''
+Refactored by Jonathan J. Makela (jmakela@illinois.edu) with CLAUDE on Apr 6, 2026
+"""
 
-# Import required modules
-import os
-import sys
-from glob import glob
+# Dependencies:
+#   stdlib:     argparse, datetime, logging, os, shutil, subprocess, sys,
+#               tarfile, time, urllib.request, collections, dataclasses,
+#               glob, itertools, pathlib
+#   third-party: pytz, Pillow (PIL) [optional, searcher() only]
+#   local:      Emailer, X300Sensor [optional, x3t only],
+#               ImgImagePlugin [optional, searcher() only]
+
+import argparse
 import datetime as dt
-import urllib
-import tarfile
+import logging
+import os
 import shutil
-from optparse import OptionParser
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
 from collections import defaultdict
-import Emailer
-import pytz
+from dataclasses import dataclass
+from glob import glob
+from itertools import groupby
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Union
 
+import pytz
+import Emailer
+
+# PIL/Pillow — optional; only needed by searcher()
+try:
+    from PIL import Image
+    import ImgImagePlugin
+except ImportError:
+    Image = None
+    ImgImagePlugin = None
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+MIN_FILE_SIZE_BYTES: int = 1_000
+SPLIT_CHUNK_BYTES: int = 5 * 1024 * 1024  # 5 MB chunks
+FPI_DAY_START_HOUR: int = 12              # local noon — FPI night starts here
+
+
+# ---------------------------------------------------------------------------
+# DateBundle
+# ---------------------------------------------------------------------------
+@dataclass
+class DateBundle:
+    """Pre-computed date strings for a single processing day.
+
+    Attributes:
+        date: The data day (yesterday, or specified).
+        next_date: Data day + 1.
+        today: Actual today.
+    """
+
+    date: dt.date
+    next_date: dt.date
+    today: dt.date
+
+    @property
+    def year(self) -> str:
+        return self.date.strftime('%Y')
+
+    @property
+    def yr(self) -> str:
+        return self.date.strftime('%y')
+
+    @property
+    def month(self) -> str:
+        return self.date.strftime('%m')
+
+    @property
+    def mon(self) -> str:
+        return self.date.strftime('%b')
+
+    @property
+    def day(self) -> str:
+        return self.date.strftime('%d')
+
+    @property
+    def doy(self) -> str:
+        return self.date.strftime('%j')
+
+    @property
+    def nday(self) -> str:
+        return self.next_date.strftime('%d')
+
+    @property
+    def tyear(self) -> str:
+        return self.today.strftime('%Y')
+
+    @property
+    def tmonth(self) -> str:
+        return self.today.strftime('%m')
+
+    @property
+    def tday(self) -> str:
+        return self.today.strftime('%d')
+
+
+# ---------------------------------------------------------------------------
+# activeinstruments — content frozen, do not modify
+# ---------------------------------------------------------------------------
 def activeinstruments():
     '''
     Summary:
@@ -201,503 +297,637 @@ def activeinstruments():
     return(code)
 
 
-def doer(site,instr,num,prior=1,pyear=0,pdoy=0):
-    '''
-    Summary:
-        doer(site,instr,num,prior,pyear,pdoy)
-        Zips, splits, and moves all data to Sending Folder
+# ---------------------------------------------------------------------------
+# Core utilities
+# ---------------------------------------------------------------------------
+def zipper(name: Union[str, List[str]], filename: str) -> None:
+    """Create a gzip-compressed tar archive.
 
-    Inputs:
-        site =  XXX - location name
-        instr = XXX - instrument name
-        num =   ##  - instrument number or letter
-        prior = #   - Send additional days back (optional)
-        pyear = ### - Year to send back (optional)
-        pdoy =  ### - DOY to send back (optional)
-
-    History:
-        7/17/13 -- Written by DJF (dfisher2@illinois.edu)
-    '''
-
-    # Minimum file size for writing (to find "empty" folders)
-    mfs = 1000
-
-    code = activeinstruments()
-
-    # Go through all possible days
-    for dback in range(prior,0,-1):
-
-        # Get yesterdays day's date
-        d = dt.datetime.today()-dt.timedelta(dback)
-        doy = d.strftime('%j')
-        year = d.strftime('%Y')
-        yr = d.strftime('%y')
-        month = d.strftime('%m')
-        mon = d.strftime('%b')
-        day = d.strftime('%d')
-
-        # Get today's date
-        d = dt.datetime.today()-dt.timedelta(dback-1)
-        nday = d.strftime('%d')
-        now = dt.datetime.utcnow()
-
-        # Get todays day's date
-        d = dt.datetime.today()
-        tyear = d.strftime('%Y')
-        tmonth = d.strftime('%m')
-        tday = d.strftime('%d')
-
-        # Do single day (assumes no -p)
-        if pyear > 0:
-            d = dt.date.fromordinal(dt.datetime(pyear,1,1).toordinal()-1+pdoy)
-            doy = d.strftime('%j')
-            year = d.strftime('%Y')
-            yr = d.strftime('%y')
-            month = d.strftime('%m')
-            mon = d.strftime('%b')
-            day = d.strftime('%d')
-
-            # Get prior day's date
-            d = dt.date.fromordinal(dt.datetime(pyear,1,1).toordinal()-1+pdoy+1)
-            nday = d.strftime('%d')
-
-        print (instr+': '+day+'-'+mon+'-'+year)
-        # Go to local directory!
-        os.chdir(code[site][instr][num]['local_dir'])
-        filename = "%03s%02s_%s_%04s%02s%02s.tar.gz" %(instr,num,site,year,month,day)
-        checkname = "%03s%02s_%s_%04s%02s%02s.txt" %(instr,num,site,year,month,day)
-
-
-    ########## TO ZIP UP FPI ##########
-        if 'fpi' == instr:
-            # Grab all files made within 24 hour period
-            name = [f for f in glob(os.path.join('*','*.img')) if (dt.datetime(int(year),int(month),int(day),12) < dt.datetime.fromtimestamp(os.path.getmtime(f)) and dt.datetime.fromtimestamp(os.path.getmtime(f)) < (dt.datetime(int(year),int(month),int(day),12)+dt.timedelta(1)))]
-            if name == []:
-                # Try the new format
-                name = [f for f in glob(os.path.join('*','*.hdf5')) if (dt.datetime(int(year),int(month),int(day),12) < dt.datetime.fromtimestamp(os.path.getmtime(f)) and dt.datetime.fromtimestamp(os.path.getmtime(f)) < (dt.datetime(int(year),int(month),int(day),12)+dt.timedelta(1)))]
-            #for printing purposes only
-            print(name)
-            _f=[]
-            for nn in name:
-                if os.path.dirname(nn) not in _f:
-                    _f.append(os.path.dirname(nn))
-            for __i in _f:
-                print ("Zipping from %s/%s"%( code[site][instr][num]['local_dir'], __i ))
-            #
-            zipper(name,filename)
-            splitter(site,instr,num,code,filename,checkname,mfs)
-            os.remove(code[site][instr][num]['local_dir']+filename)
-
-
-    ########## TO ZIP UP NFI/ASI ##########
-        if 'asi' == instr: # or 'nfi' == instr:
-            name = "%02s-%02s" %(day,nday)
-            os.chdir(code[site][instr][num]['local_dir']+year)
-            # Gun-Tar Folder
-            tar = tarfile.open(filename,"w:gz")
-            try:
-                # Change folder name to doy before tarballing & then change back
-                os.rename(code[site][instr][num]['local_dir']+year+'/'+mon+name,code[site][instr][num]['local_dir']+year+'/'+doy)
-                tar.add(doy);
-                os.rename(code[site][instr][num]['local_dir']+year+'/'+doy,code[site][instr][num]['local_dir']+year+'/'+mon+name)
-            except:
-                print ("!!! No Data")
-            tar.close()
-            splitter(site,instr,num,code,filename,checkname,mfs)
-            os.remove(code[site][instr][num]['local_dir']+year+'/'+filename)
-
-
-    ########## TO ZIP UP x300 ##########
-        if 'x3t' == instr:
-            sys.path = sys.path + [code[site][instr][num]['local_dir']]
-            import X300Sensor
-
-            filename = "TempL%02s_%s_%04s%02s%02s.txt" %(num,site,year,month,day)
-
-            localpath=code[site][instr][num]['local_dir']+'/X300_temp_log.txt'
-            if os.path.exists(localpath):
-                os.remove(localpath)
-            if 'api/history' in code[site][instr][num]['url']:
-                print ("homeassistant starts...")
-                sys.path = sys.path + ['C:\Scripts',]
-                from read_history_hass import query_sensor
-                d0=(dt.datetime.now()-dt.timedelta(days=30)).replace(tzinfo=pytz.UTC)
-                data=query_sensor('sensor.lumi_lumi_weather_temperature',begin=d0)
-                h=open(localpath,'w')
-                h.write("date,temp#hass\n")
-                for _date,_temp in data:
-                    line="%s,%.2f\n"%(_date.strftime("%Y/%m/%d %H:%M:%S"),_temp)
-                    h.write(line)
-                h.close()
-                sys.path.pop()
-            else:
-                print ('try reading from rpi or x300')
-                ntry=5
-                while ntry>0:
-                    try:
-                        urllib.urlretrieve(code[site][instr][num]['url'],localpath)
-                        if os.stat(localpath).st_size > 100:
-                            print ('success!')
-                            break
-                    except:
-                        pass
-                    ntry=ntry-1
-                    import time
-                    time.sleep(1)
-
-            os.chmod(localpath,0o777)
-
-            args=[dt.datetime(int(year),1,1)+ dt.timedelta(days = int(doy)-1),
-                    code[site][instr][num]['local_dir'],
-                    code[site][instr][num]['send_dir'],
-                    site,]
-            if ('api/history' in code[site][instr][num]['url']) or ('raspberry' in code[site][instr][num]['url']):
-                kwargs={'num':num,'dtfmt':"%Y/%m/%d"}
-            else:
-                kwargs={}
-            #try:
-            X300Sensor.WriteLogFromRaw(*args,**kwargs)
-            #except:
-            #    try:
-            #        X300Sensor.WriteLogFromRaw(*args,**kwargs)
-            #    except:
-            #        print 'X300 Error!'
-
-            # Check filesize for offline X300
-            if os.stat(code[site][instr][num]['send_dir']+filename).st_size < 100:
-                # Send checkfile that system is down!
-                print ('No Data ERROR!!!')
-                check = open(checkname, 'w')
-                check.write(filename+'\n0\n0\n'+str(now)+'\n999\n')
-                # Legend for checkfile + boosts size for Sending
-                check.write('1: 1st file name\n2: Number of parts\n3: Size of tar.gz\n4: Time of Creation\n5: GB Disk Free')
-
-            # Get as much current day as possible to cover all night
-            if prior == 1:
-                args[0]=dt.datetime(int(year),1,1)+ dt.timedelta(days = int(doy))
-                X300Sensor.WriteLogFromRaw(*args,**kwargs)
-                #filename = "TempL%02s_%s_%04s%02s%02s.txt" %(num,site,tyear,tmonth,tday)
-                #X300Sensor.WriteLogFromRaw(dt.datetime(int(year),1,1)+ dt.timedelta(days = int(doy)),code[site][instr][num]['local_dir'],code[site][instr][num]['send_dir'],site,num=num)
-            #os.system('mv '+filename+' '+code[site][instr][num]['send_dir'])
-            #os.system('mv log.txt '+code[site][instr][num]['send_dir']+filename)
-
-
-    ########## TO ZIP UP CLOUD ##########
-        if 'bwc' == instr:
-            name = "%04s-%02s-%02s.txt" %(year,month,day)
-            filename = "Cloud_%s_%04s%02s%02s.txt" %(site,year,month,day)
-
-            # try SkyAlert
-            is_skyalert="SkyAlert" in code[site][instr][num]['local_dir']
-            if is_skyalert:
-                name = "/Weatherdata Files/%02s-%02s-%04s.txt" %(month,day,year)
-                def send_skyalert_rows(y,m,d,local_dir=code[site][instr][num]['local_dir'],send_dir=code[site][instr][num]['send_dir'],send_name=filename):
-                    compiledfile=local_dir+"weatherdatafiles.txt"
-                    #read and select only rows of interest
-                    h=open(compiledfile,'r')
-                    lines=h.readlines()
-                    h.close()
-                    selected=list(filter(lambda line:"%04s-%02s-%02s"%(y,m,d) in line,lines))
-                    #save rows into temporal file if any
-                    if len(selected)>0:
-                        temporal=local_dir+'temporal.txt'
-                        if os.path.exists(temporal):
-                            os.remove(temporal)
-                        h=open(temporal,'w')
-                        h.write(''.join(selected))
-                        h.close()
-                        #send it over
-                        shutil.copy2(temporal,send_dir+send_name)
-                        os.remove(temporal)
-
-            if os.path.isfile(code[site][instr][num]['local_dir']+name):
-                #os.rename(code[site][instr][num]['local_dir']+name,code[site][instr][num]['send_dir']+filename)
-                shutil.copy2(code[site][instr][num]['local_dir']+name,code[site][instr][num]['send_dir']+filename)
-                # If Downloading yesterday get todays partial file too.
-                if prior == 1:
-                    filename = "Cloud_%s_%04s%02s%02s.txt" %(site,tyear,tmonth,tday)
-                    name = "%04s-%02s-%02s.txt" %(tyear,tmonth,tday)
-                    if is_skyalert:
-                        send_skyalert_rows(tyear,tmonth,tday,send_name=filename)
-                    else:
-                        shutil.copy2(code[site][instr][num]['local_dir']+name,code[site][instr][num]['send_dir']+filename)
-            elif is_skyalert:
-                #do a final check that works for skyalert
-                send_skyalert_rows(year,month,day,send_name=filename)
-                if prior == 1:
-                    filename = "Cloud_%s_%04s%02s%02s.txt" %(site,tyear,tmonth,tday)
-                    name = "%04s-%02s-%02s.txt" %(tyear,tmonth,tday)
-                    if is_skyalert:
-                        send_skyalert_rows(tyear,tmonth,tday,send_name=filename)
-            elif os.path.isfile(code[site][instr][num]['local_dir']+filename):
-                print('here3')
-                # This is for the linux-version of the SkyAlert file
-                shutil.copy2(code[site][instr][num]['local_dir']+filename, code[site][instr][num]['send_dir']+filename)
-                if prior == 1:
-                    filename = "Cloud_%s_%04s%02s%02s.txt" %(site,tyear,tmonth,tday)
-                    name = "%04s-%02s-%02s.txt" %(tyear,tmonth,tday)
-                    shutil.copy2(code[site][instr][num]['local_dir']+filename,code[site][instr][num]['send_dir']+filename)
-            else:
-                ## Send checkfile that system is down!
-                print ('No Data Error!')
-                os.chdir(code[site][instr][num]['send_dir'])
-                check = open(checkname, 'w')
-                check.write(filename+'\n0\n0\n'+str(now)+'\n999\n')
-                # Legend for checkfile + boosts size for Sending
-                check.write('1: 1st file name\n2: Number of parts\n3: Size of tar.gz\n4: Time of Creation\n5: GB Disk Free')
-
-
-    ########## TO ZIP UP PIC ##########
-        if 'pic' == instr or 'nfi' == instr:
-            os.chdir(code[site][instr][num]['local_dir']+year)
-            # Grab all files made within 24 hour period
-            name = [f for f in glob(os.path.join('*','*.tif')) if (dt.datetime(int(year),int(month),int(day),12) < dt.datetime.fromtimestamp(os.path.getmtime(f)) < (dt.datetime(int(year),int(month),int(day),12)+dt.timedelta(1)))]
-            zipper(name,filename)
-            splitter(site,instr,num,code,filename,checkname,mfs)
-            os.remove(code[site][instr][num]['local_dir']+year+'/'+filename)
-
-
-    ########## TO ZIP UP SKY ##########
-        if 'sky' == instr:
-            name = "%04s%02s%02s/" %(year,month,day)
-            zipper(name,filename)
-            splitter(site,instr,num,code,filename,checkname,mfs)
-            os.remove(code[site][instr][num]['local_dir']+filename)
-
-
-    ########## TO ZIP UP SCN ##########
-        if 'scn' == instr:
-            name = "%02s%02s%02s*" %(yr,month,day)
-            zipper(name,filename)
-            splitter(site,instr,num,code,filename,checkname,mfs)
-            os.remove(code[site][instr][num]['local_dir']+filename)
-
-
-    ########## TO ZIP UP TEC ##########
-        if 'tec' == instr:
-            name = glob("%02s%02s%02s*" %(yr,month,day))
-            zipper(name,filename)
-            splitter(site,instr,num,code,filename,checkname,mfs)
-            os.remove(code[site][instr][num]['local_dir']+filename)
-
-        if 'xxx' == instr:
-            print ('\nPlease check your input:\nsite -s\ninstrumetn -i\nnumber -n\n')
-
-def searcher(site,instrument,num,local_dir):
-    '''
-    Summary:
-        searcher(site,instr,num,local_dir)
-        Searches all IMG files within local_dir, sort, zip, split them ready to be sent by Sender.py
-            It avoids repeated fils using the acquisition time.
-            It also avoids repeated names by adding suffixes.
-            It saves all files into a single %d%m%Y folder within the hierchary of the tar.gz file.
-
-    Inputs:
-        site =  XXX - location name
-        instr = XXX - instrument name
-        num =   ##  - instrument number or letter
-        local_dir = #   - Local dir to look for IMG files
-
-    History:
-        8/13/20 -- Written by L. Navarro (lnav@illinois.edu)
-    '''
-    # Minimum file size for writing (to find "empty" folders)
-    mfs = 1000
-    code = activeinstruments()
-    import sys
-    sys.path.append("../python/modules/")
-    try:
-        import Image
-    except:
-        from PIL import Image
-    import ImgImagePlugin
-    def getDT(path):
-        try:
-            d = Image.open(path)
-            _dt=d.info['LocalTime']
-        except:
-            _dt=None
-        return _dt
-    from itertools import groupby
-    import numpy as np
-    #List all IMG files
-    imgpaths=[os.path.join(root, name) for root, _, files in os.walk(local_dir) for name in files if ".img" in name]
-    #get acquisition datetime
-    dts=list(map(getDT,imgpaths))
-    #build matrix with rows [dt,path]
-    data=np.array(zip(dts,imgpaths),dtype=np.object)
-    print("Total IMG found %i"%data.shape[0])
-    #flag the ones were not readable
-    idx=data[:,0]==None
-    badfiles=data[idx,:]
-    print("\tIMG with non-readable headers were %i"%badfiles.shape[0])
-    #work with good IMG files
-    data=data[~idx,:]
-    print("\tIMG OK were %i"%data.shape[0])
-    #sort them
-    data=sorted(data.tolist())
-    #group them by day. One day is considered from 15 LT to next day 15 LT.
-    def grouper(row):
-        dtlocal,_=row
-        dt0=dtlocal if dtlocal.hour>15 else dtlocal-dt.timedelta(hours=12)
-        return dt0.strftime("%j%Y")
-    for doyyear,daily in groupby(data, grouper):
-        lista=[]
-        #removing repeated files using acquisition datetime.
-        #If repeated, use the first one with maximum size in filesystem
-        repeatedgroups=groupby(daily,lambda row:row[0])
-        for _dt,_items in repeatedgroups:
-            items=np.array(list(_items),dtype=np.object)
-            if items.shape[0]>1:
-                sizes=np.array(map(lambda item:os.stat(item[1]).st_size,items))
-                idx=np.where(sizes==np.max(sizes))[0][0]
-                lista.append(items[idx,1])
-            else:
-                lista.append(items[0,1])
-        #getting ready to zip and upload files
-        _dt=dt.datetime.strptime(doyyear,"%j%Y")
-        print("Zipping and Splitting %i non-repeated files from %s"%(len(lista),_dt.strftime("%d %h %Y")))
-        os.chdir(code[site][instr][num]['local_dir'])
-        filename = "%03s%02s_%s_%s.tar.gz" %(instr,num,site,_dt.strftime("%Y%m%d"))
-        checkname = "%03s%02s_%s_%s.txt" %(instr,num,site,_dt.strftime("%Y%m%d"))
-        #make sure there is no repeated names within the tar.gz file
-        arcnames=[]
-        i=0
-        for item in lista:
-            arcname="/%s/%s"%(_dt.strftime("%Y%m%d"),os.path.basename(item))
-            if arcname in arcnames:
-                arcname=arcname[:-4]+"__%05i.img"%i
-                i=i+1
-            arcnames.append(arcname)
-        #zipping files
-        with tarfile.open(filename, "w:gz") as archive:
-            for _i_,item in enumerate(lista):
-                with open(item, 'rb') as f:
-                    info = archive.gettarinfo(name=item,arcname=arcnames[_i_])
-                    archive.addfile(info, f)
-        #splitting
-        splitter(site,instr,num,code,filename,checkname,mfs)
-        #removing tar.gz original file
-        os.remove(code[site][instr][num]['local_dir']+filename)
-
-def zipper(name,filename):
-    '''
-    Summary:
-        zipper(name,filename)
-        Zips up all data
-
-    Inputs:
-        name    = X  - name* of files to be zipped up
-        filename    = XXX##_XXX_########.tar.gz - tarball filename
-
-    History:
-        7/17/13 -- Written by DJF (dfisher2@illinois.edu)
-    '''
-
-    # Guntar folder
-    tar = tarfile.open(filename,"w:gz")
-    if(type(name).__name__=='str'):
-        files = glob(name)
-    else:
-        files = name
+    Args:
+        name: Glob pattern string or list of file paths to include.
+        filename: Output archive path (e.g. ``fpi05_uao_20240115.tar.gz``).
+    """
+    tar = tarfile.open(filename, "w:gz")
+    files = glob(name) if isinstance(name, str) else name
     for oscar in files:
         tar.add(oscar)
     tar.close()
 
 
-def splitter(site,instr,num,code,filename,checkname,mfs):
-    '''
-    Summary:
-        splitter(site,instr,num,code,filename,checkname,mfs)
-        Splits and moves all data to Sending Folder + checkfile
+def _run_split(split_bin: str, filename: str, send_dir: str) -> None:
+    """Run the system ``split`` command to chunk an archive.
 
-    Inputs:
-        site    = XXX   - location name
-        instr   = XXX   - instrument name
-        num  = ##   - instrument number or letter
-        code    = DICT  - Dictionary of locations
-        filename    = XXX##_XXX_########.tar.gz - tarball filename
-        checkname   = XXX##_XXX_########.txt    - checksum filename
-        mfs  = #     - minimum file size
+    Args:
+        split_bin: Path to the split binary.
+        filename: Source archive filename (relative to cwd).
+        send_dir: Destination directory; split pieces are placed here.
 
-    History:
-        7/17/13 -- Written by DJF (dfisher2@illinois.edu)
-    '''
+    Raises:
+        RuntimeError: If split exits with a non-zero return code.
+    """
+    cmd = [
+        split_bin, '-a', '6', '-b', str(SPLIT_CHUNK_BYTES), '-d',
+        filename, str(Path(send_dir) / filename),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"split failed: {result.stderr}")
 
-    # Find size of data
-    statinfo = os.stat(filename)
+
+def splitter(site: str, instr: str, num: str, code: dict,
+             filename: str, checkname: str, mfs: int) -> None:
+    """Split a tar archive into chunks and write a checkfile to the sending directory.
+
+    The checkfile uses a frozen five-line format parsed by the receiving end:
+    line 1: first split-piece filename, line 2: number of pieces,
+    line 3: archive size in bytes, line 4: UTC creation time, line 5: disk free (GB).
+
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code.
+        num: Instrument number/letter.
+        code: Active-instruments dictionary from ``activeinstruments()``.
+        filename: Archive filename; must exist in the current working directory.
+        checkname: Checkfile filename to write into ``send_dir``.
+        mfs: Minimum file size (bytes); below this is treated as a collection error.
+    """
+    send_dir = code[site][instr][num]['send_dir']
+    local_dir = code[site][instr][num]['local_dir']
     now = dt.datetime.utcnow()
-    # Split and move files to Sending
-    if statinfo.st_size > mfs :
-        os.system(code[site][instr][num]['split']+' -a 6 -b 5242880 -d '+filename+' '+code[site][instr][num]['send_dir'] + filename)
-        # Check Disk Space Free in GB
-        s = os.statvfs(code[site][instr][num]['local_dir'])
-        df = round(float(s.f_bavail * s.f_frsize) / 1024**3,2)
-        # Make checkfile
-        os.chdir(code[site][instr][num]['send_dir'])
-        check = open(checkname, 'w')
-        pieces = glob(filename + '*')
-        check.write(pieces[0]+'\n' + str(len(pieces))+'\n' + str(statinfo.st_size)+'\n'+str(now)+'\n'+str(df)+'\n')
+    file_size = Path(filename).stat().st_size
+
+    if file_size > mfs:
+        _run_split(code[site][instr][num]['split'], filename, send_dir)
+        # Disk space free in GB
+        sv = os.statvfs(local_dir)
+        df = round(float(sv.f_bavail * sv.f_frsize) / 1024 ** 3, 2)
+        pieces = sorted(Path(send_dir).glob(filename + '*'))
+        with open(Path(send_dir) / checkname, 'w') as check:
+            check.write(
+                pieces[0].name + '\n' + str(len(pieces)) + '\n' +
+                str(file_size) + '\n' + str(now) + '\n' + str(df) + '\n'
+            )
+            check.write(
+                '1: 1st file name\n2: Number of parts\n3: Size of tar.gz\n'
+                '4: Time of Creation\n5: GB Disk Free'
+            )
     else:
-        print ('COLLECTION ERROR!!!')
-        # Make error checkfile
-        os.chdir(code[site][instr][num]['send_dir'])
-        check = open(checkname, 'w')
-        check.write(filename+'\n0\n0\n'+str(now)+'\n999\n')
-    # Legend for checkfile + boosts size for Sending
-    check.write('1: 1st file name\n2: Number of parts\n3: Size of tar.gz\n4: Time of Creation\n5: GB Disk Free')
-    check.close()
+        log.warning('COLLECTION ERROR!!!')
+        with open(Path(send_dir) / checkname, 'w') as check:
+            check.write(filename + '\n0\n0\n' + str(now) + '\n999\n')
+            check.write(
+                '1: 1st file name\n2: Number of parts\n3: Size of tar.gz\n'
+                '4: Time of Creation\n5: GB Disk Free'
+            )
 
 
+# ---------------------------------------------------------------------------
+# Per-instrument handlers
+# ---------------------------------------------------------------------------
+def _zip_fpi(site: str, instr: str, num: str, code: dict,
+             dates: DateBundle, prior: int) -> None:
+    """Zip, split, and stage FPI data.
 
-if __name__=="__main__":
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code (``'fpi'``).
+        num: Instrument number/letter.
+        code: Active-instruments dictionary.
+        dates: Date bundle for the processing day.
+        prior: Number of prior days being processed (unused here, for signature uniformity).
+    """
+    local_dir = code[site][instr][num]['local_dir']
+    filename = "%03s%02s_%s_%04s%02s%02s.tar.gz" % (instr, num, site, dates.year, dates.month, dates.day)
+    checkname = "%03s%02s_%s_%04s%02s%02s.txt" % (instr, num, site, dates.year, dates.month, dates.day)
 
-    # Main module allows zipper to be run via command line
+    os.chdir(local_dir)
+    start = dt.datetime(int(dates.year), int(dates.month), int(dates.day), FPI_DAY_START_HOUR)
+    end = start + dt.timedelta(1)
 
-    # Parse the command line
-    usage = "usage: Zipper -s SITE -i INSTRUMENT -n NUMBER -p DAYSPRIOR -y YEAR -d DOY"
-    parser = OptionParser(usage=usage)
-    parser.add_option("-s", "--site", dest="site", help="Site to be run",
-                   metavar="SITE", type="str",default='XXX')
-    parser.add_option("-i", "--instrument", dest="instr", help="Instrument to be run",
-                   metavar="INSTRUMENT", type="str",default='XXX')
-    parser.add_option("-n", "--number", dest="num", help="Number/Letter of instrument",
-                   metavar="NUMBER", type="str",default='00')
-    parser.add_option("-p", "--prior", dest="prior", help="Days Prior to be run",
-                   metavar="PRIORDAYS", type="int",default=1)
-    parser.add_option("-y", "--year", dest="pyear", help="Year to be run",
-                   metavar="YEAR", type="int",default=0)
-    parser.add_option("-d", "--doy", dest="pdoy", help="Doy to be run",
-                   metavar="DOY", type="int",default=0)
-    parser.add_option("-S", "--search", dest="psearch", help="Search all IMG files within local_dir",
-                   metavar="SRCH", type="str",default="None")
+    name = [f for f in glob(os.path.join('*', '*.img'))
+            if start < dt.datetime.fromtimestamp(os.path.getmtime(f)) < end]
+    if not name:
+        # Try the new format
+        name = [f for f in glob(os.path.join('*', '*.hdf5'))
+                if start < dt.datetime.fromtimestamp(os.path.getmtime(f)) < end]
 
-    (options, args) = parser.parse_args()
-    site = options.site.lower()
-    instr = options.instr.lower()
-    num = options.num.zfill(2)
-    prior = options.prior
-    pyear = options.pyear
-    pdoy = options.pdoy
-    path2search = options.psearch
+    log.debug('%s', name)
+    dirs_seen: List[str] = []
+    for nn in name:
+        d = os.path.dirname(nn)
+        if d not in dirs_seen:
+            dirs_seen.append(d)
+    for d in dirs_seen:
+        log.debug('Zipping from %s/%s', local_dir, d)
+
+    zipper(name, filename)
+    splitter(site, instr, num, code, filename, checkname, MIN_FILE_SIZE_BYTES)
+    (Path(local_dir) / filename).unlink()
+
+
+def _zip_asi(site: str, instr: str, num: str, code: dict,
+             dates: DateBundle, prior: int) -> None:
+    """Zip, split, and stage ASI data.
+
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code (``'asi'``).
+        num: Instrument number/letter.
+        code: Active-instruments dictionary.
+        dates: Date bundle for the processing day.
+        prior: Number of prior days being processed.
+    """
+    local_dir = code[site][instr][num]['local_dir']
+    filename = "%03s%02s_%s_%04s%02s%02s.tar.gz" % (instr, num, site, dates.year, dates.month, dates.day)
+    checkname = "%03s%02s_%s_%04s%02s%02s.txt" % (instr, num, site, dates.year, dates.month, dates.day)
+
+    name = "%02s-%02s" % (dates.day, dates.nday)
+    year_dir = Path(local_dir) / dates.year
+    os.chdir(year_dir)
+
+    tar = tarfile.open(filename, "w:gz")
+    try:
+        # Rename folder to doy before archiving, then rename back
+        src = str(year_dir / (dates.mon + name))
+        dst = str(year_dir / dates.doy)
+        os.rename(src, dst)
+        tar.add(dates.doy)
+        os.rename(dst, src)
+    except Exception as e:
+        log.warning('!!! No Data: %s', e)
+    tar.close()
+
+    splitter(site, instr, num, code, filename, checkname, MIN_FILE_SIZE_BYTES)
+    (year_dir / filename).unlink()
+
+
+def _zip_x3t(site: str, instr: str, num: str, code: dict,
+             dates: DateBundle, prior: int) -> None:
+    """Download and stage X300 temperature sensor data.
+
+    Supports both homeassistant (HTTP API) and direct X300/raspberry Pi URLs.
+    X300Sensor is imported dynamically here since it is only available on x3t
+    instrument computers.
+
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code (``'x3t'``).
+        num: Instrument number/letter.
+        code: Active-instruments dictionary.
+        dates: Date bundle for the processing day.
+        prior: Number of prior days being processed.
+    """
+    local_dir = code[site][instr][num]['local_dir']
+    send_dir = code[site][instr][num]['send_dir']
+    url = code[site][instr][num]['url']
+    filename = "TempL%02s_%s_%04s%02s%02s.txt" % (num, site, dates.year, dates.month, dates.day)
+    checkname = "%03s%02s_%s_%04s%02s%02s.txt" % (instr, num, site, dates.year, dates.month, dates.day)
+
+    if local_dir not in sys.path:
+        sys.path.append(local_dir)
+    try:
+        import X300Sensor
+    except ImportError as e:
+        log.error('Could not import X300Sensor from %s: %s', local_dir, e)
+        return
+
+    localpath = Path(local_dir) / 'X300_temp_log.txt'
+    if localpath.exists():
+        localpath.unlink()
+
+    if 'api/history' in url:
+        log.info('homeassistant starts...')
+        sys.path.append('C:\\Scripts')
+        try:
+            from read_history_hass import query_sensor
+            d0 = (dt.datetime.now() - dt.timedelta(days=30)).replace(tzinfo=pytz.UTC)
+            data = query_sensor('sensor.lumi_lumi_weather_temperature', begin=d0)
+            with open(localpath, 'w') as h:
+                h.write("date,temp#hass\n")
+                for _date, _temp in data:
+                    h.write("%s,%.2f\n" % (_date.strftime("%Y/%m/%d %H:%M:%S"), _temp))
+        finally:
+            sys.path.pop()
+    else:
+        log.info('try reading from rpi or x300')
+        for _ in range(5):
+            try:
+                urllib.request.urlretrieve(url, str(localpath))
+                if localpath.stat().st_size > 100:
+                    log.info('success!')
+                    break
+            except Exception as e:
+                log.debug('urlretrieve attempt failed: %s', e)
+            time.sleep(1)
+
+    localpath.chmod(0o777)
+
+    args = [
+        dt.datetime(int(dates.year), 1, 1) + dt.timedelta(days=int(dates.doy) - 1),
+        local_dir,
+        send_dir,
+        site,
+    ]
+    if 'api/history' in url or 'raspberry' in url:
+        kwargs: dict = {'num': num, 'dtfmt': "%Y/%m/%d"}
+    else:
+        kwargs = {}
+    X300Sensor.WriteLogFromRaw(*args, **kwargs)
+
+    # Check filesize for offline X300
+    send_file = Path(send_dir) / filename
+    if send_file.stat().st_size < 100:
+        log.warning('No Data ERROR!!!')
+        now = dt.datetime.utcnow()
+        with open(Path(send_dir) / checkname, 'w') as check:
+            check.write(filename + '\n0\n0\n' + str(now) + '\n999\n')
+            check.write(
+                '1: 1st file name\n2: Number of parts\n3: Size of tar.gz\n'
+                '4: Time of Creation\n5: GB Disk Free'
+            )
+
+    # Get as much current day as possible to cover all night
+    if prior == 1:
+        args[0] = dt.datetime(int(dates.year), 1, 1) + dt.timedelta(days=int(dates.doy))
+        X300Sensor.WriteLogFromRaw(*args, **kwargs)
+
+
+def _zip_bwc(site: str, instr: str, num: str, code: dict,
+             dates: DateBundle, prior: int) -> None:
+    """Copy cloud-cover (BWC/SkyAlert) data to the sending directory.
+
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code (``'bwc'``).
+        num: Instrument number/letter.
+        code: Active-instruments dictionary.
+        dates: Date bundle for the processing day.
+        prior: Number of prior days being processed.
+    """
+    local_dir = code[site][instr][num]['local_dir']
+    send_dir = code[site][instr][num]['send_dir']
+    filename = "Cloud_%s_%04s%02s%02s.txt" % (site, dates.year, dates.month, dates.day)
+    checkname = "%03s%02s_%s_%04s%02s%02s.txt" % (instr, num, site, dates.year, dates.month, dates.day)
+    name = "%04s-%02s-%02s.txt" % (dates.year, dates.month, dates.day)
+
+    is_skyalert = "SkyAlert" in local_dir
+    if is_skyalert:
+        name = "/Weatherdata Files/%02s-%02s-%04s.txt" % (dates.month, dates.day, dates.year)
+
+    def send_skyalert_rows(y: str, m: str, d: str, send_name: str = filename) -> None:
+        """Filter and copy SkyAlert rows for a given date to the sending directory."""
+        compiledfile = local_dir + "weatherdatafiles.txt"
+        with open(compiledfile, 'r') as h:
+            lines = h.readlines()
+        selected = [line for line in lines if "%04s-%02s-%02s" % (y, m, d) in line]
+        if selected:
+            temporal = local_dir + 'temporal.txt'
+            if os.path.exists(temporal):
+                os.remove(temporal)
+            with open(temporal, 'w') as h:
+                h.write(''.join(selected))
+            shutil.copy2(temporal, send_dir + send_name)
+            os.remove(temporal)
+
+    if os.path.isfile(local_dir + name):
+        shutil.copy2(local_dir + name, send_dir + filename)
+        if prior == 1:
+            filename = "Cloud_%s_%04s%02s%02s.txt" % (site, dates.tyear, dates.tmonth, dates.tday)
+            name = "%04s-%02s-%02s.txt" % (dates.tyear, dates.tmonth, dates.tday)
+            if is_skyalert:
+                send_skyalert_rows(dates.tyear, dates.tmonth, dates.tday, send_name=filename)
+            else:
+                shutil.copy2(local_dir + name, send_dir + filename)
+    elif is_skyalert:
+        send_skyalert_rows(dates.year, dates.month, dates.day, send_name=filename)
+        if prior == 1:
+            filename = "Cloud_%s_%04s%02s%02s.txt" % (site, dates.tyear, dates.tmonth, dates.tday)
+            name = "%04s-%02s-%02s.txt" % (dates.tyear, dates.tmonth, dates.tday)
+            if is_skyalert:
+                send_skyalert_rows(dates.tyear, dates.tmonth, dates.tday, send_name=filename)
+    elif os.path.isfile(local_dir + filename):
+        log.debug('here3')
+        # Linux-version of the SkyAlert file
+        shutil.copy2(local_dir + filename, send_dir + filename)
+        if prior == 1:
+            filename = "Cloud_%s_%04s%02s%02s.txt" % (site, dates.tyear, dates.tmonth, dates.tday)
+            name = "%04s-%02s-%02s.txt" % (dates.tyear, dates.tmonth, dates.tday)
+            shutil.copy2(local_dir + filename, send_dir + filename)
+    else:
+        log.warning('No Data Error!')
+        now = dt.datetime.utcnow()
+        with open(Path(send_dir) / checkname, 'w') as check:
+            check.write(filename + '\n0\n0\n' + str(now) + '\n999\n')
+            check.write(
+                '1: 1st file name\n2: Number of parts\n3: Size of tar.gz\n'
+                '4: Time of Creation\n5: GB Disk Free'
+            )
+
+
+def _zip_pic(site: str, instr: str, num: str, code: dict,
+             dates: DateBundle, prior: int) -> None:
+    """Zip, split, and stage PIC or NFI imager data.
+
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code (``'pic'`` or ``'nfi'``).
+        num: Instrument number/letter.
+        code: Active-instruments dictionary.
+        dates: Date bundle for the processing day.
+        prior: Number of prior days being processed.
+    """
+    local_dir = code[site][instr][num]['local_dir']
+    filename = "%03s%02s_%s_%04s%02s%02s.tar.gz" % (instr, num, site, dates.year, dates.month, dates.day)
+    checkname = "%03s%02s_%s_%04s%02s%02s.txt" % (instr, num, site, dates.year, dates.month, dates.day)
+
+    year_dir = Path(local_dir) / dates.year
+    os.chdir(year_dir)
+    start = dt.datetime(int(dates.year), int(dates.month), int(dates.day), FPI_DAY_START_HOUR)
+    end = start + dt.timedelta(1)
+    name = [f for f in glob(os.path.join('*', '*.tif'))
+            if start < dt.datetime.fromtimestamp(os.path.getmtime(f)) < end]
+    zipper(name, filename)
+    splitter(site, instr, num, code, filename, checkname, MIN_FILE_SIZE_BYTES)
+    (year_dir / filename).unlink()
+
+
+def _zip_sky(site: str, instr: str, num: str, code: dict,
+             dates: DateBundle, prior: int) -> None:
+    """Zip, split, and stage sky camera data.
+
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code (``'sky'``).
+        num: Instrument number/letter.
+        code: Active-instruments dictionary.
+        dates: Date bundle for the processing day.
+        prior: Number of prior days being processed.
+    """
+    local_dir = code[site][instr][num]['local_dir']
+    filename = "%03s%02s_%s_%04s%02s%02s.tar.gz" % (instr, num, site, dates.year, dates.month, dates.day)
+    checkname = "%03s%02s_%s_%04s%02s%02s.txt" % (instr, num, site, dates.year, dates.month, dates.day)
+
+    os.chdir(local_dir)
+    name = "%04s%02s%02s/" % (dates.year, dates.month, dates.day)
+    zipper(name, filename)
+    splitter(site, instr, num, code, filename, checkname, MIN_FILE_SIZE_BYTES)
+    (Path(local_dir) / filename).unlink()
+
+
+def _zip_scn(site: str, instr: str, num: str, code: dict,
+             dates: DateBundle, prior: int) -> None:
+    """Zip, split, and stage scintillation monitor data.
+
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code (``'scn'``).
+        num: Instrument number/letter.
+        code: Active-instruments dictionary.
+        dates: Date bundle for the processing day.
+        prior: Number of prior days being processed.
+    """
+    local_dir = code[site][instr][num]['local_dir']
+    filename = "%03s%02s_%s_%04s%02s%02s.tar.gz" % (instr, num, site, dates.year, dates.month, dates.day)
+    checkname = "%03s%02s_%s_%04s%02s%02s.txt" % (instr, num, site, dates.year, dates.month, dates.day)
+
+    os.chdir(local_dir)
+    name = "%02s%02s%02s*" % (dates.yr, dates.month, dates.day)
+    zipper(name, filename)
+    splitter(site, instr, num, code, filename, checkname, MIN_FILE_SIZE_BYTES)
+    (Path(local_dir) / filename).unlink()
+
+
+def _zip_tec(site: str, instr: str, num: str, code: dict,
+             dates: DateBundle, prior: int) -> None:
+    """Zip, split, and stage TEC/GPS data.
+
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code (``'tec'``).
+        num: Instrument number/letter.
+        code: Active-instruments dictionary.
+        dates: Date bundle for the processing day.
+        prior: Number of prior days being processed.
+    """
+    local_dir = code[site][instr][num]['local_dir']
+    filename = "%03s%02s_%s_%04s%02s%02s.tar.gz" % (instr, num, site, dates.year, dates.month, dates.day)
+    checkname = "%03s%02s_%s_%04s%02s%02s.txt" % (instr, num, site, dates.year, dates.month, dates.day)
+
+    os.chdir(local_dir)
+    name = glob("%02s%02s%02s*" % (dates.yr, dates.month, dates.day))
+    zipper(name, filename)
+    splitter(site, instr, num, code, filename, checkname, MIN_FILE_SIZE_BYTES)
+    (Path(local_dir) / filename).unlink()
+
+
+# ---------------------------------------------------------------------------
+# Dispatch table
+# ---------------------------------------------------------------------------
+HANDLERS: Dict[str, Callable] = {
+    'fpi': _zip_fpi,
+    'nfi': _zip_pic,   # nfi uses the same handler as pic
+    'asi': _zip_asi,
+    'pic': _zip_pic,
+    'sky': _zip_sky,
+    'scn': _zip_scn,
+    'tec': _zip_tec,
+    'bwc': _zip_bwc,
+    'x3t': _zip_x3t,
+}
+
+
+# ---------------------------------------------------------------------------
+# doer
+# ---------------------------------------------------------------------------
+def doer(site: str, instr: str, num: str,
+         prior: int = 1, pyear: int = 0, pdoy: int = 0) -> None:
+    """Zip, split, and move all data for one instrument/site to the sending folder.
+
+    Args:
+        site: 3-letter site code.
+        instr: Instrument code.
+        num: Instrument number/letter.
+        prior: Number of prior days to process.
+        pyear: Specific year to process (used with ``pdoy``).
+        pdoy: Specific day-of-year to process (used with ``pyear``).
+    """
+    code = activeinstruments()
+    handler = HANDLERS.get(instr)
+    if handler is None:
+        log.warning(
+            'Unknown instrument %r. Usable keys: fpi,asi,nfi,pic,sky,scn,tec,bwc,x3t\n'
+            'Please check your input: site -s  instrument -i  number -n', instr
+        )
+        return
+
+    for dback in range(prior, 0, -1):
+        today = dt.date.today()
+        if pyear > 0:
+            data_date = dt.date.fromordinal(dt.datetime(pyear, 1, 1).toordinal() - 1 + pdoy)
+            next_date = dt.date.fromordinal(dt.datetime(pyear, 1, 1).toordinal() - 1 + pdoy + 1)
+        else:
+            data_date = (dt.datetime.today() - dt.timedelta(dback)).date()
+            next_date = (dt.datetime.today() - dt.timedelta(dback - 1)).date()
+
+        dates = DateBundle(date=data_date, next_date=next_date, today=today)
+        log.info('%s: %s-%s-%s', instr, dates.day, dates.mon, dates.year)
+        handler(site, instr, num, code, dates, prior)
+
+
+# ---------------------------------------------------------------------------
+# searcher
+# ---------------------------------------------------------------------------
+def searcher(site: str, instrument: str, num: str, local_dir: str) -> None:
+    """Search all IMG files within ``local_dir``, sort, zip, and split for sending.
+
+    Avoids repeated files using acquisition time; avoids repeated archive names by
+    adding suffixes. Groups files into nightly bundles (15 LT to next day 15 LT).
+
+    Args:
+        site: 3-letter site code.
+        instrument: Instrument code.
+        num: Instrument number/letter.
+        local_dir: Directory to recursively search for ``.img`` files.
+
+    Raises:
+        ImportError: If PIL/Pillow or ImgImagePlugin are not available.
+    """
+    if Image is None:
+        raise ImportError(
+            "PIL/Pillow is required for searcher(). Install with: pip install Pillow"
+        )
+    try:
+        import ImgImagePlugin as _imp  # noqa: F401 — registers .img handler with PIL
+    except ImportError as e:
+        raise ImportError("ImgImagePlugin is required for searcher()") from e
+
+    code = activeinstruments()
+
+    def get_dt(path: str) -> Optional[dt.datetime]:
+        """Return the LocalTime embedded in an .img file header, or None."""
+        try:
+            img = Image.open(path)
+            return img.info['LocalTime']
+        except Exception:
+            return None
+
+    # Collect all .img files and their acquisition datetimes
+    imgpaths: List[str] = [
+        os.path.join(root, name)
+        for root, _, files in os.walk(local_dir)
+        for name in files
+        if '.img' in name
+    ]
+    dts = list(map(get_dt, imgpaths))
+    data: List[tuple] = list(zip(dts, imgpaths))
+
+    log.info('Total IMG found %d', len(data))
+    bad = [(d, p) for d, p in data if d is None]
+    good = [(d, p) for d, p in data if d is not None]
+    log.info('\tIMG with non-readable headers: %d', len(bad))
+    log.info('\tIMG OK: %d', len(good))
+
+    good.sort()
+
+    def grouper(row: tuple) -> str:
+        """Group key: day boundary at 15 LT."""
+        dtlocal, _ = row
+        dt0 = dtlocal if dtlocal.hour > 15 else dtlocal - dt.timedelta(hours=12)
+        return dt0.strftime('%j%Y')
+
+    for doyyear, daily in groupby(good, grouper):
+        lista: List[str] = []
+        # Deduplicate by acquisition datetime; keep the largest file when multiple exist
+        for _dt_key, items_iter in groupby(daily, lambda row: row[0]):
+            items = list(items_iter)
+            if len(items) > 1:
+                sizes = [os.stat(item[1]).st_size for item in items]
+                lista.append(items[sizes.index(max(sizes))][1])
+            else:
+                lista.append(items[0][1])
+
+        _dt_obj = dt.datetime.strptime(doyyear, '%j%Y')
+        log.info(
+            'Zipping and Splitting %d non-repeated files from %s',
+            len(lista), _dt_obj.strftime('%d %h %Y'),
+        )
+
+        local_dir_path = Path(code[site][instrument][num]['local_dir'])
+        os.chdir(local_dir_path)
+        filename = "%03s%02s_%s_%s.tar.gz" % (instrument, num, site, _dt_obj.strftime('%Y%m%d'))
+        checkname = "%03s%02s_%s_%s.txt" % (instrument, num, site, _dt_obj.strftime('%Y%m%d'))
+
+        # Build unique archive member names
+        arcnames: List[str] = []
+        suffix_counter = 0
+        for item in lista:
+            arcname = "/%s/%s" % (_dt_obj.strftime('%Y%m%d'), os.path.basename(item))
+            if arcname in arcnames:
+                arcname = arcname[:-4] + "__%05i.img" % suffix_counter
+                suffix_counter += 1
+            arcnames.append(arcname)
+
+        with tarfile.open(filename, 'w:gz') as archive:
+            for idx, item in enumerate(lista):
+                with open(item, 'rb') as f:
+                    info = archive.gettarinfo(name=item, arcname=arcnames[idx])
+                    archive.addfile(info, f)
+
+        splitter(site, instrument, num, code, filename, checkname, MIN_FILE_SIZE_BYTES)
+        (local_dir_path / filename).unlink()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    )
+
+    parser = argparse.ArgumentParser(
+        description='Zip, split, and stage science data for transfer to the repository.',
+        usage='Zipper -s SITE -i INSTRUMENT -n NUMBER -p DAYSPRIOR -y YEAR -d DOY',
+    )
+    parser.add_argument('-s', '--site', dest='site', metavar='SITE',
+                        type=str, default='XXX', help='Site to be run')
+    parser.add_argument('-i', '--instrument', dest='instr', metavar='INSTRUMENT',
+                        type=str, default='XXX', help='Instrument to be run')
+    parser.add_argument('-n', '--number', dest='num', metavar='NUMBER',
+                        type=str, default='00', help='Number/Letter of instrument')
+    parser.add_argument('-p', '--prior', dest='prior', metavar='PRIORDAYS',
+                        type=int, default=1, help='Days Prior to be run')
+    parser.add_argument('-y', '--year', dest='pyear', metavar='YEAR',
+                        type=int, default=0, help='Year to be run')
+    parser.add_argument('-d', '--doy', dest='pdoy', metavar='DOY',
+                        type=int, default=0, help='Doy to be run')
+    parser.add_argument('-S', '--search', dest='psearch', metavar='SRCH',
+                        type=str, default='None', help='Search all IMG files within local_dir')
+
+    args = parser.parse_args()
+    site = args.site.lower()
+    instr = args.instr.lower()
+    num = args.num.zfill(2)
+    prior = args.prior
+    pyear = args.pyear
+    pdoy = args.pdoy
+    path2search = args.psearch
 
     if prior > 1 and pyear > 0:
-        d0=dt.datetime(int(pyear),1,1)+dt.timedelta(days=pdoy-1)
-        for i in range(0,prior):
-            ddt=d0+dt.timedelta(days=i)
-            doer(site, instr, num, 1, ddt.year, ddt.timetuple().tm_yday )
-        #print 'Prior Days (-p) and Specific Days (-y & -d) cannot be used together'
+        d0 = dt.datetime(int(pyear), 1, 1) + dt.timedelta(days=pdoy - 1)
+        for i in range(prior):
+            ddt = d0 + dt.timedelta(days=i)
+            doer(site, instr, num, 1, ddt.year, ddt.timetuple().tm_yday)
         sys.exit()
 
-    if len(instr)>3:
-        print ('Usable Instrument Keys: fpi,asi,nfi,pic,sky,swe,cas,tec,scn,bwc,x3t')
+    if len(instr) > 3:
+        log.warning('Usable Instrument Keys: fpi,asi,nfi,pic,sky,swe,cas,tec,scn,bwc,x3t')
 
-    if "None" in path2search:
-        doer(site,instr,num,prior,pyear,pdoy)
+    if 'None' in path2search:
+        doer(site, instr, num, prior, pyear, pdoy)
     else:
-        print ("Searching within %s..."%path2search)
+        log.info('Searching within %s...', path2search)
         searcher(site, instr, num, path2search)
 
-    print ('Zip Complete...')
-
-
+    log.info('Zip Complete...')
