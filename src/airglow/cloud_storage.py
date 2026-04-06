@@ -34,7 +34,7 @@ class CloudStorage:
 
         self.client_s3v4 = boto3.client(**s3v4_client_args)
 
-        # Initialize S3 client
+        # Initialize S3 client``
         s3_config = Config(
             signature_version='s3',
             s3={'addressing_style': 'path'}
