@@ -10,6 +10,7 @@ from dagster_ncsa import S3ResourceNCSA
 from airglow.dagster_airglow.assets.analysis_asset import AnalysisConfig
 from airglow.dagster_airglow.assets.delete_raw import DeleteRawConfig
 
+from botocore.exceptions import ClientError
 
 class ChunkedArchiveConfig(dg.Config):
     observation_date: str = "20250328"
@@ -97,14 +98,25 @@ def unzip_chunked_archive(
     # Copy the cloud cover files to the archive directory in the bucket
     cloud_cover_path = f"cloudsensor/{config.site}/{year}"
     for cloud_cover_file in config.cloud_files:
-        s3_client.copy_object(
-            Bucket=EnvVar("DEST_BUCKET").get_value(),
-            CopySource={
-                "Bucket": EnvVar("DEST_BUCKET").get_value(),
-                "Key": cloud_cover_file
-            },
-            Key=f"{cloud_cover_path}/{Path(cloud_cover_file).name}"
-        )
+        try:
+            s3_client.head_object(
+                Bucket=EnvVar("DEST_BUCKET").get_value(),
+                Key=cloud_cover_file
+            )
+            s3_client.copy_object(
+                Bucket=EnvVar("DEST_BUCKET").get_value(),
+                CopySource={
+                    "Bucket": EnvVar("DEST_BUCKET").get_value(),
+                    "Key": cloud_cover_file
+                },
+                Key=f"{cloud_cover_path}/{Path(cloud_cover_file).name}"
+            )
+            context.log.info(f"Copied cloud cover file: {cloud_cover_file}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                context.log.warning(f"Cloud cover file not found, skipping: {cloud_cover_file}")
+            else:
+                raise
 
     analysis_config = AnalysisConfig(
         site=config.site,
