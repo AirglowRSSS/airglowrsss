@@ -91,6 +91,11 @@ _dates['minime12']['uao'] = { 'start' : datetime.datetime(2021,4,5),
 _dates['minime12']['blo'] = { 'start' : datetime.datetime(2021,8,16),
 			      'stop'  : None, }
 
+#DASI FPIs for Chile
+_dates['minime13'] ={}
+_dates['minime13']['uao'] = { 'start' : datetime.datetime(2026,4,1),
+			      'stop'  : None, }
+
 # The minime9* instruments have "always" been at their sites. (TODO)
 _dates['minime90'] = {}
 _dates['minime90']['mrh'] = { 'start': datetime.datetime(2000, 1, 1),
@@ -1458,6 +1463,43 @@ _instruments['minime12'] = {
         'skyB_quality_thresh'   : 0.2,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'zenith',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
     }
+
+_instruments['minime13'] = {
+        'name'          : 'minime13',
+        'N'             : 500,          # Number of annuli
+        'N0'            : 0,            # First annulus to use
+        'N1'            : 500,          # Last annulus to use
+        'focal_length'  : 30e-2,       # focal length of lens in m
+        'pix_size'      : 13e-6,        # pixel size on CCD in m
+        'lam_laser'     : 633.e-9,     # laser wavelength in m
+        'lam0'          : 630.0e-9,     # nominal line center wavelength in m
+        'lam0_gl'       : 557.7e-9,     # nominal line center wavelength in m
+        'nominal_t'     : 1.2806e-2,       # approximate etalon gap in m
+        'default_params': {# instrument params to be used if the laser fails (i.e., zenith reference)
+                                'R': 0.75,
+                            'alpha': 8.6481e-5,
+                                'B': 0.0,
+                                'I': 1.0,
+                               'a1': 0.0755,
+                               'a2': -0.0325,
+                               'b0': 1.906,
+                               'b1': .6284,
+                               'b2': -0.6455,
+                           'center':  (249.68, 247.14),
+                          },
+        'sql_winds_id'          : 139,           # ID for SQL database
+        'sql_temperatures_id'   : 140,           # ID for SQL database
+        'sql_gl_winds_id'       : 141,           # ID for SQL database
+        'sql_gl_temperatures_id': 142,           # ID for SQL database
+        'sql_diagnostics_id'    : 143,           # ID for SQL database
+        'many_fringes'          : True,         # indicates whether radial falloff terms should be used
+        'bad_wind_dates'        : [],   # Each entry is a tuple (start_date, stop_date, flag), between which data are bad. flag is a number, indicating the severity.
+        'bad_temperature_dates' : [],   # Each entry is a tuple (start_date, stop_date, flag), between which data are bad. flag is a number, indicating the severity.
+        'send_to_madrigal'      : False, # whether or not we should send this instrument's data to Madrigal
+        'skyI_quality_thresh'   : [0.4180, 0.1330], #The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
+        'skyB_quality_thresh'   : 0.2,             # Label with q=1 for data with skyB > this number. Red and green.
+        'plot_ref'              : 'zenith',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+     }
 
 _instruments['minime80'] = { #Update this from a laser image or two!
         'name'          : 'minime80',
