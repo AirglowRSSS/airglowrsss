@@ -191,7 +191,9 @@ def activeinstruments():
     code['cvo']['fpi']['10'] = {'send_dir':'/home/airglow/airglow/Sending/', 'local_dir':'/home/airglow/airglow/data/', 'split':'/usr/bin/split','email':UIemail}
     code['cvo']['bwc']['00'] = {'send_dir':'/home/airglow/airglow/Sending/', 'local_dir':'/home/airglow/airglow/skyalert-logger/skyalert-logs/', 'email':UIemail}
 
-
+    # DASI FPI at UAO (testing for ALO) starting from April 1, 2026
+    code['uao']['fpi']['13'] = {'send_dir':'/home/airglow/airglow/Sending/', 'local_dir':'/home/airglow/airglow/data/', 'split':'/usr/bin/split','email':UIemail}
+#    code['uao']['bwc']['00'] = {'send_dir':'/home/airglow/airglow/Sending/', 'local_dir':'/home/airglow/airglow/skyalert-logger/skyalert-logs/', 'email':UIemail}
 
     # Last index is for remote2 admin related issues (not site based)
     code['ADMIN']={'email':['jmakela@illinois.edu','bharding@ssl.berkeley.edu']}
