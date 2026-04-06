@@ -184,4 +184,5 @@ cython_debug/
 DataManagement/.env
 Python/modules/.env
 
-
+# Ignore CLAUDE.md files
+CLAUDE.md*
