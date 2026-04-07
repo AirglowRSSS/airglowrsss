@@ -23,6 +23,7 @@ class AnalysisConfig(dg.Config):
 
     site: str = "uao"
     observation_date: str = "20250429"
+    instrument_name: Optional[str] = None
     fail_asset_on_all_errors: bool = False  # Set to True if you want the asset to fail when all processing fails
 
     @property
@@ -37,14 +38,27 @@ class AnalysisConfig(dg.Config):
 
     @property
     def fpi_data_path(self) -> str:
-        """Construct FPI data path from site, year, and observation_date."""
-        # Parse observation_date to get datetime
+        """Returns the S3 path for a single instrument.
+        Only valid when instrument_name is set; raises if it is None."""
+        if not self.instrument_name:
+            raise ValueError(
+                "fpi_data_path requires instrument_name to be set. "
+                "Use fpi_data_paths() when iterating over all instruments."
+            )
+        return f"fpi/{self.instrument_name}/{self.site}/{self.year}/{self.observation_date}"
+
+    def fpi_data_paths(self) -> list[str]:
+        """Return S3 data paths for all relevant instruments.
+        If instrument_name is set, returns a one-element list.
+        Otherwise queries fpiinfo for every instrument at the site."""
+        if self.instrument_name:
+            return [self.fpi_data_path]
         nominal_dt = datetime.strptime(self.observation_date, "%Y%m%d")
-
-        # Get instrument name from fpiinfo
-        instr_name = fpiinfo.get_instr_at(self.site, nominal_dt)[0]
-
-        return f"fpi/{instr_name}/{self.site}/{self.year}/{self.observation_date}"
+        instruments = fpiinfo.get_instr_at(self.site, nominal_dt)
+        return [
+            f"fpi/{name}/{self.site}/{self.year}/{self.observation_date}"
+            for name in instruments
+        ]
 
 
 class DagsterErrorHandler:
@@ -265,26 +279,31 @@ class DagsterErrorHandler:
                 self.logger.error(f"Failed to create GitHub issue for warning: {github_error}")
 
 
-def get_instrument_info(site, year, doy):
-    """Get instrument information for the given site and date."""
-    # Get date from year and doy
+def get_instrument_info(site, year, doy, instr_name: Optional[str] = None):
+    """Return instrument metadata for a single instrument.
+
+    If instr_name is provided it is used directly.
+    If it is None, the first instrument returned by fpiinfo.get_instr_at is used.
+    """
     nominal_dt = datetime(year, 1, 1) + timedelta(days=doy - 1)
+    if instr_name is None:
+        instr_name = fpiinfo.get_instr_at(site, nominal_dt)[0]
 
-    # Get the instrument name at this site
-    instr_name = fpiinfo.get_instr_at(site, nominal_dt)[0]
-
-    # Import the site information
     site_name = fpiinfo.get_site_of(instr_name, nominal_dt)
-
-    # Create "minime05_uao_20130729" string
     datestr = nominal_dt.strftime("%Y%m%d")
     instrsitedate = instr_name + "_" + site_name + "_" + datestr
 
-    # What tags we expect at this site
-    site_info = fpiinfo.get_site_info(site)
-    expected_tags = site_info['expected_tags']
-    
+    # Read expected_tags from the instrument, not the site
+    instr_info = fpiinfo.get_instr_info(instr_name, nominal_dt)
+    expected_tags = instr_info.get('expected_tags', ['XR'])
+
     return instr_name, site_name, datestr, instrsitedate, expected_tags
+
+
+def get_all_instruments(site, year, doy) -> list[str]:
+    """Return every instrument name active at *site* on the given date."""
+    nominal_dt = datetime(year, 1, 1) + timedelta(days=doy - 1)
+    return list(fpiinfo.get_instr_at(site, nominal_dt))
 
 
 def download_fpi_data(
@@ -293,17 +312,19 @@ def download_fpi_data(
     site,
     year,
     datestr,
+    instr_name,
     target_dir,
     fpi_data_path: str,
     cloud_cover_path: str,
     bucket_prefix_dir: str = "",
 ):
-    """Download FPI data files from cloud storage."""
+    """Download FPI data files from cloud storage.
+
+    *instr_name* must be supplied by the caller; this function no longer
+    derives it internally.
+    """
 
     created_files = []
-
-    # Get the instrument name for the site
-    instr_name = get_instrument_info(site, year, int(datestr[-3:]))[0]
 
     # Download FPI data
     context.log.info(f"Downloading FPI data for {fpi_data_path}")
@@ -344,7 +365,7 @@ def download_fpi_data(
 
         created_files.append(local_file)
 
-    return created_files, instr_name
+    return created_files
 
 
 def upload_results(
@@ -416,167 +437,105 @@ def analyze_data(
         "sky_line_tags_processed": []
     }
     
-    # Perform some analysis on the data
     observation_date = config.observation_date
     date_obj = datetime.strptime(observation_date, "%Y%m%d")
     doy = date_obj.timetuple().tm_yday
     year = int(config.year)
 
-    # Get date string from year and day of year
-    instr_name, site_name, datestr, instrsitedate, expected_tags = get_instrument_info(
-        config.site, year, doy
-    )
+    # -----------------------------------------------------------------------
+    # Resolve which instruments to process
+    # -----------------------------------------------------------------------
+    if config.instrument_name:
+        instruments_to_process = [config.instrument_name]
+        context.log.info(f"Using pinned instrument from config: {config.instrument_name}")
+    else:
+        instruments_to_process = get_all_instruments(config.site, year, doy)
+        context.log.info(
+            f"No instrument_name specified; found {len(instruments_to_process)} "
+            f"instrument(s) at site '{config.site}': {instruments_to_process}"
+        )
 
-    context.log.info("Instrument name: %s", instr_name)
-    context.log.info("Site name: %s", site_name)
-    context.log.info("Date string: %s", datestr)
-    context.log.info("Instrument site date: %s", instrsitedate)
-    context.log.info(f"Expected sky tags: {expected_tags}")
-
-    # Create a temporary directory context manager
+    # -----------------------------------------------------------------------
+    # Process each instrument
+    # -----------------------------------------------------------------------
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            # Define all paths using the temporary directory
-            fpi_dir = os.path.join(temp_dir, "fpi/")
-            bw_dir = os.path.join(temp_dir, "cloudsensor/")
-            x300_dir = os.path.join(temp_dir, "templogs/x300/")
-            results_stub = os.path.join(temp_dir, "test/results/")
-            madrigal_stub = os.path.join(temp_dir, "test/madrigal/")
-            share_stub = os.path.join(temp_dir, "share/")
-            temp_plots_stub = os.path.join(temp_dir, "temporary_plots/")
+            for instr_name in instruments_to_process:
+                context.log.info(f"--- Starting processing for instrument: {instr_name} ---")
 
-            # Make sure all directories exist
-            for directory in [
-                fpi_dir,
-                bw_dir,
-                x300_dir,
-                results_stub,
-                madrigal_stub,
-                share_stub,
-                temp_plots_stub,
-            ]:
-                os.makedirs(directory, exist_ok=True)
-
-            # Download data with error handling
-            try:
-                download_fpi_data(
-                    context=context,
-                    s3=s3,
-                    site=config.site,
-                    year=year,
-                    datestr=observation_date,
-                    target_dir=temp_dir,
-                    fpi_data_path=config.fpi_data_path,
-                    cloud_cover_path=config.cloud_cover_path,
+                _, site_name, datestr, instrsitedate, expected_tags = get_instrument_info(
+                    config.site, year, doy, instr_name=instr_name
                 )
-            except Exception as download_error:
-                error_handler._handle_processing_error(
-                    download_error,
-                    {
-                        "step": "data_download",
-                        "fpi_data_path": config.fpi_data_path,
-                        "cloud_cover_path": config.cloud_cover_path
-                    }
-                )
-                raise
 
-            # Enhanced processing loop with comprehensive error handling
-            # This replaces the original try/except block around line 216
-            for sky_line_tag in expected_tags:#["X", "XR", "XG"]:
-                processing_stats["total_processed"] += 1
-                processing_stats["sky_line_tags_processed"].append(sky_line_tag)
-                
-                context.log.info(f"Processing sky line tag: {sky_line_tag}")
-                
-                # Context information for this specific processing step
-                step_context = {
-                    "sky_line_tag": sky_line_tag,
-                    "instrument": instr_name,
-                    "year": year,
-                    "doy": doy,
-                    "datestr": datestr,
-                    "processing_step": "FPIprocess.process_instr"
-                }
-                
+                context.log.info("Instrument name: %s", instr_name)
+                context.log.info("Site name: %s", site_name)
+                context.log.info("Date string: %s", datestr)
+                context.log.info("Instrument site date: %s", instrsitedate)
+                context.log.info(f"Expected sky tags: {expected_tags}")
+
+                # Each instrument gets its own subdirectory so outputs don't collide
+                instr_temp = os.path.join(temp_dir, instr_name)
+                fpi_dir = os.path.join(instr_temp, "fpi/")
+                bw_dir = os.path.join(instr_temp, "cloudsensor/")
+                x300_dir = os.path.join(instr_temp, "templogs/x300/")
+                results_stub = os.path.join(instr_temp, "test/results/")
+                madrigal_stub = os.path.join(instr_temp, "test/madrigal/")
+                share_stub = os.path.join(instr_temp, "share/")
+                temp_plots_stub = os.path.join(instr_temp, "temporary_plots/")
+
+                for directory in [fpi_dir, bw_dir, x300_dir, results_stub,
+                                  madrigal_stub, share_stub, temp_plots_stub]:
+                    os.makedirs(directory, exist_ok=True)
+
+                instr_fpi_data_path = (
+                    f"fpi/{instr_name}/{config.site}/{config.year}/{observation_date}"
+                )
+
                 try:
-                    # Call FPIprocess.process_instr with comprehensive error handling
-                    warning = FPIprocess.process_instr(
-                        instr_name,
-                        year,
-                        doy,
-                        mysql=mysql,
-                        sky_line_tag=sky_line_tag,
-                        fpi_dir=fpi_dir,
-                        bw_dir=bw_dir,
-                        send_to_madrigal=True,
-                        send_to_website=True,
-                        x300_dir=x300_dir,
-                        results_stub=results_stub,
-                        madrigal_stub=madrigal_stub,
-                        share_stub=share_stub,
-                        temp_plots_stub=temp_plots_stub,
+                    download_fpi_data(
+                        context=context,
+                        s3=s3,
+                        site=config.site,
+                        year=year,
+                        datestr=observation_date,
+                        instr_name=instr_name,
+                        target_dir=instr_temp,
+                        fpi_data_path=instr_fpi_data_path,
+                        cloud_cover_path=config.cloud_cover_path,
                     )
-                    
-                    # Handle any warnings returned by the processing function
-                    if warning:
-                        processing_stats["warnings"] += 1
-                        error_handler._handle_warning(
-                            warning_message=str(warning),
-                            metadata=step_context
-                        )
-                    
-                    # Upload results if processing was successful
-                    try:
-                        results_path = EnvVar("RESULTS_PATH").get_value()
-                        upload_results(
-                            context, s3, results_stub, f"{results_path}/{year}"
-                        )
-
-                        summary_path = EnvVar("SUMMARY_IMAGES_PATH").get_value()
-                        upload_results(
-                            context, s3, temp_plots_stub, f"{summary_path}/{year}"
-                        )
-
-                        madrigal_path = EnvVar("MADRIGAL_PATH").get_value()
-                        upload_results(
-                            context, s3, madrigal_stub, f"{madrigal_path}/{year}"
-                        )
-                        
-                        processing_stats["successful"] += 1
-                        context.log.info(f"Successfully processed and uploaded results for {sky_line_tag}")
-                        
-                    except Exception as upload_error:
-                        # Handle upload errors separately - processing succeeded but upload failed
-                        error_handler._handle_processing_error(
-                            upload_error,
-                            {**step_context, "error_location": "results_upload"}
-                        )
-                        # Don't fail the entire processing for upload errors
-                        processing_stats["warnings"] += 1
-                        
-                except NoSkyImagesError as no_sky_error:
-                    # This is expected for some sky line tags - treat as warning
-                    processing_stats["warnings"] += 1
-                    warning_message = f"No {sky_line_tag} sky images found for {instr_name} on {datestr}"
-                    context.log.warning(warning_message)
-                    
-                    error_handler._handle_warning(
-                        warning_message=warning_message,
-                        metadata=step_context
+                except Exception as download_error:
+                    error_handler._handle_processing_error(
+                        download_error,
+                        {
+                            "step": "data_download",
+                            "instrument": instr_name,
+                            "fpi_data_path": instr_fpi_data_path,
+                            "cloud_cover_path": config.cloud_cover_path,
+                        }
                     )
+                    raise
 
-                except BadLaserError as base_laser_error:
-                    # There is an issue with the laser images - try analyzing with zenith reference
-                    warning_message = f"Bad laser images for {instr_name} on {datestr}. Attempting zenith reference."
-                    context.log.warning(warning_message)
+                for sky_line_tag in expected_tags:
+                    processing_stats["total_processed"] += 1
+                    processing_stats["sky_line_tags_processed"].append(sky_line_tag)
+
+                    context.log.info(f"Processing sky line tag: {sky_line_tag}")
+                    context.log.info(f"Cloud directory: {bw_dir}")
+
+                    step_context = {
+                        "sky_line_tag": sky_line_tag,
+                        "instrument": instr_name,
+                        "year": year,
+                        "doy": doy,
+                        "datestr": datestr,
+                        "processing_step": "FPIprocess.process_instr"
+                    }
 
                     try:
-                        # Call FPIprocess.process_instr with comprehensive error handling
                         warning = FPIprocess.process_instr(
                             instr_name,
                             year,
                             doy,
-                            reference='zenith',
                             mysql=mysql,
                             sky_line_tag=sky_line_tag,
                             fpi_dir=fpi_dir,
@@ -589,16 +548,14 @@ def analyze_data(
                             share_stub=share_stub,
                             temp_plots_stub=temp_plots_stub,
                         )
-                        
-                        # Handle any warnings returned by the processing function
+
                         if warning:
                             processing_stats["warnings"] += 1
                             error_handler._handle_warning(
                                 warning_message=str(warning),
                                 metadata=step_context
                             )
-                        
-                        # Upload results if processing was successful
+
                         try:
                             results_path = EnvVar("RESULTS_PATH").get_value()
                             upload_results(
@@ -614,104 +571,133 @@ def analyze_data(
                             upload_results(
                                 context, s3, madrigal_stub, f"{madrigal_path}/{year}"
                             )
-                            
+
                             processing_stats["successful"] += 1
                             context.log.info(f"Successfully processed and uploaded results for {sky_line_tag}")
-                            
+
                         except Exception as upload_error:
-                            # Handle upload errors separately - processing succeeded but upload failed
                             error_handler._handle_processing_error(
                                 upload_error,
                                 {**step_context, "error_location": "results_upload"}
                             )
-                            # Don't fail the entire processing for upload errors
                             processing_stats["warnings"] += 1
 
+                    except NoSkyImagesError as no_sky_error:
                         processing_stats["warnings"] += 1
+                        warning_message = f"No {sky_line_tag} sky images found for {instr_name} on {datestr}"
+                        context.log.warning(warning_message)
+
                         error_handler._handle_warning(
-                            warning_message=str(f"Bad laser images - analyzed with zenith reference for {instr_name} on {datestr}"),
+                            warning_message=warning_message,
                             metadata=step_context
                         )
 
+                    except BadLaserError as base_laser_error:
+                        warning_message = f"Bad laser images for {instr_name} on {datestr}. Attempting zenith reference."
+                        context.log.warning(warning_message)
+
+                        try:
+                            warning = FPIprocess.process_instr(
+                                instr_name,
+                                year,
+                                doy,
+                                reference='zenith',
+                                mysql=mysql,
+                                sky_line_tag=sky_line_tag,
+                                fpi_dir=fpi_dir,
+                                bw_dir=bw_dir,
+                                send_to_madrigal=True,
+                                send_to_website=True,
+                                x300_dir=x300_dir,
+                                results_stub=results_stub,
+                                madrigal_stub=madrigal_stub,
+                                share_stub=share_stub,
+                                temp_plots_stub=temp_plots_stub,
+                            )
+
+                            if warning:
+                                processing_stats["warnings"] += 1
+                                error_handler._handle_warning(
+                                    warning_message=str(warning),
+                                    metadata=step_context
+                                )
+
+                            try:
+                                results_path = EnvVar("RESULTS_PATH").get_value()
+                                upload_results(
+                                    context, s3, results_stub, f"{results_path}/{year}"
+                                )
+
+                                summary_path = EnvVar("SUMMARY_IMAGES_PATH").get_value()
+                                upload_results(
+                                    context, s3, temp_plots_stub, f"{summary_path}/{year}"
+                                )
+
+                                madrigal_path = EnvVar("MADRIGAL_PATH").get_value()
+                                upload_results(
+                                    context, s3, madrigal_stub, f"{madrigal_path}/{year}"
+                                )
+
+                                processing_stats["successful"] += 1
+                                context.log.info(f"Successfully processed and uploaded results for {sky_line_tag}")
+
+                            except Exception as upload_error:
+                                error_handler._handle_processing_error(
+                                    upload_error,
+                                    {**step_context, "error_location": "results_upload"}
+                                )
+                                processing_stats["warnings"] += 1
+
+                            processing_stats["warnings"] += 1
+                            error_handler._handle_warning(
+                                warning_message=str(f"Bad laser images - analyzed with zenith reference for {instr_name} on {datestr}"),
+                                metadata=step_context
+                            )
+
+                        except Exception as processing_error:
+                            processing_stats["errors"] += 1
+                            error_type = type(processing_error).__name__
+                            context.log.error(f"Processing error with zenith reference in {sky_line_tag}: {error_type} - {str(processing_error)}")
+                            error_handler._handle_processing_error(
+                                processing_error,
+                                step_context
+                            )
+                            context.log.warning(f"Continuing processing despite error in {sky_line_tag}: {error_type}")
+                            continue
+
                     except Exception as processing_error:
-                        # Handle any other processing errors
                         processing_stats["errors"] += 1
-                        
-                        # Get the error type name for proper labeling
                         error_type = type(processing_error).__name__
-                        context.log.error(f"Processing error with zenith reference in {sky_line_tag}: {error_type} - {str(processing_error)}")
-                        
+                        context.log.error(f"Processing error in {sky_line_tag}: {error_type} - {str(processing_error)}")
                         error_handler._handle_processing_error(
                             processing_error,
                             step_context
                         )
-                        
-                        # Decide whether to continue or fail - continue processing other tags
                         context.log.warning(f"Continuing processing despite error in {sky_line_tag}: {error_type}")
                         continue
-                    
-                except Exception as processing_error:
-                    # Handle any other processing errors
-                    processing_stats["errors"] += 1
-                    
-                    # Get the error type name for proper labeling
-                    error_type = type(processing_error).__name__
-                    context.log.error(f"Processing error in {sky_line_tag}: {error_type} - {str(processing_error)}")
-                    
-                    error_handler._handle_processing_error(
-                        processing_error,
-                        step_context
-                    )
-                    
-                    # Decide whether to continue or fail - continue processing other tags
-                    context.log.warning(f"Continuing processing despite error in {sky_line_tag}: {error_type}")
-                    continue
-            
+
             # Log final processing statistics
             context.log.info(f"Processing completed. Stats: {processing_stats}")
-            
-            # Handle final processing results
+
             if processing_stats["errors"] > 0:
                 if processing_stats["successful"] == 0:
-                    # All processing failed
                     warning_message = f"All processing failed: {processing_stats['errors']} errors occurred across all sky line tags"
-#                    error_handler._handle_warning(
-#                        warning_message=warning_message,
-#                        metadata={
-#                            "final_stats": processing_stats,
-#                            "severity": "critical",
-#                            "all_tags_failed": True
-#                        }
-#                    )
-#                    
                     if config.fail_asset_on_all_errors:
-                        # Fail the asset if configured to do so
                         raise RuntimeError(f"All processing failed. {processing_stats['errors']} errors occurred.")
                     else:
-                        # Don't fail the asset, but return error status
                         context.log.error(warning_message)
                         return f"failed_all_processing_{processing_stats['errors']}_errors"
-#                else:
-#                    # Partial success - log warning but don't fail
-#                    error_handler._handle_warning(
-#                        warning_message=f"Partial processing failure: {processing_stats['errors']} errors, {processing_stats['successful']} successful",
-#                        metadata={"final_stats": processing_stats}
-#                    )
-            
+
         except Exception as main_error:
-            # Handle any unexpected errors at the top level
             error_handler._handle_processing_error(
                 main_error,
                 {
                     "error_location": "main_processing_loop",
                     "processing_stats": processing_stats,
-                    "instrument": instr_name,
                     "year": year,
-                    "doy": doy
+                    "doy": doy,
                 }
             )
-            
-            # Re-raise the error to fail the asset
             raise
 
     return "ok"
