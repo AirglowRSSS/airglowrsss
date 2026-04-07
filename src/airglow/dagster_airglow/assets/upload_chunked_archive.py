@@ -185,6 +185,7 @@ def unzip_chunked_archive(
     analysis_config = AnalysisConfig(
         site=config.site,
         observation_date=config.observation_date,
+        instrument_name=config.instrument_name,
     )
 
     delete_raw_config = DeleteRawConfig(
