@@ -223,7 +223,6 @@ _sites['uao'] = {
 		            'n_exp': 0, 'last_exp': None, 'delay':0},
                 },
         'github_assignees': ['jonathanjmakela'],
-        'expected_tags': ['XR']
     }
 
 _sites['ann'] = {
@@ -629,7 +628,6 @@ _sites['mor'] = {
 		            'n_exp': 0, 'last_exp': None, 'delay':0,},
                 },
         'github_assignees': ['jonathanjmakela'],
-        'expected_tags': ['X']
     }
 
 _sites['car'] = {
@@ -674,7 +672,6 @@ _sites['car'] = {
                             'n_exp': 0, 'last_exp': None, 'delay':0,},
                 },
         'github_assignees': ['jonathanjmakela'],
-        'expected_tags': ['XR']
     }
 
 
@@ -773,7 +770,6 @@ _sites['low'] = {
 		            'n_exp': 0, 'last_exp': None, 'delay':0},
                 },
         'github_assignees': ['jonathanjmakela','bharding512'],
-        'expected_tags': ['XG','XR']
     }
 
 
@@ -805,7 +801,6 @@ _sites['blo'] = {
 		            'n_exp': 0, 'last_exp': None, 'delay':0},
                 },
         'github_assignees': ['jonathanjmakela','bharding512'],
-        'expected_tags': ['XG','XR']
     }
 
 
@@ -837,7 +832,6 @@ _sites['cvo'] = {
 		            'n_exp': 0, 'last_exp': None, 'delay':0},
                 },
         'github_assignees': ['jonathanjmakela','bharding512'],
-        'expected_tags': ['XG','XR']
     }
 
 # TODO: If we ever end up controlling these peruvian sites, make sure
@@ -1072,6 +1066,7 @@ _instruments['minime01'] = {
         'skyI_quality_thresh'   : [-np.inf,-np.inf], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 _instruments['minime02'] = {
@@ -1106,6 +1101,7 @@ _instruments['minime02'] = {
         'skyI_quality_thresh'   : [0.0355,-np.inf], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 # TODO: Fill in this instrument's parameters when it ships.
@@ -1141,6 +1137,7 @@ _instruments['minime03'] = {
         'skyI_quality_thresh'   : [0.2275, 0.1074], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['X'],
     }
 
 _instruments['minime04'] = {
@@ -1175,6 +1172,7 @@ _instruments['minime04'] = {
         'skyI_quality_thresh'   : [-np.inf,-np.inf], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 
@@ -1213,6 +1211,7 @@ _instruments['minime05'] = {
         'skyI_quality_thresh'   : [0.4467,0.1413], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 _instruments['minime06'] = {
@@ -1247,6 +1246,7 @@ _instruments['minime06'] = {
         'skyI_quality_thresh'   : [0.0708,0.0224], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 _instruments['minime07'] = {
@@ -1281,6 +1281,7 @@ _instruments['minime07'] = {
         'skyI_quality_thresh'   : [0.1122,0.0562], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 _instruments['minime08'] = {
@@ -1315,6 +1316,7 @@ _instruments['minime08'] = {
         'skyI_quality_thresh'   : [0.4467,0.2239], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 
@@ -1350,6 +1352,7 @@ _instruments['minime09'] = {
         'skyI_quality_thresh'   : [0.0708,-np.inf], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 _instruments['minime10'] = {
@@ -1387,6 +1390,7 @@ _instruments['minime10'] = {
         'skyI_quality_thresh'   : [0.4180, 0.1330], #The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : 0.2,             # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'zenith',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XG', 'XR'],
      }
 
 _instruments['minime11'] = {
@@ -1425,6 +1429,7 @@ _instruments['minime11'] = {
         'skyI_quality_thresh'   : [0.6410, 0.2720],  #The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : 0.2,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'zenith',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XG', 'XR'],
     }
 
 _instruments['minime12'] = {
@@ -1462,6 +1467,7 @@ _instruments['minime12'] = {
         'skyI_quality_thresh'   : [0.5560, 0.1770],  #The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : 0.2,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'zenith',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XG', 'XR'],
     }
 
 _instruments['minime13'] = {
@@ -1499,6 +1505,7 @@ _instruments['minime13'] = {
         'skyI_quality_thresh'   : [0.4180, 0.1330], #The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : 0.2,             # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'zenith',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XG', 'XR'],
      }
 
 _instruments['minime80'] = { #Update this from a laser image or two!
@@ -1533,6 +1540,7 @@ _instruments['minime80'] = { #Update this from a laser image or two!
         'skyI_quality_thresh'   : [0.3469,0.2292], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 # TODO: Default instrument params for minime90
@@ -1568,6 +1576,7 @@ _instruments['minime90'] = {
         'skyI_quality_thresh'   : [-np.inf,-np.inf], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 _instruments['minime91'] = {
@@ -1603,6 +1612,7 @@ _instruments['minime91'] = {
         'skyI_quality_thresh'   : [-np.inf,-np.inf], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 # TODO: Default instrument params for minime92
@@ -1638,6 +1648,7 @@ _instruments['minime92'] = {
         'skyI_quality_thresh'   : [-np.inf,-np.inf], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 # TODO: recalculate default parameters once more reliable laser images come through (2015Oct14 BJH)
@@ -1673,6 +1684,7 @@ _instruments['minime94'] = {
         'skyI_quality_thresh'   : [0.0891,0.0447], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 
@@ -1709,12 +1721,13 @@ _instruments['minime95'] = {
         'skyI_quality_thresh'   : [-np.inf,-np.inf], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
+        'expected_tags'         : ['XR'],
     }
 
 
-_instruments['noto01'] = {} # TODO (if we need to)
+_instruments['noto01'] = {'expected_tags': ['XR']} # TODO (if we need to)
 
-_instruments['noto02'] = {} # TODO (if we need to)
+_instruments['noto02'] = {'expected_tags': ['XR']} # TODO (if we need to)
 
 # Add "Abbreviation" key to the instrument dictionary
 for instr_name in _instruments.keys():
@@ -1749,10 +1762,6 @@ def get_site_info(site_name, dn=datetime.datetime.now()):
     if site_name == 'car' and dn < datetime.datetime(2025,10,25):
         # We changed the CAR FPI to follow UTC time on 10/25/25
         site_info['Timezone'] = 'America/Recife'
-    if site_name == 'car' and dn < datetime.datetime(2025,10,1):
-        # We changed to XR after Oct 2025
-        site_info['expected_tags'] = ['X']
-
     return site_info
 
 def get_network_info(network_name, dn=datetime.datetime.now()):
@@ -2124,7 +2133,12 @@ def get_instr_info(instr_name, dn = datetime.datetime.now()):
                             'b2': -3.62640e-02,
                        'center':  (254.37, 248.56),
         }
-    
+
+    # expected_tags for minime01 at car changed to XR after Oct 2025;
+    # before that, the instrument used only the broad-band 'X' filter tag.
+    if instr_name == 'minime01' and dn < datetime.datetime(2025, 10, 1):
+        instrument['expected_tags'] = ['X']
+
     return instrument
 
 def get_all_instr_names():
