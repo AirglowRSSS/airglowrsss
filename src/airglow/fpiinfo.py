@@ -1502,7 +1502,7 @@ _instruments['minime13'] = {
         'bad_wind_dates'        : [],   # Each entry is a tuple (start_date, stop_date, flag), between which data are bad. flag is a number, indicating the severity.
         'bad_temperature_dates' : [],   # Each entry is a tuple (start_date, stop_date, flag), between which data are bad. flag is a number, indicating the severity.
         'send_to_madrigal'      : False, # whether or not we should send this instrument's data to Madrigal
-        'skyI_quality_thresh'   : [0.4180, 0.1330], #The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
+        'skyI_quality_thresh'   : [3.0, 1.0], #The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : 0.2,             # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'zenith',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
         'expected_tags'         : ['XG', 'XR'],
