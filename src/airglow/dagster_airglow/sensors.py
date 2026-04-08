@@ -66,9 +66,7 @@ def cloud_cover_files_for_site(site: str, files: list[str]) -> list[str]:
     job_name="analysis_job",
     minimum_interval_seconds=1 * 60 * 60,  # 1 hour
 )
-def instrument_upload_sensor(context,
-                             s3: S3ResourceNCSA
-                             ):
+def instrument_upload_sensor(context, s3: S3ResourceNCSA):
     objects = list_files(EnvVar('DEST_BUCKET').get_value(), "raw", s3.get_client())
     files = group_files_by_date(objects)
 
@@ -76,61 +74,75 @@ def instrument_upload_sensor(context,
         sensor_files = files[data_date]
         sensor_date = data_date
 
-        # After processing, there can be just the .txt file for that date
-        if sensor_files and len(sensor_files) > 1:
-            context.log.info(f"Found {len(sensor_files)} files on {sensor_date}")
-            tar_gz_files = {}
-            complete_sites = {}
+        if not sensor_files or len(sensor_files) <= 1:
+            continue
 
-            for file in sensor_files:
-                filename = file.split('/')[-1]
-                site_code = filename.split('_')[1]
+        context.log.info(f"Found {len(sensor_files)} files on {sensor_date}")
 
-                if filename.startswith("fpi") and filename.endswith(".txt"):
-                    # This is a log file, we can ignore it, but it signifies that all
-                    # the files are uploaded for this date/site
-                    complete_sites[site_code] = file
-                    continue
+        # Key by (site_code, stub) so instruments at the same site stay separate.
+        # e.g. ('uao', 'fpi05') and ('uao', 'fpi13') are distinct keys.
+        tar_gz_files = {}   # dict[(site, stub), list[str]]
+        complete_sites = {}  # dict[(site, stub), str]
 
-                if "tar.gz" in file:
-                    if site_code in tar_gz_files:
-                        tar_gz_files[site_code].append(file)
-                    else:
-                        tar_gz_files[site_code] = [file]
+        for file in sensor_files:
+            filename = file.split('/')[-1]
+            parts = filename.split('_')
+            if len(parts) < 2:
+                continue
 
-            context.log.info(f"Found files for {tar_gz_files.keys()}")
-            for site in tar_gz_files.keys():
-                if site in complete_sites:
-                    # The upload file contains the serial number of the instrument.
-                    # Use that to construct the canonical name of the instrument
-                    # Use regex to find the pattern "fpi" followed by two digits
-                    match = re.search(r'fpi(\d{2})', tar_gz_files[site][0])
+            stub = parts[0]       # e.g. 'fpi05' or 'fpi13'
+            site_code = parts[1]  # e.g. 'uao'
+            key = (site_code, stub)
 
-                    if match:
-                        instrument_name = f"minime{match.group(1)}"
-                    else:
-                        context.log.warn(f"Could not find instrument name for {tar_gz_files[site][0]}")  # NOQA E501
-                        instrument_name = "minime??"
+            if filename.startswith("fpi") and filename.endswith(".txt"):
+                # Log file — signals that all chunks for this instrument are uploaded
+                complete_sites[key] = file
+                continue
 
-                    run_config = RunConfig({
-                        "unzip_chunked_archive": ChunkedArchiveConfig(
-                            site=site,
-                            observation_date=str(sensor_date),
-                            cloud_files=cloud_cover_files_for_site(site, objects),
-                            file_chunks=tar_gz_files[site],
-                            instrument_name=instrument_name,
-                            instrument_log_file=complete_sites[site],
-                        )
-                        }
-                    )
-                    yield dg.RunRequest(
-                        run_key=f"sort-{sensor_date}-{site}",
-                        run_config=run_config,
-                        tags={
-                            "site": site,
-                            "instrument_name": instrument_name,
-                            "observation_date": str(sensor_date),
-                        }
-                    )
+            if "tar.gz" in file:
+                if key in tar_gz_files:
+                    tar_gz_files[key].append(file)
                 else:
-                    context.log.info(f"Incomplete upload for {site} on {sensor_date} - will pick them up next time")  # NOQA E501
+                    tar_gz_files[key] = [file]
+
+        context.log.info(f"Found files for {list(tar_gz_files.keys())}")
+
+        for (site, stub) in tar_gz_files.keys():
+            key = (site, stub)
+            if key not in complete_sites:
+                context.log.info(
+                    f"Incomplete upload for {stub} at {site} on {sensor_date} "
+                    f"— will pick up next time"
+                )
+                continue
+
+            match = re.search(r'fpi(\d{2})', stub)
+            if match:
+                instrument_name = f"minime{match.group(1)}"
+            else:
+                context.log.warning(
+                    f"Could not determine instrument name from stub '{stub}' "
+                    f"for {tar_gz_files[key][0]}"
+                )
+                instrument_name = "minime??"
+
+            run_config = RunConfig({
+                "unzip_chunked_archive": ChunkedArchiveConfig(
+                    site=site,
+                    observation_date=str(sensor_date),
+                    cloud_files=cloud_cover_files_for_site(site, objects),
+                    file_chunks=sorted(tar_gz_files[key]),
+                    instrument_name=instrument_name,
+                    instrument_log_file=complete_sites[key],
+                )
+            })
+
+            yield dg.RunRequest(
+                run_key=f"sort-{sensor_date}-{site}-{stub}",  # unique per instrument
+                run_config=run_config,
+                tags={
+                    "site": site,
+                    "instrument_name": instrument_name,
+                    "observation_date": str(sensor_date),
+                },
+            )

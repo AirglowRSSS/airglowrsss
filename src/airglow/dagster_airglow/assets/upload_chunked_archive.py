@@ -38,6 +38,38 @@ def _list_s3_prefix(s3_client, bucket: str, prefix: str) -> list[str]:
     return keys
 
 
+def _validate_file_chunks(
+    file_chunks: list[str],
+    stub: str,
+    site: str,
+    observation_date: str,
+    context: dg.AssetExecutionContext,
+) -> list[str]:
+    """
+    Filters file_chunks to only those whose filename starts with
+    '{stub}_{site}_{observation_date}', warning on any that are dropped.
+    Raises if no valid chunks remain.
+    """
+    expected_prefix = f"{stub}_{site}_{observation_date}"
+    valid = []
+    for key in file_chunks:
+        filename = key.split("/")[-1]
+        if filename.startswith(expected_prefix):
+            valid.append(key)
+        else:
+            context.log.warning(
+                f"Dropping file_chunk that does not match expected pattern "
+                f"'{expected_prefix}': '{key}'"
+            )
+    if not valid:
+        raise Exception(
+            f"No valid file chunks remain after filtering for pattern "
+            f"'{expected_prefix}'. Verify instrument_name, site, and "
+            f"observation_date are correct."
+        )
+    return valid
+
+
 def resolve_config(
     config: ChunkedArchiveConfig,
     s3_client,
@@ -65,6 +97,12 @@ def resolve_config(
                 "Verify instrument_name, site, and observation_date are correct."
             )
         context.log.info(f"Auto-discovered {len(file_chunks)} chunk(s): {file_chunks}")
+
+    # Always validate regardless of source — catches mixed lists from manual
+    # configs or sensor bugs.
+    file_chunks = _validate_file_chunks(
+        file_chunks, stub, config.site, config.observation_date, context
+    )
 
     # --- cloud_files ---
     if config.cloud_files is not None:
@@ -191,6 +229,7 @@ def unzip_chunked_archive(
     delete_raw_config = DeleteRawConfig(
         site=config.site,
         observation_date=config.observation_date,
+        instrument_name=config.instrument_name,
         raw_files=file_chunks,
         cloud_cover_files=cloud_files,
         instrument_log_file=instrument_log_file,
