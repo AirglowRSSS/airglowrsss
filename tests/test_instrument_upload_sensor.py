@@ -107,5 +107,5 @@ def test_instrument_upload_sensor():
                         'raw/fpi12_ABC_20250409.tar.gz000002'],
         'cloud_files': ['raw/Cloud_ABC_20250409.txt', 'raw/Cloud_ABC_20250410.txt'],
         'instrument_name': 'minime12',
-        'instrument_log_file': 'raw/fpi05_ABC_20250409.txt'
+        'instrument_log_file': 'raw/fpi12_ABC_20250409.txt'
     }
