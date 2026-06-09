@@ -186,3 +186,7 @@ Python/modules/.env
 
 # Ignore CLAUDE.md files
 CLAUDE.md*
+settings.local.json
+
+# Ignore dagster temp files
+.tmp_dagster_home_*

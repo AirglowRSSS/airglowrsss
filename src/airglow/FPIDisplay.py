@@ -1860,29 +1860,19 @@ def CompareData(files, full_clear=-30, full_cloud=-20,
             # Inital plot of bogus value to get the legend right
             Temperature_Graph.plot(-999,-999,color=fmt['Color'], marker=fmt['Marker'], label='%s, %s' % (inst_name,x))
 
-        if x == 'Zenith':
-            Doppler_Wind = (FPI_Results['LOSwind'][ind]-ref_Dop[ind])
-            Doppler_Error = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2)
-        else:
-            Doppler_Wind = (FPI_Results['LOSwind'][ind]-ref_Dop[ind]-w[ind]*np.cos(FPI_Results['ze'][ind]*np.pi/180.))/np.sin(FPI_Results['ze'][ind]*np.pi/180.)
-            Doppler_Error = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2+sigma_w[ind]**2)
-        if x == 'South' or x == 'West':
-            Doppler_Wind = -Doppler_Wind
+            if x == 'Zenith':
+                Doppler_Wind = (FPI_Results['LOSwind'][ind]-ref_Dop[ind])
+                Doppler_Error = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2)
+            else:
+                Doppler_Wind = (FPI_Results['LOSwind'][ind]-ref_Dop[ind]-w[ind]*np.cos(FPI_Results['ze'][ind]*np.pi/180.))/np.sin(FPI_Results['ze'][ind]*np.pi/180.)
+                Doppler_Error = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2+sigma_w[ind]**2)
+            if x == 'South' or x == 'West':
+                Doppler_Wind = -Doppler_Wind
 
-#            if x == 'Zenith':
-#                Doppler_Wind = (FPI_Results['LOSwind'][ind]-ref_Dop[ind])
-#                Doppler_Error = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2)
-#            else:
-#                Doppler_Wind = (FPI_Results['LOSwind'][ind]-ref_Dop[ind]-w[ind]*np.cos(FPI_Results['ze'][ind]*np.pi/180.))/np.sin(FPI_Results['ze'][ind]*np.pi/180.)
-#                Doppler_Error = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2+sigma_w[ind]**2)
-#            if x == 'North' or x == 'East':
-#                Doppler_Wind = -Doppler_Wind
-
-#            Doppler_Graph.plot(FPI_Results['sky_times'][ind],Doppler_Wind,color=fmt['Color'],alpha=0.3,marker=None,label='_nolegend_')
             Doppler_Graph.plot(-999,-999,color=fmt['Color'],marker=fmt['Marker'],label='%s, %s' % (inst_name,x))
 
             if ('Clouds' in FPI_Results.keys()) is False:
-                    FPI_Results['Clouds'] = None
+                FPI_Results['Clouds'] = None
 
             if FPI_Results['Clouds'] is None:
                 # No cloud data so create plot without alpha
@@ -1909,7 +1899,8 @@ def CompareData(files, full_clear=-30, full_cloud=-20,
                     # Plot the points and error bars on the graphs
                     Temperature_Graph.errorbar(t,y,yerr=ey,alpha=alpha_val,color=fmt['Color'],fmt=fmt['Marker'],label='_nolegend_')
                     Doppler_Graph.errorbar(t,z,yerr=ez,alpha=alpha_val,color=fmt['Color'],fmt=fmt['Marker'],label='_nolegend_')
-
+            print(t)
+            print(z)
     # Plotting font setup
     fontP = FontProperties()
 #    fontP.set_size('10')
@@ -1960,6 +1951,196 @@ def CompareData(files, full_clear=-30, full_cloud=-20,
         Doppler_Graph.set_title(site['Abbreviation'] + ':' + (FPI_Results['sky_times'][0]).strftime('%d %b, %Y %H:%M') + ' - ' + (FPI_Results['sky_times'][-1]).strftime('%H:%M LT'))#, fontsize = fontsize)
 
     return(Temperature_Fig, Temperature_Graph), (Doppler_Fig, Doppler_Graph)
+
+def ScatterWind(files, full_clear=-30, full_cloud=-20,
+                Tmin=500, Tmax=1500, Dmin=-200, Dmax=200,
+                reference='Laser', directions=None, displayhours=False,
+                Temperature_Fig=None, Temperature_Graph=None,
+                Doppler_Fig=None, Doppler_Graph=None):
+#
+# Scatter plot comparing Doppler winds between two FPI data files.
+# The x-axis is the wind from files[0]; the y-axis is the wind from files[1]
+# interpolated onto the time grid of files[0].  One panel is produced per
+# look direction.  Error bars show the wind uncertainty; alpha is set
+# proportional to the skyI value in files[0].
+#
+# INPUTS:
+#   files - list of two .npz result file paths; only the first two are used
+#
+# OPTIONAL INPUTS: (same signature as CompareData)
+#   full_clear, full_cloud - not used; kept for API compatibility
+#   Tmin, Tmax             - not used; kept for API compatibility
+#   Dmin, Dmax             - axis limits for both wind axes [m/s]
+#   reference              - Doppler reference ('Laser', 'Zenith', ...)
+#   directions             - list of directions to plot; None = all non-laser
+#   displayhours           - not used; kept for API compatibility
+#   Temperature_Fig/Graph  - not used; kept for API compatibility
+#   Doppler_Fig/Graph      - figure/axes to draw into; created if None
+#
+# OUTPUTS:
+#   (Doppler_Fig, Doppler_Graph) - the scatter figure and axes
+#
+# HISTORY:
+#   Written by Jonathan J. Makela, April 2026
+
+    if len(files) < 2:
+        raise ValueError('ScatterWind requires exactly two files.')
+
+    # ------------------------------------------------------------------
+    # Load both files
+    # ------------------------------------------------------------------
+    def _load(f):
+        npzfile = np.load(f, allow_pickle=True)
+        res = npzfile['FPI_Results'].reshape(-1)[0]
+        npzfile.close()
+        inst, site_name = os.path.basename(f).split('_')[0:2]
+        return res, inst, site_name
+
+    FPI_Results1, inst1, site1 = _load(files[0])
+    FPI_Results2, inst2, site2 = _load(files[1])
+
+    # ------------------------------------------------------------------
+    # Doppler reference for each file
+    # ------------------------------------------------------------------
+    (ref_Dop1, _) = FPI.DopplerReference(FPI_Results1, reference=reference)
+    (ref_Dop2, _) = FPI.DopplerReference(FPI_Results2, reference=reference)
+
+    # ------------------------------------------------------------------
+    # Vertical-wind interpolants for each file (needed for non-Zenith
+    # horizontal wind projections).  Mirror CompareData's approach.
+    # ------------------------------------------------------------------
+    def _vertical_wind_interp(FPI_Results, ref_Dop):
+        ind = FPI.all_indices('Zenith', FPI_Results['direction'])
+        w = FPI_Results['LOSwind'][ind] - ref_Dop[ind]
+        sigma_w = FPI_Results['sigma_LOSwind'][ind]
+        t_num = np.array([dates.date2num(t) for t in FPI_Results['sky_times'][ind]])
+        ok = np.abs(w) < 200.
+        if ok.sum() <= 1:
+            ok = np.ones(len(w), dtype=bool)
+        w_func      = interpolate.interp1d(t_num[ok], w[ok],      bounds_error=False, fill_value=0.0)
+        sigma_func  = interpolate.interp1d(t_num[ok], sigma_w[ok], bounds_error=False, fill_value=0.0)
+        t_all = np.array([dates.date2num(t) for t in FPI_Results['sky_times']])
+        return w_func(t_all), sigma_func(t_all)
+
+    w1, sigma_w1 = _vertical_wind_interp(FPI_Results1, ref_Dop1)
+    w2, sigma_w2 = _vertical_wind_interp(FPI_Results2, ref_Dop2)
+
+    # ------------------------------------------------------------------
+    # Compute horizontal Doppler wind for one direction from one dataset
+    # ------------------------------------------------------------------
+    def _doppler_wind(FPI_Results, ref_Dop, w, sigma_w, x, ind):
+        if x == 'Zenith':
+            dwind = FPI_Results['LOSwind'][ind] - ref_Dop[ind]
+            derr  = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2)
+        else:
+            ze_rad = FPI_Results['ze'][ind] * np.pi / 180.
+            dwind = (FPI_Results['LOSwind'][ind] - ref_Dop[ind]
+                     - w[ind] * np.cos(ze_rad)) / np.sin(ze_rad)
+            derr  = np.sqrt(FPI_Results['sigma_LOSwind'][ind]**2 + sigma_w[ind]**2)
+        if x in ('South', 'West'):
+            dwind = -dwind
+        return dwind, derr
+
+    # ------------------------------------------------------------------
+    # Directions: use file1's directions unless caller specified some
+    # ------------------------------------------------------------------
+    if directions is None:
+        l = [x for x in np.unique(FPI_Results1['direction'])
+             if x not in ('Unknown', 'Laser')]
+    else:
+        l = directions
+
+    # ------------------------------------------------------------------
+    # Color/marker per direction (match PlotDay conventions)
+    # ------------------------------------------------------------------
+    all_markers = ['s', 'd', '^', 'x', 'p', '*', '+', 'v', '>', '<']
+    all_colors  = ['r', 'g', 'b', 'c', 'm', 'y', 'k']
+    all_markers.reverse()
+    all_colors.reverse()
+    fmt = {
+        'East':   {'Color': 'y', 'Marker': 'o'},
+        'West':   {'Color': 'm', 'Marker': 'o'},
+        'North':  {'Color': 'r', 'Marker': 'o'},
+        'South':  {'Color': 'g', 'Marker': 'o'},
+        'Zenith': {'Color': 'k', 'Marker': 'o'},
+        'Laser':  None,
+    }
+    for direc in [d for d in l if d not in fmt]:
+        fmt[direc] = {'Color': all_colors.pop(), 'Marker': all_markers.pop()}
+
+    # ------------------------------------------------------------------
+    # Create figure
+    # ------------------------------------------------------------------
+    if Doppler_Fig is None:
+        Doppler_Fig = plt.figure()
+        Doppler_Graph = Doppler_Fig.add_subplot(111)
+
+    # ------------------------------------------------------------------
+    # Plot each direction
+    # ------------------------------------------------------------------
+    for x in l:
+        ind1 = FPI.all_indices(x, FPI_Results1['direction'])
+        ind2 = FPI.all_indices(x, FPI_Results2['direction'])
+
+        if len(ind1) == 0 or len(ind2) == 0:
+            continue
+
+        # Wind + error for file1
+        dwind1, derr1 = _doppler_wind(FPI_Results1, ref_Dop1, w1, sigma_w1, x, ind1)
+
+        # Wind + error for file2 on its own time grid
+        dwind2, derr2 = _doppler_wind(FPI_Results2, ref_Dop2, w2, sigma_w2, x, ind2)
+
+        # Time grids as floats (matplotlib date numbers) for interpolation
+        t1_num = np.array([dates.date2num(t) for t in FPI_Results1['sky_times'][ind1]])
+        t2_num = np.array([dates.date2num(t) for t in FPI_Results2['sky_times'][ind2]])
+
+        # Interpolate file2's wind and error onto file1's time grid
+        wind2_func  = interpolate.interp1d(t2_num, dwind2, bounds_error=False, fill_value=np.nan)
+        error2_func = interpolate.interp1d(t2_num, derr2,  bounds_error=False, fill_value=np.nan)
+        dwind2_at1 = wind2_func(t1_num)
+        derr2_at1  = error2_func(t1_num)
+
+        # Alpha from file1's skyI: scale [min, max] -> [0.1, 1.0]
+        skyI1 = FPI_Results1['skyI'][ind1].astype(float)
+        skyI_min, skyI_max = skyI1.min(), skyI1.max()
+        if skyI_max > skyI_min:
+            alpha_vals = 0.1 + 0.9 * (skyI1 - skyI_min) / (skyI_max - skyI_min)
+        else:
+            alpha_vals = np.ones(len(skyI1))
+
+        # Legend proxy
+        color  = fmt[x]['Color']
+        marker = fmt[x]['Marker']
+        Doppler_Graph.plot(-9999, -9999, color=color, marker=marker,
+                           linestyle='None', label=x)
+
+        # Plot each point individually to allow per-point alpha
+        for (xv, yv, ex, ey, alpha) in zip(dwind1, dwind2_at1, derr1, derr2_at1, alpha_vals):
+            if np.isnan(yv):
+                continue
+            Doppler_Graph.errorbar(xv, yv, xerr=ex, yerr=ey,
+                                   alpha=float(alpha), color=color, fmt=marker,
+                                   label='_nolegend_')
+
+    # ------------------------------------------------------------------
+    # Reference line and formatting
+    # ------------------------------------------------------------------
+    lim = max(abs(Dmin), abs(Dmax))
+    Doppler_Graph.plot([-lim, lim], [-lim, lim], 'k--', label='_nolegend_')
+    Doppler_Graph.set_xlim(Dmin, Dmax)
+    Doppler_Graph.set_ylim(Dmin, Dmax)
+    Doppler_Graph.set_xlabel('%s Neutral Wind [m/s]  (Doppler ref: %s)' % (inst1, reference))
+    Doppler_Graph.set_ylabel('%s Neutral Wind [m/s]  (Doppler ref: %s)' % (inst2, reference))
+    Doppler_Graph.set_title('%s vs %s' % (inst1, inst2))
+    Doppler_Graph.set_aspect('equal', adjustable='box')
+    Doppler_Graph.grid(True)
+
+    fontP = FontProperties()
+    Doppler_Graph.legend(ncol=4, prop=fontP)
+
+    return Doppler_Fig, Doppler_Graph
+
 
 def Map(sites,m,times,MapTemperatures=False, MapDopplers=False, avg_time=15, title_stub=''):
 # Function to produce a map of values from several FPIs

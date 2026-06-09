@@ -99,7 +99,7 @@ def test_instrument_upload_sensor():
 
     assert len(runs) == 1
     run09 = runs[0]
-    assert run09.run_key == 'sort-20250409-ABC'
+    assert run09.run_key == 'sort-20250409-ABC-fpi12'
     assert run09.run_config["ops"]['unzip_chunked_archive']["config"] == {
         'observation_date': '20250409', 'site': 'ABC',
         'file_chunks': ['raw/fpi12_ABC_20250409.tar.gz000000',
@@ -107,5 +107,5 @@ def test_instrument_upload_sensor():
                         'raw/fpi12_ABC_20250409.tar.gz000002'],
         'cloud_files': ['raw/Cloud_ABC_20250409.txt', 'raw/Cloud_ABC_20250410.txt'],
         'instrument_name': 'minime12',
-        'instrument_log_file': 'raw/fpi05_ABC_20250409.txt'
+        'instrument_log_file': 'raw/fpi12_ABC_20250409.txt'
     }

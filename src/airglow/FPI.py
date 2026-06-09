@@ -249,7 +249,7 @@ def ReadIMG(fname):
 
         # Convert to im structure
         im = temp['image']
-        im.info = {'ExposureTime': temp['image'].attrs['ExposureTime'],
+        im.info = {'ExposureTime': float(temp['image'].attrs['ExposureTime']),
                    'zeAngle': temp['image'].attrs['zeAngle'],
                    'azAngle': temp['image'].attrs['azAngle'],
                    'XBinning': 2, ### JJM NEED TO CHANGE!
