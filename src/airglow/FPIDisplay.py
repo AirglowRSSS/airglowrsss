@@ -1899,8 +1899,7 @@ def CompareData(files, full_clear=-30, full_cloud=-20,
                     # Plot the points and error bars on the graphs
                     Temperature_Graph.errorbar(t,y,yerr=ey,alpha=alpha_val,color=fmt['Color'],fmt=fmt['Marker'],label='_nolegend_')
                     Doppler_Graph.errorbar(t,z,yerr=ez,alpha=alpha_val,color=fmt['Color'],fmt=fmt['Marker'],label='_nolegend_')
-            print(t)
-            print(z)
+            
     # Plotting font setup
     fontP = FontProperties()
 #    fontP.set_size('10')
