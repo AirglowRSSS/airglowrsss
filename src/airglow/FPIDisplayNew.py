@@ -575,7 +575,7 @@ def DataSummary(files, times=None,
                 cloudy_temperature=-15.0, reference='zenith',
                 use_cloud_storage=False, cloud_storage=None, temp_dir=None,
                 bin_time=None, bin_days=None, mode='publication',
-                variables=None):
+                variables=None, compare_years=False):
     """
     Two-dimensional summary of FPI data.
 
@@ -637,12 +637,25 @@ def DataSummary(files, times=None,
         ``['T', 'U', 'V', 'W', 'I']`` (temperature, zonal wind,
         meridional wind, vertical wind, 630-nm intensity).
         ``None`` → all five.
+    compare_years : bool
+        If ``True``, produce a stacked year-over-year comparison instead of
+        the normal date-range view.  Each row covers one calendar year
+        (oldest at top); the x-axis spans Jan 1 – Dec 31 (366 day-of-year
+        columns, month-labeled); all rows share the same colour scale and
+        y-axis limits.  A single colorbar is placed to the right of the
+        entire figure.  Only supported when *files* is an ``xr.Dataset``
+        (from ``FPIDataHandler.load_fpi_data``).  *bin_days* and *times*
+        are ignored in this mode.  Returns one ``(Figure, np.ndarray of
+        Axes)`` pair per variable instead of the usual
+        ``(Figure, single Axes)`` pair.  Default ``False``.
 
     Returns
     -------
     dict
         Keys are variable names (from *variables*); values are
         ``(matplotlib.Figure, matplotlib.Axes)`` tuples.
+        When *compare_years* is ``True``, the Axes value is a 1-D
+        ``np.ndarray`` of Axes (one per year row).
         Example::
 
             {'T': (fig_T, ax_T), 'U': (fig_U, ax_U), ...}
@@ -674,6 +687,124 @@ def DataSummary(files, times=None,
         time_edges = np.append(time_edges, t_end)
     time_centers = 0.5 * (time_edges[:-1] + time_edges[1:])
     n_tbins = len(time_centers)
+
+    # ── compare_years: stacked year-over-year view ───────────────────────
+    if compare_years:
+        if not isinstance(files, xr.Dataset):
+            raise ValueError(
+                "compare_years=True requires files to be an xr.Dataset "
+                "(from FPIDataHandler.load_fpi_data). File-list input is "
+                "not supported."
+            )
+
+        ds_input  = files
+        site_name = ds_input.attrs.get('site', '').upper()
+        _em       = ds_input.attrs.get('emission', '')
+        emission  = 'RL' if _em == 'xr' else ('GL' if _em == 'xg' else _em.upper())
+
+        # Collect calendar years present in the dataset
+        obs_times_cy  = pd.DatetimeIndex(ds_input.coords['time'].values)
+        unique_nights_cy = sorted(set(_night_date(t) for t in obs_times_cy))
+        years = sorted(set(d.year for d in unique_nights_cy))
+
+        # Accumulate a (n_tbins × 366) grid for each year.
+        # Column index = DOY - 1 (0 = Jan 1, 364/365 = Dec 31).
+        # Non-leap years leave column 365 (DOY 366) all-NaN.
+        year_grids = {}
+        for year in years:
+            year_start   = datetime.date(year, 1, 1)
+            date_to_di_y = {}
+            for doy in range(1, 367):
+                d = year_start + datetime.timedelta(days=doy - 1)
+                if d.year == year:          # stops at Dec 31 for non-leap years
+                    date_to_di_y[d] = doy - 1
+            year_grids[year] = _accumulate_from_dataset(
+                ds_input, time_edges, date_to_di_y,
+                n_tbins, 366, variables, cloudy_temperature,
+            )
+
+        rc, cmap_div, cmap_seq = _mode_rcparams(mode)
+        fig_w = 10.0
+        row_h = 2.0 if mode == 'publication' else 2.5
+
+        # pcolormesh x-edges for 366 DOY columns: 0.5 … 366.5
+        x_edges_yr = np.arange(0.5, 367.5)
+
+        # Month-start DOYs in a non-leap reference year; the ≤1-day offset
+        # for leap years is invisible at the scale of a full-year plot.
+        _month_doy    = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+        _month_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                         'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+        def _lt_fmt_cy(x, pos):
+            return f'{int(np.mod(x, 24)):02d}'
+
+        var_cfg_cy = {
+            'T': (Tmin,   Tmax,  cmap_seq, 'Temperature [K]',       'Neutral Temperature'),
+            'U': (Dmin,   Dmax,  cmap_div, 'Zonal Wind [m/s]',      'Zonal Neutral Wind'),
+            'V': (Dmin,   Dmax,  cmap_div, 'Meridional Wind [m/s]', 'Meridional Neutral Wind'),
+            'W': (-50.0,  50.0,  cmap_div, 'Vertical Wind [m/s]',   'Vertical Neutral Wind'),
+            'I': (Imin,   Imax,  cmap_seq, 'Intensity [arb]',       '630.0-nm Intensity'),
+        }
+
+        site_emission = ' '.join(filter(None, [site_name, emission]))
+        n_years       = len(years)
+        results_cy    = {}
+
+        for v in variables:
+            vmin, vmax, cmap, cbar_lbl, panel_title = var_cfg_cy[v]
+
+            with matplotlib.rc_context(rc):
+                fig, axes_2d = plt.subplots(
+                    n_years, 1,
+                    figsize=(fig_w, n_years * row_h),
+                    sharex=True, sharey=True,
+                    constrained_layout=True,
+                    squeeze=False,
+                )
+                axes_cy = axes_2d.ravel()
+
+                pcm_last = None
+                for i, year in enumerate(years):
+                    ax = axes_cy[i]
+                    ax.set_facecolor('#b0b0b0')
+                    data2d = year_grids[year][v]      # shape (n_tbins, 366)
+                    masked = ma.masked_invalid(data2d)
+                    pcm = ax.pcolormesh(
+                        x_edges_yr, time_edges, masked,
+                        vmin=vmin, vmax=vmax, cmap=cmap, shading='flat',
+                    )
+                    pcm_last = pcm
+                    ax.set_xlim(0.5, 366.5)
+                    ax.set_ylim(t_start, t_end)
+                    ax.yaxis.set_major_formatter(FuncFormatter(_lt_fmt_cy))
+                    ax.set_ylabel('LT [hr]')
+                    # Year label at top-left of each row
+                    ax.set_title(str(year), loc='left', fontweight='bold',
+                                 fontsize=rc.get('axes.titlesize', 10))
+                    ax.set_xticks(_month_doy)
+                    # Month labels only on the bottom row; all rows get ticks
+                    ax.set_xticklabels(
+                        _month_labels if i == n_years - 1 else []
+                    )
+
+                if pcm_last is not None:
+                    cbar = fig.colorbar(
+                        pcm_last, ax=axes_cy.tolist(),
+                        ticks=[vmin, (vmin + vmax) / 2.0, vmax],
+                    )
+                    cbar.set_label(cbar_lbl)
+
+                title_parts = [p for p in [site_emission, panel_title] if p]
+                fig.suptitle(
+                    '  '.join(title_parts),
+                    fontsize=rc.get('axes.titlesize', 10) + 1,
+                    fontweight='bold',
+                )
+
+            results_cy[v] = (fig, axes_cy)
+
+        return results_cy
 
     # ── Night-date index and data accumulation ────────────────────────────
     if isinstance(files, xr.Dataset):
