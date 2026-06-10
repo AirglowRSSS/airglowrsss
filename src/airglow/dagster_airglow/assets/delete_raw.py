@@ -26,9 +26,15 @@ class DeleteRawConfig(dg.Config):
 def delete_raw(
         context: dg.AssetExecutionContext,
         s3: S3ResourceNCSA):
-    upstream_metadata = context.instance.get_latest_materialization_event(
-        dg.AssetKey("unzip_chunked_archive")).asset_materialization.metadata
-    config = DeleteRawConfig(**upstream_metadata['delete_raw_config'].data)
+    materialization_records = context.instance.get_records_for_run(
+        run_id=context.run_id,
+        of_type=dg.DagsterEventType.ASSET_MATERIALIZATION,
+    ).records
+    materialization_dict = {
+        record.asset_key.to_python_identifier(): record.asset_materialization.metadata
+        for record in materialization_records
+    }
+    config = DeleteRawConfig(**materialization_dict['unzip_chunked_archive']['delete_raw_config'].data)
     context.log.info(f"Delete Raw config: {config}")
 
     context.log.info(
