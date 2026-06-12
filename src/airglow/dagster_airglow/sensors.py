@@ -79,10 +79,10 @@ def instrument_upload_sensor(context, s3: S3ResourceNCSA):
 
         context.log.info(f"Found {len(sensor_files)} files on {sensor_date}")
 
-        # Key by (site_code, stub) so instruments at the same site stay separate.
-        # e.g. ('uao', 'fpi05') and ('uao', 'fpi13') are distinct keys.
-        tar_gz_files = {}   # dict[(site, stub), list[str]]
-        complete_sites = {}  # dict[(site, stub), str]
+        # Key by stub only — the instrument stub (e.g. 'fpi05', 'fpi13') is
+        # globally unique and already encodes the site implicitly.
+        tar_gz_files = {}   # dict[stub, list[str]]
+        complete_sites = {}  # dict[stub, str]
 
         for file in sensor_files:
             filename = file.split('/')[-1]
@@ -90,31 +90,32 @@ def instrument_upload_sensor(context, s3: S3ResourceNCSA):
             if len(parts) < 2:
                 continue
 
-            stub = parts[0]       # e.g. 'fpi05' or 'fpi13'
-            site_code = parts[1]  # e.g. 'uao'
-            key = (site_code, stub)
+            stub = parts[0]  # e.g. 'fpi05' or 'fpi13'
 
             if filename.startswith("fpi") and filename.endswith(".txt"):
                 # Log file — signals that all chunks for this instrument are uploaded
-                complete_sites[key] = file
+                complete_sites[stub] = file
                 continue
 
             if "tar.gz" in file:
-                if key in tar_gz_files:
-                    tar_gz_files[key].append(file)
+                if stub in tar_gz_files:
+                    tar_gz_files[stub].append(file)
                 else:
-                    tar_gz_files[key] = [file]
+                    tar_gz_files[stub] = [file]
 
         context.log.info(f"Found files for {list(tar_gz_files.keys())}")
 
-        for (site, stub) in tar_gz_files.keys():
-            key = (site, stub)
-            if key not in complete_sites:
+        for stub in tar_gz_files.keys():
+            if stub not in complete_sites:
                 context.log.info(
-                    f"Incomplete upload for {stub} at {site} on {sensor_date} "
+                    f"Incomplete upload for {stub} on {sensor_date} "
                     f"— will pick up next time"
                 )
                 continue
+
+            # Derive site from the log filename: fpi05_uao_20260407.txt -> 'uao'
+            log_parts = complete_sites[stub].split('/')[-1].split('_')
+            site = log_parts[1] if len(log_parts) >= 2 else 'unknown'
 
             match = re.search(r'fpi(\d{2})', stub)
             if match:
@@ -122,7 +123,7 @@ def instrument_upload_sensor(context, s3: S3ResourceNCSA):
             else:
                 context.log.warning(
                     f"Could not determine instrument name from stub '{stub}' "
-                    f"for {tar_gz_files[key][0]}"
+                    f"for {tar_gz_files[stub][0]}"
                 )
                 instrument_name = "minime??"
 
@@ -131,14 +132,14 @@ def instrument_upload_sensor(context, s3: S3ResourceNCSA):
                     site=site,
                     observation_date=str(sensor_date),
                     cloud_files=cloud_cover_files_for_site(site, objects),
-                    file_chunks=sorted(tar_gz_files[key]),
+                    file_chunks=sorted(tar_gz_files[stub]),
                     instrument_name=instrument_name,
-                    instrument_log_file=complete_sites[key],
+                    instrument_log_file=complete_sites[stub],
                 )
             })
 
             yield dg.RunRequest(
-                run_key=f"sort-{sensor_date}-{site}-{stub}",  # unique per instrument
+                run_key=f"sort-{sensor_date}-{stub}",  # unique per instrument
                 run_config=run_config,
                 tags={
                     "site": site,
