@@ -770,10 +770,9 @@ def DataSummary(files, times=None,
                     ax.set_facecolor('#b0b0b0')
                     data2d = year_grids[year][v]      # shape (n_tbins, 366)
                     masked = ma.masked_invalid(data2d)
-                    pcm = ax.pcolormesh(
-                        x_edges_yr, time_edges, masked,
-                        vmin=vmin, vmax=vmax, cmap=cmap, shading='flat',
-                    )
+                    pcm = ax.pcolormesh(x_edges_yr, time_edges, masked,vmin=vmin, vmax=vmax, cmap=cmap, shading='flat',)
+                    #X, Y = np.meshgrid(x_centers, time_centers)
+                    #pcm = ax.contourf(X, Y, masked,levels=20,cmap=cmap,vmin=vmin,vmax=vmax)
                     pcm_last = pcm
                     ax.set_xlim(0.5, 366.5)
                     ax.set_ylim(t_start, t_end)
@@ -1118,10 +1117,7 @@ def DataSummary(files, times=None,
             # from cells that contain a true zero value.
             ax.set_facecolor('#b0b0b0')
             masked = ma.masked_invalid(data2d)
-            pcm = ax.pcolormesh(
-                x_edges, time_edges, masked,
-                vmin=vmin, vmax=vmax, cmap=cmap, shading='flat',
-            )
+            pcm = ax.pcolormesh(x_edges, time_edges, masked,vmin=vmin, vmax=vmax, cmap=cmap, shading='flat')
             ax.set_ylim(t_start, t_end)
             ax.yaxis.set_major_formatter(FuncFormatter(_lt_fmt))
             ax.set_ylabel('LT [hr]')
@@ -1169,6 +1165,8 @@ def MonthlySummaries(
     show_sample_counts=False,
     mode='publication',
     plot_los=False,
+    by_year=False,
+    shade_years=False,
 ):
     """
     Monthly climatology panels for FPI data.
@@ -1209,12 +1207,27 @@ def MonthlySummaries(
     plot_los : bool
         If ``True``, plot raw Doppler-corrected LOS wind instead of the
         default horizontal projection.  Temperature and intensity unaffected.
+    by_year : bool
+        If ``True``, produce a year-over-year comparison instead of the
+        default direction-overlay climatology.  Each figure is a fixed 3×4
+        grid (one panel per calendar month, Jan–Dec); each line within a
+        panel represents one calendar year present in *ds*.  Year colours
+        are drawn from ``tab10`` and are consistent across all panels and
+        figures.  Returns a dict keyed by ``(var_group, direction)`` tuples
+        rather than plain ``var_group`` strings.
+    shade_years : bool
+        Only used when *by_year* is ``True``.  If ``True``, draw uncertainty
+        shading (using the *shade* method) for each year's line, the same
+        way the default mode shades directions.  Default ``False`` (lines
+        only), which is cleaner when many years overlap.
 
     Returns
     -------
     dict of str → matplotlib.Figure
         Keys are variable group names requested; e.g.
         ``{'wind': fig1, 'temperature': fig2}``.
+        When *by_year* is ``True``, keys are ``(var_group, direction)``
+        tuples; e.g. ``{('wind', 'North'): fig1, ('wind', 'South'): fig2}``.
 
     Notes
     -----
@@ -1235,6 +1248,8 @@ def MonthlySummaries(
         Grid is 3 columns wide (≤2 months → 1 column), with enough rows
         to hold all months chronologically.  Unused grid cells are hidden;
         if exactly one cell is unused it holds the shared legend.
+        When *by_year* is ``True``, the grid is always 4 rows × 3 columns
+        (Jan–Dec); empty months show a "No data" label.
     """
     # ── Validate inputs ───────────────────────────────────────────────────
     valid_vars  = {'wind', 'temperature', 'intensity'}
@@ -1373,6 +1388,226 @@ def MonthlySummaries(
         obs_wind   = np.full(len(obs_dirs), np.nan)
         obs_wind_w = np.full(len(obs_dirs), np.nan)
 
+    # ── Emission label and date range (used by both code paths) ─────────────
+    em_raw = ds.attrs.get('emission', '')
+    em_str = 'RL' if em_raw == 'xr' else ('GL' if em_raw == 'xg' else em_raw.upper())
+    date_range_attr = ds.attrs.get('date_range', '')
+
+    # ── Year-over-month comparison ────────────────────────────────────────
+    if by_year:
+        import matplotlib.lines as mlines
+
+        obs_year  = np.array([d.year  for d in night_of_obs])
+        obs_month = np.array([d.month for d in night_of_obs])
+        unique_years = sorted(set(obs_year.tolist()))
+
+        # Consistent tab10 colour per year across all panels and figures
+        year_colors = {yr: plt.cm.tab10(i % 10) for i, yr in enumerate(unique_years)}
+
+        xtick_locs_by = np.arange(
+            np.ceil(t_start / 2) * 2,
+            t_end + 0.01,
+            2.0,
+        )
+        xtick_locs_by = xtick_locs_by[
+            (xtick_locs_by >= t_start) & (xtick_locs_by <= t_end)
+        ]
+
+        def _xt_label_by(h):
+            return f'{int(h % 24):02d}:00'
+
+        xlabel_str_by = 'LST' if time_axis == 'LST' else 'UT'
+
+        by_var_cfg = {
+            'wind':        (obs_wind,  obs_wind_w,  'LOS Wind [m/s]' if plot_los else 'Wind [m/s]'),
+            'temperature': (obs_T,     obs_T_w,     'Temperature [K]'),
+            'intensity':   (obs_I,     obs_I_w,     'Intensity [arb]'),
+        }
+
+        month_names = [
+            'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+            'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+        ]
+
+        by_results = {}
+
+        for var_group in variables:
+            obs_vals, obs_wts, ylabel = by_var_cfg[var_group]
+
+            for direction in directions:
+                # Bin stats per (year, month) for this direction
+                stats_ym = {}
+                for yr in unique_years:
+                    for mo in range(1, 13):
+                        mask = (
+                            (obs_year == yr)
+                            & (obs_month == mo)
+                            & (obs_dirs == direction)
+                        )
+                        if not mask.any():
+                            stats_ym[(yr, mo)] = None
+                            continue
+
+                        ph  = obs_plot_hours[mask]
+                        val = obs_vals[mask]
+                        wt  = obs_wts[mask]
+                        ti  = np.digitize(ph, time_edges) - 1
+
+                        mean_arr = np.full(n_tbins, np.nan)
+                        lo_arr   = np.full(n_tbins, np.nan)
+                        hi_arr   = np.full(n_tbins, np.nan)
+                        n_arr    = np.zeros(n_tbins, dtype=int)
+
+                        for b in range(n_tbins):
+                            b_mask  = (ti == b)
+                            n_valid = int(np.sum(b_mask & np.isfinite(val)))
+                            n_arr[b] = n_valid
+                            if n_valid >= 2:
+                                mean_arr[b], lo_arr[b], hi_arr[b] = \
+                                    _weighted_bin_stats(val[b_mask], wt[b_mask], shade)
+
+                        stats_ym[(yr, mo)] = {
+                            'mean': mean_arr, 'lo': lo_arr,
+                            'hi':   hi_arr,   'n':  n_arr,
+                        }
+
+                # Shared y-axis limits across all months and years
+                all_lo, all_hi = [], []
+                for st in stats_ym.values():
+                    if st is None:
+                        continue
+                    all_lo.extend(st['lo'][np.isfinite(st['lo'])].tolist())
+                    all_hi.extend(st['hi'][np.isfinite(st['hi'])].tolist())
+
+                if not all_lo:
+                    with matplotlib.rc_context(rc):
+                        fig, ax = plt.subplots(
+                            figsize=(panel_w, panel_h), constrained_layout=True
+                        )
+                        ax.text(0.5, 0.5, 'No data',
+                                transform=ax.transAxes, ha='center', va='center')
+                        ax.set_axis_off()
+                    by_results[(var_group, direction)] = fig
+                    continue
+
+                data_lo = min(all_lo)
+                data_hi = max(all_hi)
+                pad     = 0.05 * (data_hi - data_lo) if data_hi > data_lo else 1.0
+                ylim_lo = -80#data_lo - pad
+                ylim_hi = 80#data_hi + pad
+
+                fig_w = 3 * panel_w
+                fig_h = 4 * panel_h
+
+                with matplotlib.rc_context(rc):
+                    fig, axes = plt.subplots(
+                        4, 3,
+                        figsize=(fig_w, fig_h),
+                        sharex=True,
+                        sharey=True,
+                        constrained_layout=True,
+                        squeeze=False,
+                    )
+                    axes_flat = axes.flatten()
+
+                    axes_flat[0].set_xlim(t_start, t_end)
+                    axes_flat[0].set_ylim(ylim_lo, ylim_hi)
+                    axes_flat[0].set_xticks(xtick_locs_by)
+                    axes_flat[0].xaxis.set_major_formatter(
+                        FuncFormatter(lambda h, _: _xt_label_by(h))
+                    )
+
+                    for mo_idx in range(12):
+                        mo = mo_idx + 1
+                        ax = axes_flat[mo_idx]
+                        ax.set_title(
+                            month_names[mo_idx],
+                            fontsize=rc.get('axes.titlesize', 10),
+                        )
+
+                        any_data = False
+                        for yr in unique_years:
+                            st = stats_ym.get((yr, mo))
+                            if st is None or not np.any(np.isfinite(st['mean'])):
+                                continue
+                            any_data = True
+                            color = year_colors[yr]
+
+                            valid = np.isfinite(st['mean'])
+                            ax.plot(
+                                time_centers[valid], st['mean'][valid],
+                                color=color, linewidth=lw_line, label=str(yr),
+                            )
+
+                            if shade_years:
+                                band = (
+                                    valid
+                                    & np.isfinite(st['lo'])
+                                    & np.isfinite(st['hi'])
+                                )
+                                if band.any():
+                                    ax.fill_between(
+                                        time_centers[band],
+                                        st['lo'][band], st['hi'][band],
+                                        color=color, alpha=_SHADE_ALPHA,
+                                    )
+
+                        if not any_data:
+                            ax.text(
+                                0.5, 0.5, 'No data',
+                                transform=ax.transAxes,
+                                ha='center', va='center',
+                                fontsize=rc.get('font.size', 9),
+                                color='gray',
+                            )
+
+                    # y-labels on left column, x-labels on bottom row
+                    for row in range(4):
+                        axes[row, 0].set_ylabel(
+                            ylabel, fontsize=rc.get('axes.labelsize', 9)
+                        )
+                    for col in range(3):
+                        axes[3, col].set_xlabel(
+                            xlabel_str_by, fontsize=rc.get('axes.labelsize', 9)
+                        )
+                        plt.setp(
+                            axes[3, col].get_xticklabels(),
+                            rotation=45, ha='right',
+                        )
+
+                    # Legend below figure — one entry per year
+                    legend_handles = [
+                        mlines.Line2D(
+                            [], [], color=year_colors[yr],
+                            linewidth=lw_line, label=str(yr),
+                        )
+                        for yr in unique_years
+                    ]
+                    fig.legend(
+                        legend_handles, [str(yr) for yr in unique_years],
+                        loc='lower center',
+                        ncol=len(unique_years),
+                        fontsize=rc.get('font.size', 9),
+                        bbox_to_anchor=(0.5, -0.02),
+                        frameon=True,
+                    )
+
+                    title_parts = [
+                        p for p in [
+                            site.upper(), em_str,
+                            var_group.capitalize(), direction, date_range_attr,
+                        ]
+                        if p
+                    ]
+                    fig.suptitle(
+                        '  |  '.join(title_parts),
+                        fontsize=rc.get('axes.titlesize', 10),
+                    )
+
+                by_results[(var_group, direction)] = fig
+
+        return by_results
+
     # ── Panel grid layout ─────────────────────────────────────────────────
     # Prefer 3 columns; fall back to 1 column for ≤2 months (spec: "single
     # column for ≤2 months").  nrows determined by ceil(n_months / ncols).
@@ -1399,11 +1634,6 @@ def MonthlySummaries(
         'temperature': (obs_T,     obs_T_w,     'Temperature [K]'),
         'intensity':   (obs_I,     obs_I_w,     'Intensity [arb]'),
     }
-
-    # Emission label for figure title
-    em_raw = ds.attrs.get('emission', '')
-    em_str = 'RL' if em_raw == 'xr' else ('GL' if em_raw == 'xg' else em_raw.upper())
-    date_range_attr = ds.attrs.get('date_range', '')
 
     results = {}
 
