@@ -132,9 +132,9 @@ def instrument_upload_sensor(context, s3: S3ResourceNCSA):
                     site=site,
                     observation_date=str(sensor_date),
                     cloud_files=cloud_cover_files_for_site(site, objects),
-                    file_chunks=sorted(tar_gz_files[stub]),
+#                    file_chunks=sorted(tar_gz_files[stub]),
                     instrument_name=instrument_name,
-                    instrument_log_file=complete_sites[stub],
+#                    instrument_log_file=complete_sites[stub],
                 )
             })
 
