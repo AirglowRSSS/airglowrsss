@@ -92,7 +92,13 @@ def instrument_upload_sensor(context, s3: S3ResourceNCSA):
 
             stub = parts[0]  # e.g. 'fpi05' or 'fpi13'
 
-            if filename.startswith("fpi") and filename.endswith(".txt"):
+            # Skip any file whose first component is not a valid fpiNN stub.
+            # This guards against Cloud files, stray uploads, etc. contaminating
+            # tar_gz_files or complete_sites.
+            if not re.match(r'^fpi\d+$', stub):
+                continue
+
+            if filename.endswith(".txt"):
                 # Log file — signals that all chunks for this instrument are uploaded
                 complete_sites[stub] = file
                 continue
@@ -132,9 +138,9 @@ def instrument_upload_sensor(context, s3: S3ResourceNCSA):
                     site=site,
                     observation_date=str(sensor_date),
                     cloud_files=cloud_cover_files_for_site(site, objects),
-#                    file_chunks=sorted(tar_gz_files[stub]),
+                    file_chunks=sorted(tar_gz_files[stub]),
                     instrument_name=instrument_name,
-#                    instrument_log_file=complete_sites[stub],
+                    instrument_log_file=complete_sites[stub],
                 )
             })
 
