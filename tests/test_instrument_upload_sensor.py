@@ -109,3 +109,48 @@ def test_instrument_upload_sensor():
         'instrument_name': 'minime12',
         'instrument_log_file': 'raw/fpi12_ABC_20250409.txt'
     }
+
+
+def test_instrument_upload_sensor_two_instruments_same_site():
+    """Two instruments (fpi05, fpi13) at the same site must produce two
+    separate RunRequests, each scoped to its own chunks only."""
+    mock_s3 = MagicMock()
+    paginator = MagicMock()
+    files = [
+        "raw/fpi05_uao_20260407.tar.gz000000",
+        "raw/fpi05_uao_20260407.tar.gz000001",
+        "raw/fpi13_uao_20260407.tar.gz000000",
+        "raw/fpi13_uao_20260407.tar.gz000001",
+        "raw/fpi05_uao_20260407.txt",
+        "raw/fpi13_uao_20260407.txt",
+        "raw/Cloud_uao_20260407.txt",
+    ]
+    paginator.paginate.return_value = [
+        {"Contents": [{"Key": file} for file in files]}
+    ]
+    mock_s3.get_client.return_value.get_paginator.return_value = paginator
+
+    context = dg.build_sensor_context(resources={"s3": mock_s3})
+    runs = list(instrument_upload_sensor(context))
+
+    assert len(runs) == 2, f"Expected 2 RunRequests, got {len(runs)}"
+
+    runs_by_key = {r.run_key: r for r in runs}
+    assert 'sort-20260407-fpi05' in runs_by_key, f"Missing fpi05 run, keys: {list(runs_by_key)}"
+    assert 'sort-20260407-fpi13' in runs_by_key, f"Missing fpi13 run, keys: {list(runs_by_key)}"
+
+    fpi05_config = runs_by_key['sort-20260407-fpi05'].run_config['ops']['unzip_chunked_archive']['config']
+    assert fpi05_config['instrument_name'] == 'minime05'
+    assert fpi05_config['site'] == 'uao'
+    assert fpi05_config['file_chunks'] == [
+        'raw/fpi05_uao_20260407.tar.gz000000',
+        'raw/fpi05_uao_20260407.tar.gz000001',
+    ], f"fpi05 got wrong chunks: {fpi05_config['file_chunks']}"
+
+    fpi13_config = runs_by_key['sort-20260407-fpi13'].run_config['ops']['unzip_chunked_archive']['config']
+    assert fpi13_config['instrument_name'] == 'minime13'
+    assert fpi13_config['site'] == 'uao'
+    assert fpi13_config['file_chunks'] == [
+        'raw/fpi13_uao_20260407.tar.gz000000',
+        'raw/fpi13_uao_20260407.tar.gz000001',
+    ], f"fpi13 got wrong chunks: {fpi13_config['file_chunks']}"
