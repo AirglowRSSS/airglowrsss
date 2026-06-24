@@ -475,6 +475,17 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
     # Ensure output directory exists
     os.makedirs(system_parameters['output_directory'], exist_ok=True)
 
+    # Elevation floor used exclusively for colormap-limit computation.  Set
+    # higher than el_cutoff to exclude near-horizon pixels (city lights, etc.)
+    # that can spike the percentiles and cause flicker.  Defaults to el_cutoff+10.
+    clim_el_cutoff = analysis_parameters.get(
+        'clim_el_cutoff', analysis_parameters['el_cutoff'] + 10
+    )
+    logger.info(
+        f"Colormap limits use pixels above {clim_el_cutoff}° "
+        f"(display cutoff: {analysis_parameters['el_cutoff']}°)"
+    )
+
     # Pre-compute a single fixed colormap range across all sites and all frames
     # to prevent per-frame clim variation that causes flickering in the output movie.
     # Subsample frames to keep memory under ~10M values: use every Nth frame where
@@ -484,7 +495,7 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
         if 'FilteredImageData' not in ds[_site]:
             continue
         _fid = ds[_site]['FilteredImageData']
-        _mask = (ds[_site]['Elevation'] > analysis_parameters['el_cutoff']).values
+        _mask = (ds[_site]['Elevation'] > clim_el_cutoff).values
         _n = len(ds[_site].time)
         _step = max(1, _n // 30)
         for _ti in range(0, _n, _step):
@@ -516,7 +527,7 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
             if 'FilteredImageData' not in ds[_site]:
                 continue
             _fid = ds[_site]['FilteredImageData']
-            _mask = (ds[_site]['Elevation'] > analysis_parameters['el_cutoff']).values
+            _mask = (ds[_site]['Elevation'] > clim_el_cutoff).values
             _n = len(ds[_site].time)
             _vmins = np.empty(_n)
             _vmaxs = np.empty(_n)
@@ -564,8 +575,10 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
 
                     filtered_frame = data.FilteredImageData.where(mask)
                     if norm_mode == 'per_frame':
-                        _vals = filtered_frame.values
-                        _valid = _vals[np.isfinite(_vals)]
+                        _clim_mask = (data.Elevation > clim_el_cutoff).values
+                        _vals = data.FilteredImageData.values
+                        _valid = _vals[_clim_mask]
+                        _valid = _valid[np.isfinite(_valid)]
                         if len(_valid) > 0:
                             vmin_plot = float(np.percentile(_valid, clim_percentile[0]))
                             vmax_plot = float(np.percentile(_valid, clim_percentile[1]))
@@ -803,6 +816,12 @@ if __name__=="__main__":
                         type=int, default=11,
                         help="Number of frames in the running-median window used by "
                              "--normalization=rolling (default: 11; forced odd)")
+    parser.add_argument("--clim-el-cutoff", dest="clim_el_cutoff",
+                        type=float, default=None,
+                        help="Minimum elevation (degrees) for pixels included in "
+                             "colormap-limit computation.  Default is el_cutoff+10 "
+                             "(i.e. 30° with the standard 20° display cutoff).  Set "
+                             "higher to exclude near-horizon light sources.")
 
     args = parser.parse_args()
     year = args.year
@@ -813,6 +832,7 @@ if __name__=="__main__":
     delete_working_files = args.delete_working_files
     normalization = args.normalization
     rolling_window = args.rolling_window
+    clim_el_cutoff = args.clim_el_cutoff
 
     # Defaults if no date is given
     if (doy == 0) or (year == 0):
@@ -849,6 +869,7 @@ if __name__=="__main__":
         'el_cutoff': 20.,
         'normalization': normalization,
         'rolling_window': rolling_window,
+        **({'clim_el_cutoff': clim_el_cutoff} if clim_el_cutoff is not None else {}),
     }
 
     # Run the code
