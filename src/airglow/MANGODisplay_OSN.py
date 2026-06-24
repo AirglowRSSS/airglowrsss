@@ -696,8 +696,8 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
             text1 = 'Temporal filter: %d-%d min' % (analysis_parameters['Tlo'], analysis_parameters['Thi'])
         text2 = 'Plotted on ' + today_date
         text_x = 0
-        axes00.annotate(text1, xy=(text_x, -0.05), xycoords='axes fraction', ha='left', va='bottom', fontsize=8)
-        axes00.annotate(text2, xy=(text_x, -0.10), xycoords='axes fraction', ha='left', va='bottom', fontsize=8)
+        axes00.annotate(text1, xy=(text_x, -0.05), xycoords='axes fraction', ha='left', va='bottom', fontsize=6)
+        axes00.annotate(text2, xy=(text_x, -0.10), xycoords='axes fraction', ha='left', va='bottom', fontsize=6)
         if norm_mode != 'global':
             _roll_win = analysis_parameters.get('rolling_window', 11)
             _norm_labels = {
@@ -706,7 +706,7 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
             }
             axes00.annotate(_norm_labels.get(norm_mode, f'Display: {norm_mode} normalization'),
                             xy=(text_x, -0.15), xycoords='axes fraction',
-                            ha='left', va='bottom', fontsize=8)
+                            ha='left', va='bottom', fontsize=6)
 
         # Suppress warning about tight_layout compatibility
         with warnings.catch_warnings():
