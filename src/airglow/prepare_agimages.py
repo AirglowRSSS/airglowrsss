@@ -1010,7 +1010,15 @@ def conv_singleframe(args):
 
 IM3D = None
 
-def filter_airglow(IM3Darg, b, ntaps):
+
+def _init_filter_worker(im3d_arg):
+    # Initializer for Pool workers: sets the global so spawned processes
+    # (macOS default) have access to the array, not just forked ones.
+    global IM3D
+    IM3D = im3d_arg
+
+
+def filter_airglow(IM3Darg, b, ntaps, n_workers=NUM_PROCESSORS):
 
     global IM3D
     IM3D  = IM3Darg
@@ -1018,20 +1026,16 @@ def filter_airglow(IM3Darg, b, ntaps):
     IM3Dfilt  = np.zeros(np.shape(IM3D))
     K = np.shape(IM3D)[2]
 
-#    print("Temporally convolving...")
-    pool = mp.Pool(processes = NUM_PROCESSORS)
-
     args = [(b, i, K, ntaps) for i in range(K)]
 
-    conv_singleframe(args[0])
-
+    pool = mp.Pool(processes=n_workers,
+                   initializer=_init_filter_worker,
+                   initargs=(IM3Darg,))
     IM3Dfilt_LIST = pool.map(conv_singleframe, args)
     pool.close()
     pool.join()
 
     for k in range(K):
         IM3Dfilt[:,:,k] = IM3Dfilt_LIST[k]
-
-#    print("finished.")
 
     return IM3Dfilt

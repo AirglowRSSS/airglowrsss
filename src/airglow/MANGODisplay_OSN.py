@@ -307,25 +307,32 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
 
     # Download data
     if analysis_parameters['download_data']:
-        for site in analysis_parameters['sites_asi']:
-            try:
-                if sky_line_tag == 'XG':
-                    cmd = '/usr/bin/wget -r -nH --cut-dirs=8 --no-parent -P %s/%s/%s https://data.mangonetwork.org/data/transport/mango/archive/%s/greenline/level1/%04d/%s/' % \
-                    (system_parameters['ASI_directory'], site, analysis_parameters['date'].year, site, analysis_parameters['date'].year, analysis_parameters['date'].strftime('%j'))
-                elif sky_line_tag == 'XR':
-                    cmd = '/usr/bin/wget -r -nH --cut-dirs=8 --no-parent -P %s/%s/%s https://data.mangonetwork.org/data/transport/mango/archive/%s/redline/level1/%04d/%s/' % \
-                    (system_parameters['ASI_directory'], site, analysis_parameters['date'].year, site, analysis_parameters['date'].year, analysis_parameters['date'].strftime('%j'))
-                logger.info(f"Downloading ASI data for {site}: {cmd}")
-                MANGO_L2.runcmd(cmd)
-            except Exception as e:
-                logger.error(f"Failure to download {site} on {analysis_parameters['date']}: {str(e)}")
+        wget_bin = shutil.which('wget')
+        if not wget_bin:
+            logger.error(
+                "wget not found on PATH; cannot download ASI data. "
+                "Install wget (e.g. 'brew install wget' on macOS) and ensure it is on PATH."
+            )
+        else:
+            for site in analysis_parameters['sites_asi']:
+                try:
+                    if sky_line_tag == 'XG':
+                        cmd = '%s -r -nH --cut-dirs=8 --no-parent -P %s/%s/%s https://data.mangonetwork.org/data/transport/mango/archive/%s/greenline/level1/%04d/%s/' % \
+                        (wget_bin, system_parameters['ASI_directory'], site, analysis_parameters['date'].year, site, analysis_parameters['date'].year, analysis_parameters['date'].strftime('%j'))
+                    elif sky_line_tag == 'XR':
+                        cmd = '%s -r -nH --cut-dirs=8 --no-parent -P %s/%s/%s https://data.mangonetwork.org/data/transport/mango/archive/%s/redline/level1/%04d/%s/' % \
+                        (wget_bin, system_parameters['ASI_directory'], site, analysis_parameters['date'].year, site, analysis_parameters['date'].year, analysis_parameters['date'].strftime('%j'))
+                    logger.info(f"Downloading ASI data for {site}: {cmd}")
+                    MANGO_L2.runcmd(cmd)
+                except Exception as e:
+                    logger.error(f"Failure to download {site} on {analysis_parameters['date']}: {str(e)}")
 
-            # This is where the data should have been downloaded to
-            target_directory = '%s/%s/%s/%s' % (system_parameters['ASI_directory'], site, analysis_parameters['date'].year, analysis_parameters['date'].strftime('%j'))
-            # Add downloaded files to the list
-            for root, dirs, files in os.walk(target_directory):
-                for file in files:
-                    downloaded_files.append(os.path.join(root, file))
+                # This is where the data should have been downloaded to
+                target_directory = '%s/%s/%s/%s' % (system_parameters['ASI_directory'], site, analysis_parameters['date'].year, analysis_parameters['date'].strftime('%j'))
+                # Add downloaded files to the list
+                for root, dirs, files in os.walk(target_directory):
+                    for file in files:
+                        downloaded_files.append(os.path.join(root, file))
 
     # Download FPI data
     fpi_dir = os.path.join(system_parameters['FPI_directory'])
@@ -492,6 +499,44 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
         vmin, vmax = None, None
     logger.info(f"Colormap limits: vmin={vmin}, vmax={vmax}")
 
+    norm_mode = analysis_parameters.get('normalization', 'global')
+
+    # rolling: pre-compute per-frame percentile limits for each site, then smooth
+    # those limit sequences with a temporal running median so the colormap drifts
+    # slowly rather than jumping.  Window size is odd; defaults to 11 frames.
+    # per_frame: recompute range per site per frame — maximum suppression but
+    # residual jumping when the pixel distribution shifts between frames.
+    site_rolling_clims = {}
+    if norm_mode == 'rolling':
+        roll_window = int(analysis_parameters.get('rolling_window', 11))
+        if roll_window % 2 == 0:
+            roll_window += 1
+        logger.info(f"Rolling normalization enabled with window={roll_window} frames")
+        for _site in ds.keys():
+            if 'FilteredImageData' not in ds[_site]:
+                continue
+            _fid = ds[_site]['FilteredImageData']
+            _mask = (ds[_site]['Elevation'] > analysis_parameters['el_cutoff']).values
+            _n = len(ds[_site].time)
+            _vmins = np.empty(_n)
+            _vmaxs = np.empty(_n)
+            for _ti in range(_n):
+                _frame = _fid.isel(time=_ti).values
+                _valid = _frame[_mask]
+                _valid = _valid[np.isfinite(_valid)]
+                if len(_valid) > 0:
+                    _vmins[_ti] = np.percentile(_valid, clim_percentile[0])
+                    _vmaxs[_ti] = np.percentile(_valid, clim_percentile[1])
+                else:
+                    _vmins[_ti] = vmin if vmin is not None else 0.0
+                    _vmaxs[_ti] = vmax if vmax is not None else 1.0
+            site_rolling_clims[_site] = (
+                pd.Series(_vmins).rolling(roll_window, center=True, min_periods=1).median().to_numpy(),
+                pd.Series(_vmaxs).rolling(roll_window, center=True, min_periods=1).median().to_numpy(),
+            )
+    elif norm_mode == 'per_frame':
+        logger.info("Per-frame per-site percentile normalization enabled (normalization='per_frame')")
+
     # THIS WOULD BE THE LOOP START
     for target_time in unique_times:
         fig = plt.figure(figsize=params['figsize'])
@@ -517,7 +562,25 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
                     longitude = data.Longitude
                     mask = data.Elevation > analysis_parameters['el_cutoff']
 
-                    pc = axes00.pcolormesh(longitude, latitude, data.FilteredImageData.where(mask), transform=crs.PlateCarree(), cmap=params['cmap'], vmin=vmin, vmax=vmax)
+                    filtered_frame = data.FilteredImageData.where(mask)
+                    if norm_mode == 'per_frame':
+                        _vals = filtered_frame.values
+                        _valid = _vals[np.isfinite(_vals)]
+                        if len(_valid) > 0:
+                            vmin_plot = float(np.percentile(_valid, clim_percentile[0]))
+                            vmax_plot = float(np.percentile(_valid, clim_percentile[1]))
+                        else:
+                            vmin_plot, vmax_plot = vmin, vmax
+                    elif norm_mode == 'rolling':
+                        if k in site_rolling_clims:
+                            _ti = int(np.argmin(np.abs(ds[k].time.values - target_time)))
+                            vmin_plot = float(site_rolling_clims[k][0][_ti])
+                            vmax_plot = float(site_rolling_clims[k][1][_ti])
+                        else:
+                            vmin_plot, vmax_plot = vmin, vmax
+                    else:
+                        vmin_plot, vmax_plot = vmin, vmax
+                    pc = axes00.pcolormesh(longitude, latitude, filtered_frame, transform=crs.PlateCarree(), cmap=params['cmap'], vmin=vmin_plot, vmax=vmax_plot)
 
         # Set the title and limits of the map
         axes00.set_title('%s UT' % pd.to_datetime(str(target_time)))
@@ -527,7 +590,7 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
         pos = axes00.get_position()
         cax = fig.add_axes([pos.x0 + params['cloc'][0] * pos.width, pos.y0 + params['cloc'][1], params['cloc'][2] * pos.width - 0.05, + params['cloc'][3]])
         cbar = fig.colorbar(pc, cax=cax, orientation='horizontal')
-        cbar.set_label('Intensity [units]', fontsize=8)
+        cbar.set_label('Intensity [units]' if norm_mode == 'global' else 'Intensity [norm]', fontsize=8)
         cbar.set_ticks([])
         cbar.set_ticklabels([])
         cbar.ax.tick_params(labelsize=8)
@@ -634,7 +697,16 @@ def MakeSummaryMovies(system_parameters, analysis_parameters, cloud_storage, con
         text2 = 'Plotted on ' + today_date
         text_x = 0
         axes00.annotate(text1, xy=(text_x, -0.05), xycoords='axes fraction', ha='left', va='bottom', fontsize=8)
-        axes00.annotate(text2, xy=(text_x, -0.05 - 0.05), xycoords='axes fraction', ha='left', va='bottom', fontsize=8)
+        axes00.annotate(text2, xy=(text_x, -0.10), xycoords='axes fraction', ha='left', va='bottom', fontsize=8)
+        if norm_mode != 'global':
+            _roll_win = analysis_parameters.get('rolling_window', 11)
+            _norm_labels = {
+                'rolling':   f'Display: rolling normalization (window={_roll_win} frames)',
+                'per_frame': 'Display: per-frame normalization',
+            }
+            axes00.annotate(_norm_labels.get(norm_mode, f'Display: {norm_mode} normalization'),
+                            xy=(text_x, -0.15), xycoords='axes fraction',
+                            ha='left', va='bottom', fontsize=8)
 
         # Suppress warning about tight_layout compatibility
         with warnings.catch_warnings():
@@ -717,8 +789,20 @@ if __name__=="__main__":
                         action="store_true", help="Download data")
     parser.add_argument("-e", "--env", dest="env_file", help="Path to .env file", 
                         metavar="ENV_FILE", type=str, default=".env")
-    parser.add_argument("-r", "--retain", dest="delete_working_files", 
+    parser.add_argument("-r", "--retain", dest="delete_working_files",
                         action="store_false", help="Retain working files")
+    parser.add_argument("-n", "--normalization", dest="normalization",
+                        choices=["global", "rolling", "per_frame"], default="global",
+                        help="Colormap normalization: 'global' (default) uses a fixed "
+                             "percentile range across all sites and frames; 'rolling' "
+                             "smooths per-frame per-site limits with a running median "
+                             "(recommended anti-flicker, see --rolling-window); "
+                             "'per_frame' recomputes the range per site per frame for "
+                             "maximum suppression")
+    parser.add_argument("-w", "--rolling-window", dest="rolling_window",
+                        type=int, default=11,
+                        help="Number of frames in the running-median window used by "
+                             "--normalization=rolling (default: 11; forced odd)")
 
     args = parser.parse_args()
     year = args.year
@@ -727,6 +811,8 @@ if __name__=="__main__":
     download = args.download
     env_file = args.env_file
     delete_working_files = args.delete_working_files
+    normalization = args.normalization
+    rolling_window = args.rolling_window
 
     # Defaults if no date is given
     if (doy == 0) or (year == 0):
@@ -760,7 +846,9 @@ if __name__=="__main__":
         'date': datetime(year, 1, 1) + timedelta(days=doy-1),
         'ntaps': 13,
         'download_data': download_data,
-        'el_cutoff': 20.
+        'el_cutoff': 20.,
+        'normalization': normalization,
+        'rolling_window': rolling_window,
     }
 
     # Run the code
