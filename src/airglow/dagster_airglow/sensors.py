@@ -62,12 +62,39 @@ def cloud_cover_files_for_site(site: str, files: list[str]) -> list[str]:
     return [file for file in files if f"Cloud_{site}" in file and file.endswith(".txt")]
 
 
+def read_instrument_log(bucket: str, key: str, s3_client):
+    """
+    Downloads and parses an instrument log file from S3.
+
+    Expected format (10 lines):
+      line 1: first chunk filename   e.g. fpi13_uao_20260628.tar.gz000000
+      line 2: number of parts        e.g. 17
+      line 3: size of tar.gz bytes   e.g. 87647090
+      line 4: creation timestamp
+      line 5: GB disk free
+      lines 6-10: field descriptions (ignored)
+
+    Returns (num_parts: int, total_size_bytes: int) or None if the file
+    cannot be fetched or does not match the expected format.
+    """
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        lines = response['Body'].read().decode('utf-8').strip().splitlines()
+        if len(lines) >= 3:
+            return int(lines[1].strip()), int(lines[2].strip())
+    except Exception:
+        pass
+    return None
+
+
 @dg.sensor(
     job_name="analysis_job",
     minimum_interval_seconds=1 * 60 * 60,  # 1 hour
 )
 def instrument_upload_sensor(context, s3: S3ResourceNCSA):
-    objects = list_files(EnvVar('DEST_BUCKET').get_value(), "raw", s3.get_client())
+    bucket = EnvVar('DEST_BUCKET').get_value()
+    s3_client = s3.get_client()
+    objects = list_files(bucket, "raw", s3_client)
     files = group_files_by_date(objects)
 
     for data_date in sorted(files.keys()):
@@ -115,6 +142,24 @@ def instrument_upload_sensor(context, s3: S3ResourceNCSA):
             if stub not in complete_sites:
                 context.log.info(
                     f"Incomplete upload for {stub} on {sensor_date} "
+                    f"— no log file yet"
+                )
+                continue
+
+            log_info = read_instrument_log(bucket, complete_sites[stub], s3_client)
+            if log_info is None:
+                context.log.warning(
+                    f"Could not parse log file {complete_sites[stub]} "
+                    f"— skipping {stub} on {sensor_date}"
+                )
+                continue
+
+            expected_parts, _ = log_info
+            actual_parts = len(tar_gz_files[stub])
+            if actual_parts != expected_parts:
+                context.log.info(
+                    f"Incomplete upload for {stub} on {sensor_date}: "
+                    f"{actual_parts}/{expected_parts} parts present "
                     f"— will pick up next time"
                 )
                 continue
@@ -137,10 +182,10 @@ def instrument_upload_sensor(context, s3: S3ResourceNCSA):
                 "unzip_chunked_archive": ChunkedArchiveConfig(
                     site=site,
                     observation_date=str(sensor_date),
-                    cloud_files=cloud_cover_files_for_site(site, objects),
-                    file_chunks=sorted(tar_gz_files[stub]),
                     instrument_name=instrument_name,
-                    instrument_log_file=complete_sites[stub],
+                    # file_chunks, cloud_files, instrument_log_file all left as
+                    # None so resolve_config auto-discovers them from S3 at
+                    # run time, avoiding stale lists in the stored config.
                 )
             })
 
