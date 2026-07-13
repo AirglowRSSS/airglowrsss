@@ -108,7 +108,13 @@ def resolve_config(
     if config.cloud_files is not None:
         cloud_files = config.cloud_files
     else:
-        cloud_files = [f"raw/Cloud_{config.site}_{config.observation_date}.txt"]
+        from datetime import datetime, timedelta
+        obs_date = datetime.strptime(config.observation_date, "%Y%m%d")
+        next_date_str = (obs_date + timedelta(days=1)).strftime("%Y%m%d")
+        cloud_files = [
+            f"raw/Cloud_{config.site}_{config.observation_date}.txt",
+            f"raw/Cloud_{config.site}_{next_date_str}.txt",
+        ]
         context.log.info(f"cloud_files not provided; defaulting to: {cloud_files}")
 
     # --- instrument_log_file ---
