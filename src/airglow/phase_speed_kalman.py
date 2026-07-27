@@ -861,7 +861,10 @@ def analyze_all_waves_kalman(
         Kalman-estimated ω (rad/s).  Positive = propagating in the
         ``orientation_deg`` direction; negative = opposite lobe.
     ``kf_wavespeed_ms``
-        Phase speed (m/s), always non-negative (|ω| × λ / 2π).
+        Phase speed (m/s), always non-negative (``|ω| / k_h``), using the
+        per-frame Kalman-tracked wavenumber (Feature C), not the fixed
+        ω-k detection wavelength — so this stays correct even when the
+        wave's wavelength genuinely drifts over the run.
     ``kf_prop_azimuth_deg``
         Propagation azimuth in Convention B [0°, 360°), fixed from ω-k result.
     ``kf_period_min``
@@ -1088,7 +1091,17 @@ def analyze_all_waves_kalman(
             period_min = np.nan
 
             if np.isfinite(omega_t):
-                speed_ms   = abs(omega_t) * lam_km / (2.0 * np.pi) * 1000.0
+                # v = ω / k_h using the PER-FRAME Kalman-tracked wavenumber
+                # (kh_kf['kh_est'][t], rad/m), not the fixed ω-k detection
+                # wavelength (lam_km).  When a wave's wavelength genuinely
+                # drifts over the run, ω itself correctly evolves with the
+                # true, changing wavelength — reusing the stale fixed lam_km
+                # here previously multiplied a correctly time-varying ω by
+                # the wrong (constant) wavelength, producing a spurious
+                # speed transient even when the true speed is constant (see
+                # CaseStudy_TwoWave_WavelengthRamp.ipynb).
+                kh_t = float(kh_kf['kh_est'][t])
+                speed_ms   = abs(omega_t) / kh_t if kh_t > 0 else np.nan
                 prop_az    = omk_az
                 if abs(omega_t) > 1e-8:
                     period_min = 2.0 * np.pi / abs(omega_t) / 60.0
