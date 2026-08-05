@@ -55,21 +55,21 @@ import xarray as xr
 from scipy.stats import pearsonr
 
 # ── Pipeline modules ──────────────────────────────────────────────────────────
-from OmegaKFilter       import OmegaKFilterXarray
-from OmegaK_enhanced    import analyze_and_plot_waves
-from OmegaK_enhanced    import circular_mean as _cmean, circular_std as _cstd
-from wave_clustering    import compute_adaptive_gabor_parameters
-from phase_speed_kalman import (
+from airglow.OmegaKFilter       import OmegaKFilterXarray
+from airglow.OmegaK_enhanced    import analyze_and_plot_waves
+from airglow.OmegaK_enhanced    import circular_mean as _cmean, circular_std as _cstd
+from airglow.wave_clustering    import compute_adaptive_gabor_parameters
+from airglow.phase_speed_kalman import (
     analyze_all_waves_kalman,
     compute_binned_wave_stats,
     circular_diff_deg,
 )
-from wave_validation import (
+from airglow.wave_validation import (
     build_wave_families,
     families_to_xarray,
     plot_wave_family_timeseries,
 )
-from gabor_reconstruction import reconstruct_all_waves, build_waves_for_gabor
+from airglow.gabor_reconstruction import reconstruct_all_waves, build_waves_for_gabor
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -89,6 +89,7 @@ def _load_real_data(
     t_lo_min: float,
     t_hi_min: float,
     elevation_min: float,
+    filter_n_workers: int,
     verbose: bool,
 ) -> tuple[xr.Dataset, str, float]:
     """
@@ -133,7 +134,7 @@ def _load_real_data(
     dx_km : float
         Mean isotropic pixel spacing in km.
     """
-    import Karthik_Test_Mango_L2_1 as MANGO_L2
+    import airglow.Karthik_Test_Mango_L2_1 as MANGO_L2
     import airglow.prepare_agimages as prepare_agimages
 
     # ── Load HDF5 ─────────────────────────────────────────────────────────────
@@ -143,7 +144,7 @@ def _load_real_data(
     # ── FIR bandpass filter (operates on (north, east, time) layout) ──────────
     im3d = np.transpose(ds["ImageData"].values, (1, 2, 0))   # → (ny, nx, n_time)
     b    = prepare_agimages.initialize_airglow_filter(ntaps, t_lo_min, t_hi_min, times_pd)
-    im3d_filt = prepare_agimages.filter_airglow(im3d, b, ntaps)
+    im3d_filt = prepare_agimages.filter_airglow(im3d, b, ntaps, n_workers=filter_n_workers)
     ds["FilteredImageData"] = xr.DataArray(
         np.transpose(im3d_filt, (2, 0, 1)),                  # → (n_time, ny, nx)
         dims=("time", "north", "east"),
@@ -210,8 +211,8 @@ def _window_worker(args: dict) -> dict:
     import xarray as _xr
     import io as _io
     import contextlib as _ctx
-    from OmegaKFilter    import OmegaKFilterXarray as _OKF
-    from OmegaK_enhanced import analyze_and_plot_waves as _apw
+    from airglow.OmegaKFilter    import OmegaKFilterXarray as _OKF
+    from airglow.OmegaK_enhanced import analyze_and_plot_waves as _apw
 
     data_arr        = args["data_arr"]
     time_arr        = args["time_arr"]
@@ -221,6 +222,7 @@ def _window_worker(args: dict) -> dict:
     center_time     = args["center_time"]
     data_var        = args["data_var"]
     zp              = args["zero_pad_factor"]
+    szp             = args["spatial_zero_pad_factor"]
     filter_kwargs   = args["filter_kwargs"]
     analysis_kwargs = args["analysis_kwargs"]
     save_prefix     = args["save_prefix"]
@@ -234,7 +236,8 @@ def _window_worker(args: dict) -> dict:
     sink = _io.StringIO()
     ctx  = _ctx.redirect_stdout(sink) if not verbose else _ctx.nullcontext()
     with ctx:
-        ok   = _OKF(ds_w, data_var=data_var, zero_pad_factor=zp)
+        ok   = _OKF(ds_w, data_var=data_var, zero_pad_factor=zp,
+                    spatial_zero_pad_factor=szp)
         mask = ok.create_filter(**filter_kwargs)
         fig, wave_params, _, physical_waves = _apw(
             ok_filter=ok, filtered_ds=ds_w, filter_mask=mask,
@@ -674,6 +677,7 @@ def run_airglow_pipeline(
     win_len_min: float = 90.0,
     hop_min: float = 10.0,
     zero_pad_factor: int = 5,
+    spatial_zero_pad_factor: int = 2,
     # ── Omega-k filter ────────────────────────────────────────────────────────
     period_max_min: float = 60.0,
     lambda_h_min_km: float = 5.0,
@@ -722,6 +726,7 @@ def run_airglow_pipeline(
     make_animation: bool = True,
     # ── Execution ─────────────────────────────────────────────────────────────
     n_workers: int = 1,
+    filter_n_workers: int = 4,
     verbose: bool = False,
 ) -> dict:
     """
@@ -755,6 +760,12 @@ def run_airglow_pipeline(
         Advance between successive windows (minutes).  Default 10.
     zero_pad_factor : int
         Temporal zero-padding multiplier inside each window FFT.
+    spatial_zero_pad_factor : int
+        Spatial (kx/ky) zero-padding multiplier inside each window FFT.
+        Un-padded (1) leaves the kx/ky grid coarse enough that a wave's
+        detected wavelength can snap to the nearest bin rather than its true
+        value, and distinct nearby waves can be merged into one detection.
+        Default 2, matching the synthetic case studies' convention.
     period_max_min : float
         Omega-k filter upper period limit (minutes).
     lambda_h_min_km, lambda_h_max_km : float
@@ -832,6 +843,9 @@ def run_airglow_pipeline(
         Number of parallel worker processes.  Controls both the sliding-window
         loop and animation rendering.  Use ``1`` inside Jupyter to avoid
         multiprocessing deadlocks.
+    filter_n_workers : int
+        Number of worker processes for the FIR bandpass filter step.  Default
+        is 4.  Reduce on machines with few cores or when memory is limited.
     verbose : bool
         Print per-step diagnostics.  Default is silent.
 
@@ -876,7 +890,8 @@ def run_airglow_pipeline(
         hdf5_path=hdf5_path, site=site, date=date,
         moon_elevation_max=moon_elevation_max, ntaps=ntaps,
         t_lo_min=t_lo_min, t_hi_min=t_hi_min,
-        elevation_min=elevation_min, verbose=verbose,
+        elevation_min=elevation_min, filter_n_workers=filter_n_workers,
+        verbose=verbose,
     )
 
     time_vals = ds_full["time"].values          # (n_time,) datetime64
@@ -936,6 +951,7 @@ def run_airglow_pipeline(
             "center_time":     time_vals[c],
             "data_var":        data_var,
             "zero_pad_factor": zero_pad_factor,
+            "spatial_zero_pad_factor": spatial_zero_pad_factor,
             "filter_kwargs":   filter_kwargs,
             "analysis_kwargs": analysis_kwargs,
             "save_prefix":     str(windows_dir / f"window_{i:03d}"),
