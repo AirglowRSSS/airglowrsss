@@ -30,7 +30,7 @@ import numpy as np
 from scipy import signal
 
 # The existing Gabor implementation — imported, never reimplemented here.
-from cluster_reconstruction import create_gabor_kernel
+from airglow.cluster_reconstruction import create_gabor_kernel
 
 
 # ---------------------------------------------------------------------------

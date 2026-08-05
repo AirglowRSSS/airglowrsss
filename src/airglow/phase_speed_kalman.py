@@ -60,7 +60,7 @@ import numpy as np
 import pandas as pd
 import warnings
 
-from OmegaK_enhanced import circular_mean, circular_std
+from airglow.OmegaK_enhanced import circular_mean, circular_std
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
