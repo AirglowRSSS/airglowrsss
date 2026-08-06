@@ -22,15 +22,21 @@ steps (cross-validation, Kalman tracker) work unchanged.
 
 Public API
 ----------
-reconstruct_all_waves(data, waves, dx_km, Bf, Btheta, ...)
-    Unified dispatcher — use this in notebooks.
+reconstruct_all_waves(data, waves, dx_km, wavelength_resolution_km, Btheta, ...)
+    Unified dispatcher — use this in notebooks. Bf (the Gabor frequency
+    bandwidth) is derived per wave from wavelength_resolution_km and that
+    wave's own wavelength_km, not passed in directly — see
+    compute_bf_for_wavelength() in wave_clustering.py for why a single Bf
+    can't be correct across all wavelengths at once.
 """
 
 import numpy as np
 from scipy import signal
+from scipy.stats import pearsonr
 
 # The existing Gabor implementation — imported, never reimplemented here.
 from airglow.cluster_reconstruction import create_gabor_kernel
+from airglow.wave_clustering import compute_bf_for_wavelength
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +47,7 @@ def reconstruct_all_waves(
     data_filtered_temporal,
     waves,
     dx_km,
-    Bf=1.0,
+    wavelength_resolution_km,
     Btheta=np.pi / 4,
     n_stds=3.0,
     rms_calibrate=True,
@@ -69,11 +75,17 @@ def reconstruct_all_waves(
     dx_km : float
         Pixel spacing in km (east = north assumed).
 
-    Bf : float
-        Gabor frequency bandwidth (octaves).
+    wavelength_resolution_km : float
+        Target wavelength bandwidth (km) for each wave's Gabor kernel.  Bf is
+        computed per wave (fixed mode) / per kernel rebuild (adaptive mode)
+        from this wave's own wavelength_km via compute_bf_for_wavelength, so
+        the kernel's absolute km-wide selectivity matches this value at every
+        wave's own scale, instead of one Bf computed at a fixed reference
+        wavelength and reused everywhere (correct only near that reference).
 
     Btheta : float
-        Gabor angular bandwidth (radians).
+        Gabor angular bandwidth (radians).  Wavelength-independent, so this
+        stays a single value shared across all waves.
 
     n_stds : float
         Kernel half-width in sigma units.
@@ -106,12 +118,12 @@ def reconstruct_all_waves(
 
     if adaptive:
         return _reconstruct_adaptive(
-            data_filtered_temporal, waves, dx_km, Bf, Btheta, n_stds,
+            data_filtered_temporal, waves, dx_km, wavelength_resolution_km, Btheta, n_stds,
             rms_calibrate,
         )
     else:
         return _reconstruct_fixed(
-            data_filtered_temporal, waves, dx_km, Bf, Btheta, n_stds,
+            data_filtered_temporal, waves, dx_km, wavelength_resolution_km, Btheta, n_stds,
             rms_calibrate,
         )
 
@@ -124,7 +136,7 @@ def _reconstruct_fixed(
     data_filtered_temporal,
     waves,
     dx_km,
-    Bf,
+    wavelength_resolution_km,
     Btheta,
     n_stds,
     rms_calibrate,
@@ -139,11 +151,12 @@ def _reconstruct_fixed(
         orientation_deg = wave["orientation_deg"]
         wavelength_km   = wave["wavelength_km"]
         w_n_stds        = wave.get("n_stds", n_stds)
+        Bf              = compute_bf_for_wavelength(wavelength_resolution_km, wavelength_km)
 
         print(
             f"  [{wi+1}/{n_waves}] {label}: "
             f"lambda={wavelength_km:.1f} km, orient={orientation_deg:.1f} deg, "
-            f"n_stds={w_n_stds}  [fixed kernel]"
+            f"Bf={Bf:.3f} octaves, n_stds={w_n_stds}  [fixed kernel]"
         )
 
         kernel = create_gabor_kernel(
@@ -197,7 +210,7 @@ def _reconstruct_adaptive(
     data_filtered_temporal,
     waves,
     dx_km,
-    Bf,
+    wavelength_resolution_km,
     Btheta,
     n_stds,
     rms_calibrate,
@@ -276,6 +289,7 @@ def _reconstruct_adaptive(
                 or abs(od - _cache_orient) > _ORIENT_TOL
                 or abs(wl - _cache_wl)     > _WL_TOL
             ):
+                Bf = compute_bf_for_wavelength(wavelength_resolution_km, wl)
                 _cache_kernel = create_gabor_kernel(
                     wavelength_km=wl,
                     orientation_deg=od,
@@ -365,6 +379,80 @@ def _build_composite(data_filtered_temporal, wave_cubes, rms_calibrate):
         else:
             print("  WARNING: recon_rms is zero or non-finite — calibration skipped")
     return composite
+
+
+def check_duplicate_waves(wave_cubes, waves, threshold=0.5):
+    """
+    Flag pairs of reconstructed waves that are suspiciously similar to each
+    other, suggesting they may be the same physical wave split into two
+    families by detection noise rather than genuinely distinct waves.
+
+    Family grouping (build_wave_families) and the Gabor kernel bandwidth
+    both reduce this risk, but neither guarantees it away -- two families
+    can still survive as separate detections while their Gabor
+    reconstructions end up highly correlated with each other. For a
+    climatology this matters directly: counting the same physical wave as
+    two separate detections inflates occurrence statistics even if both
+    detections' wavelength/direction would land in the same output bin.
+
+    This checks the reconstructions directly against each other (not
+    against the independent omega-k reference used in Section 8's
+    cross-validation) -- a direct, cheap test purpose-built for this
+    specific failure mode.
+
+    Parameters
+    ----------
+    wave_cubes : list of np.ndarray, each (n_time, ny, nx)
+        Output of reconstruct_all_waves().
+    waves : list of dict
+        The corresponding wave dicts (for labeling in the printed report).
+    threshold : float
+        Mean frame-by-frame Pearson r at or above which a pair is flagged.
+
+    Returns
+    -------
+    flagged : list of (i, j, mean_r) tuples, i < j, for pairs at or above
+        threshold.
+    corr_matrix : np.ndarray, shape (n_waves, n_waves)
+        Symmetric matrix of mean frame-by-frame Pearson r between every
+        pair (diagonal is 1.0). Frames where either cube is all-zero
+        (unowned/inactive, see build_waves_for_gabor) are skipped rather
+        than counted as trivially agreeing.
+    """
+    n = len(wave_cubes)
+    corr_matrix = np.eye(n)
+    flagged = []
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            cube_i, cube_j = wave_cubes[i], wave_cubes[j]
+            n_time = cube_i.shape[0]
+            frame_rs = []
+            for t in range(n_time):
+                a, b = cube_i[t].ravel(), cube_j[t].ravel()
+                if not (np.any(a) and np.any(b)):
+                    continue
+                m = np.isfinite(a) & np.isfinite(b)
+                if m.sum() > 1:
+                    r, _ = pearsonr(a[m], b[m])
+                    if np.isfinite(r):
+                        frame_rs.append(r)
+            mean_r = float(np.mean(frame_rs)) if frame_rs else 0.0
+            corr_matrix[i, j] = corr_matrix[j, i] = mean_r
+            if mean_r >= threshold:
+                flagged.append((i, j, mean_r))
+
+    if flagged:
+        print(f"WARNING: {len(flagged)} wave pair(s) show high mutual correlation "
+              f"(>= {threshold:.2f}) between their Gabor reconstructions -- possibly "
+              f"the same physical wave split into two families rather than genuinely "
+              f"distinct waves:")
+        for i, j, r in flagged:
+            print(f"  {waves[i]['label']}  <->  {waves[j]['label']}   mean r = {r:.3f}")
+    else:
+        print(f"No wave pairs exceeded the duplicate-correlation threshold ({threshold:.2f}).")
+
+    return flagged, corr_matrix
 
 
 # ---------------------------------------------------------------------------

@@ -535,6 +535,8 @@ def _kalman_kh_tracker(
     k_h_min: float,
     k_h_max: float,
     innovation_valid: np.ndarray = None,
+    kernel_wavelength_series_km: np.ndarray = None,
+    wavelength_mismatch_frac: float = 0.20,
 ) -> dict:
     """
     Track horizontal wavenumber magnitude with a 2-state Kalman filter.
@@ -576,6 +578,19 @@ def _kalman_kh_tracker(
     innovation_valid : ndarray bool, shape (n_time,), optional
         Validity mask from the omega filter.  Frames flagged invalid there
         coast on the prediction here (same gating as the theta tracker).
+    kernel_wavelength_series_km : ndarray float, shape (n_time,), optional
+        Per-frame Gabor kernel centre wavelength in **km**.  Supplied in
+        adaptive Gabor mode from ``wave['wavelength_km_series']``.  When
+        present, ``wavelength_kernel_mismatch`` is computed frame-by-frame
+        against this series (mirrors ``kernel_center_series_deg`` in
+        ``_kalman_theta_tracker``).  NaN entries (frames with no active
+        kernel) are treated as no-mismatch.  When absent, falls back to a
+        fixed comparison against the wavelength implied by ``k_h_init``.
+    wavelength_mismatch_frac : float
+        Fractional wavelength deviation from the kernel centre wavelength
+        above which a frame is flagged.  Default 0.20 (20%), matching
+        ``kf_r_kh_frac``'s default measurement-noise fraction so the two
+        stay consistent unless deliberately decoupled by the caller.
 
     Returns
     -------
@@ -585,6 +600,15 @@ def _kalman_kh_tracker(
         ndarray (n_time,) — posterior k_h estimate (rad/m).
     ``kh_std``
         ndarray (n_time,) — 1-sigma uncertainty sqrt(P[0,0]) (rad/m).
+    ``wavelength_kernel_mismatch``
+        ndarray bool (n_time,) — True when the estimated wavelength
+        deviates by more than ``wavelength_mismatch_frac`` from the Gabor
+        kernel's own centre wavelength at that frame. Mirrors
+        ``kernel_mismatch`` in ``_kalman_theta_tracker``, but on the
+        wavelength axis rather than orientation -- catches, for example,
+        two same-direction waves at different wavelengths contaminating
+        each other's reconstruction, which orientation-only
+        ``kernel_mismatch`` would not detect.
     """
     n = len(kh_obs)
 
@@ -596,6 +620,7 @@ def _kalman_kh_tracker(
         return dict(
             kh_est=np.full(n, k_h_init),
             kh_std=np.full(n, np.nan),
+            wavelength_kernel_mismatch=np.zeros(n, dtype=bool),
         )
 
     # --- State transition: constant-velocity kinematic model ---
@@ -620,8 +645,13 @@ def _kalman_kh_tracker(
     # --- Output arrays ---
     kh_est_out = np.full(n, np.nan)
     kh_std_out = np.full(n, np.nan)
+    wavelength_mm = np.zeros(n, dtype=bool)
     I2 = np.eye(2)
     snr_min = 0.05  # same floor as omega/theta trackers
+
+    # Fixed-mode fallback: wavelength implied by k_h_init, used when no
+    # per-frame kernel_wavelength_series_km is supplied.
+    kernel_lambda_init_km = (2.0 * np.pi / k_h_init) / 1000.0 if k_h_init > 0 else np.nan
 
     for t in range(n):
         # Predict
@@ -657,10 +687,38 @@ def _kalman_kh_tracker(
         kh_est_out[t] = x[0]
         kh_std_out[t] = np.sqrt(max(P[0, 0], 0.0))
 
+        # Wavelength kernel-mismatch flag ————————————————————————————————
+        # Mirrors _kalman_theta_tracker's kernel_mismatch, but on the
+        # wavelength axis: flags frames where the estimated wavelength has
+        # drifted from the kernel's own centre wavelength by more than
+        # wavelength_mismatch_frac -- including drift caused by a different,
+        # same-direction wave's power contaminating this one's passband,
+        # which orientation-only kernel_mismatch cannot see.
+        est_lambda_km = (2.0 * np.pi / x[0]) / 1000.0 if x[0] > 0 else np.nan
+        if kernel_wavelength_series_km is not None:
+            kc_km = kernel_wavelength_series_km[t]
+            if np.isfinite(kc_km) and kc_km > 0 and np.isfinite(est_lambda_km):
+                wavelength_mm[t] = (abs(est_lambda_km - kc_km) / kc_km) > wavelength_mismatch_frac
+            else:
+                wavelength_mm[t] = False   # NaN frame (no active kernel) -- not a mismatch
+        elif np.isfinite(kernel_lambda_init_km) and kernel_lambda_init_km > 0 and np.isfinite(est_lambda_km):
+            wavelength_mm[t] = (abs(est_lambda_km - kernel_lambda_init_km)
+                                 / kernel_lambda_init_km) > wavelength_mismatch_frac
+
     # Final guard: any residual non-positive values (should never happen)
     kh_est_out = np.where(kh_est_out > 0, kh_est_out, k_h_init)
 
-    return dict(kh_est=kh_est_out, kh_std=kh_std_out)
+    # Warn once per run if mismatch fraction > 30% (matches theta tracker)
+    mismatch_frac = np.sum(wavelength_mm) / n if n > 0 else 0.0
+    if mismatch_frac > 0.30:
+        warnings.warn(
+            f'Wavenumber KF: {100 * mismatch_frac:.0f}% frames flagged as '
+            f'wavelength_kernel_mismatch (estimate > {100*wavelength_mismatch_frac:.0f}% '
+            f'from kernel centre wavelength).',
+            stacklevel=2,
+        )
+
+    return dict(kh_est=kh_est_out, kh_std=kh_std_out, wavelength_kernel_mismatch=wavelength_mm)
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +954,12 @@ def analyze_all_waves_kalman(
     ``kf_lambda_std_km``
         1-sigma wavelength uncertainty (km), propagated from sqrt(P[0,0])
         via d(lambda)/d(k_h) = -2π/k_h².
+    ``wavelength_kernel_mismatch``
+        True when ``kf_lambda_km`` deviates by more than ``kf_r_kh_frac``
+        (fractionally) from the Gabor kernel's own centre wavelength.
+        Mirrors ``kernel_mismatch`` but on the wavelength axis -- catches
+        contamination from a different, same-direction wave sharing this
+        one's passband, which orientation-only ``kernel_mismatch`` misses.
     """
     n_waves = len(waves_detected)
     n_time  = len(time_vals)
@@ -1045,6 +1109,12 @@ def analyze_all_waves_kalman(
         # Use the omega-filter validity mask (same as theta tracker)
         innov_valid_w = kf_all[wi]['innov_valid']
 
+        # Per-frame kernel centre wavelength (adaptive Gabor mode), mirrors
+        # _ks_deg above for the theta tracker.
+        _wl_series = wave.get('wavelength_km_series', None)
+        _kwl_km = (np.asarray(_wl_series, dtype=float)
+                   if _wl_series is not None else None)
+
         kh_out = _kalman_kh_tracker(
             kh_obs=kh_obs_w,
             amp_obs=amp_obs,
@@ -1056,6 +1126,8 @@ def analyze_all_waves_kalman(
             k_h_min=k_h_min,
             k_h_max=k_h_max,
             innovation_valid=innov_valid_w,
+            kernel_wavelength_series_km=_kwl_km,
+            wavelength_mismatch_frac=kf_r_kh_frac,
         )
         kf_kh_all.append(kh_out)
 
@@ -1149,6 +1221,7 @@ def analyze_all_waves_kalman(
                 'kf_lambda_std_km':       _kh_std_to_lambda_std_km(
                                               kh_kf['kh_est'][t],
                                               kh_kf['kh_std'][t]),
+                'wavelength_kernel_mismatch': bool(kh_kf['wavelength_kernel_mismatch'][t]),
             })
 
     df = pd.DataFrame(rows)

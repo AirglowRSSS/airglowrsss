@@ -69,7 +69,11 @@ from airglow.wave_validation import (
     families_to_xarray,
     plot_wave_family_timeseries,
 )
-from airglow.gabor_reconstruction import reconstruct_all_waves, build_waves_for_gabor
+from airglow.gabor_reconstruction import (
+    reconstruct_all_waves,
+    build_waves_for_gabor,
+    check_duplicate_waves,
+)
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -359,10 +363,34 @@ def _plot_kf_timeseries(
         3 — KF phase speed
         4 — KF wavelength
     Inactive regions (wave_active == False) shaded in whitesmoke.
+
+    Every row shares one y-axis range across all wave columns, so columns
+    are directly comparable:
+        0 — [min, max] of ``amplitude`` across every wave (see caveat below)
+        1 — [0, 1]                (activity fraction is a ratio by construction)
+        2 — [0, 360] deg          (full-circle orientation)
+        3 — [0, SPEED_YLIM_MAX] m/s
+        4 — [0, WAVELENGTH_YLIM_MAX] km
+
+    Caveat on row 0: raw cross-correlation amplitude |A(t)| is not
+    normalized between waves and can span 2+ orders of magnitude (a strong,
+    persistent wave vs. a weak, marginal one) -- sharing one *linear* y-axis
+    across all columns can make weaker waves look like a flat line near
+    zero. If that happens in practice, consider a log-scale row 0
+    (``ax.set_yscale('log')``) instead of a shared linear range.
     """
     CLR_KF  = "#27ae60"
     CLR_RAW = "#95a5a6"
     CLR_REF = "#7f8c8d"
+
+    # Row 3/4 shared ranges -- generous but not arbitrary: observed KF speeds
+    # in this dataset run up to ~mean+3sigma (e.g. 66+/-23 m/s), and observed
+    # wavelengths top out near the longest detected family (~116 km) with
+    # some headroom; the hard physical ceiling is lambda_h_max_km (150 km
+    # default) since the wavenumber KF clamps to it during low-SNR coasting.
+    # Tune here if your dataset's waves run faster/longer than this one's.
+    SPEED_YLIM_MAX      = 150.0   # m/s
+    WAVELENGTH_YLIM_MAX = 120.0   # km
 
     n_waves = len(waves_detected)
     if n_waves == 0 or len(kf_results) == 0:
@@ -370,6 +398,10 @@ def _plot_kf_timeseries(
 
     fig, axes = plt.subplots(5, n_waves, figsize=(6 * n_waves, 20), squeeze=False)
     colors    = plt.cm.tab10(np.linspace(0, 1, max(n_waves, 1)))
+
+    _amp_all = kf_results["amplitude"].to_numpy(dtype=float)
+    _amp_all = _amp_all[np.isfinite(_amp_all)]
+    amp_ylim = (float(_amp_all.min()), float(_amp_all.max())) if len(_amp_all) else (0.0, 1.0)
 
     def _shade_inactive(ax, active, t_arr):
         """Shade whitesmoke where wave_active is False."""
@@ -410,6 +442,7 @@ def _plot_kf_timeseries(
         _shade_inactive(ax, active, t_arr)
         ax.set_title(col_title, fontsize=8, fontweight="bold")
         ax.set_ylabel("|A(t)| amplitude")
+        ax.set_ylim(*amp_ylim)
         ax.grid(True, alpha=0.3)
 
         # ── Row 1: activity fraction ──────────────────────────────────────
@@ -436,6 +469,7 @@ def _plot_kf_timeseries(
         )
         _shade_inactive(ax, active, t_arr)
         ax.set_ylabel("KF Orientation (deg)")
+        ax.set_ylim(0, 360)
         ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
         # ── Row 3: phase speed ────────────────────────────────────────────
@@ -452,6 +486,7 @@ def _plot_kf_timeseries(
         )
         _shade_inactive(ax, active, t_arr)
         ax.set_ylabel("Phase Speed (m/s)")
+        ax.set_ylim(0, SPEED_YLIM_MAX)
         ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
         # ── Row 4: wavelength ─────────────────────────────────────────────
@@ -468,6 +503,7 @@ def _plot_kf_timeseries(
         )
         _shade_inactive(ax, active, t_arr)
         ax.set_ylabel("Wavelength (km)")
+        ax.set_ylim(0, WAVELENGTH_YLIM_MAX)
         ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
         for row in range(5):
@@ -691,13 +727,13 @@ def run_airglow_pipeline(
     peak_min_distance: int = 7,
     min_power_ratio: float = 0.10,
     # ── Wave family grouping ──────────────────────────────────────────────────
-    dir_tol_deg: float = 15.0,
+    dir_tol_deg: float = 22.5,
     lambda_tol_km: float = 20.0,
     min_detections: int = 2,
     # ── Gabor reconstruction ──────────────────────────────────────────────────
     gabor_n_stds: float = 3.0,
     wavelength_resolution_km: float = 20.0,
-    orientation_resolution_deg: float = 15.0,
+    orientation_resolution_deg: float = 22.5,
     rms_calibrate: bool = True,
     # ── Kalman: phase-speed (omega) filter ───────────────────────────────────
     kf_q_omega: float = 1e-8,
@@ -786,7 +822,12 @@ def run_airglow_pipeline(
     min_power_ratio : float
         Minimum power ratio for secondary detections relative to the dominant.
     dir_tol_deg : float
-        Direction spread tolerance within a wave family (degrees).
+        Direction spread tolerance within a wave family (degrees), and (via
+        orientation_resolution_deg, kept equal to this) the Gabor kernel's
+        angular bandwidth. Default 22.5 deg -- half of a 45 deg (8-point
+        compass) climatology orientation bin, chosen so waves that would
+        land in the same climatology bin get merged into one family instead
+        of surviving as separate, mutually-contaminating detections.
     lambda_tol_km : float
         Wavelength spread tolerance within a wave family (km).
     min_detections : int
@@ -1013,10 +1054,14 @@ def run_airglow_pipeline(
     # ── Step 4: Gabor parameters & per-frame interpolation ────────────────────
     _vprint("[4/9] Gabor parameters & per-frame interpolation ...")
     with _maybe_quiet(verbose):
-        gabor_bf, gabor_btheta_full = compute_adaptive_gabor_parameters(
+        # wavelength_km here is only for the diagnostic printout below (the
+        # dominant family, by detection count) -- the actual Bf used for each
+        # wave's kernel is computed per-wave inside reconstruct_all_waves from
+        # wavelength_resolution_km directly, not from this call's return value.
+        _gabor_bf_repr, gabor_btheta_full = compute_adaptive_gabor_parameters(
             wavelength_resolution_km   = wavelength_resolution_km,
             orientation_resolution_deg = orientation_resolution_deg,
-            resolution_km_per_pixel    = dx_km,
+            wavelength_km              = families[0]["wavelength_center"],
             verbose=verbose,
         )
     gabor_btheta   = gabor_btheta_full / 2.0
@@ -1042,15 +1087,24 @@ def run_airglow_pipeline(
     with _maybe_quiet(verbose):
         wave_cubes, composite, complex_amplitudes, kx_obs_arrays, ky_obs_arrays = \
             reconstruct_all_waves(
-                data_filtered_temporal = data_arr_full,
-                waves                  = waves_detected,
-                dx_km                  = dx_km,
-                Bf                     = gabor_bf,
-                Btheta                 = gabor_btheta,
-                n_stds                 = gabor_n_stds,
-                rms_calibrate          = rms_calibrate,
+                data_filtered_temporal   = data_arr_full,
+                waves                    = waves_detected,
+                dx_km                    = dx_km,
+                wavelength_resolution_km = wavelength_resolution_km,
+                Btheta                   = gabor_btheta,
+                n_stds                   = gabor_n_stds,
+                rms_calibrate            = rms_calibrate,
             )
     _vprint(f"  wave_cubes: {len(wave_cubes)} × {wave_cubes[0].shape}")
+
+    with _maybe_quiet(verbose):
+        flagged_duplicate_waves, wave_correlation_matrix = check_duplicate_waves(
+            wave_cubes, waves_detected,
+        )
+    if flagged_duplicate_waves:
+        _vprint(f"  {len(flagged_duplicate_waves)} possibly-duplicate wave pair(s) "
+                f"flagged -- see verbose output or wave_correlation_matrix in the "
+                f"returned results.")
 
     # ── Step 6: Omega-k full-dataset reference ────────────────────────────────
     _vprint("[6/9] Omega-k full-dataset filter (cross-validation reference) ...")
@@ -1285,13 +1339,13 @@ def run_airglow_pipeline(
 
     with _maybe_quiet(verbose):
         wave_cubes_kf, composite_kf, _, _, _ = reconstruct_all_waves(
-            data_filtered_temporal = data_arr_full,
-            waves                  = waves_kf,
-            dx_km                  = dx_km,
-            Bf                     = gabor_bf,
-            Btheta                 = gabor_btheta,
-            n_stds                 = gabor_n_stds,
-            rms_calibrate          = rms_calibrate,
+            data_filtered_temporal   = data_arr_full,
+            waves                    = waves_kf,
+            dx_km                    = dx_km,
+            wavelength_resolution_km = wavelength_resolution_km,
+            Btheta                   = gabor_btheta,
+            n_stds                   = gabor_n_stds,
+            rms_calibrate            = rms_calibrate,
         )
     _vprint("  Second-pass reconstruction complete.")
 
@@ -1393,6 +1447,8 @@ def run_airglow_pipeline(
         "waves_detected":     waves_detected,
         "wave_cubes":         wave_cubes,         # first-pass (independent cross-val)
         "composite":          composite,
+        "wave_correlation_matrix":  wave_correlation_matrix,
+        "flagged_duplicate_waves": flagged_duplicate_waves,  # (i, j, mean_r) pairs
         "wave_cubes_kf":      wave_cubes_kf,      # KF-refined second pass
         "composite_kf":       composite_kf,
         "complex_amplitudes": complex_amplitudes,
