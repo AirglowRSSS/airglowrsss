@@ -62,6 +62,7 @@ from airglow.wave_clustering    import compute_adaptive_gabor_parameters
 from airglow.phase_speed_kalman import (
     analyze_all_waves_kalman,
     compute_binned_wave_stats,
+    flag_kf_wave_collisions_by_correlation,
     circular_diff_deg,
 )
 from airglow.wave_validation import (
@@ -298,6 +299,9 @@ def _frame_worker(t: int) -> None:
     kf_lam     = d.get("kf_lam_series",   None)
     kf_spd     = d.get("kf_spd_series",   None)
     kf_valid   = d.get("kf_valid_series", None)
+    kf_sup     = d.get("kf_suppressed_series", None)
+    kf_sup_into = d.get("kf_suppressed_into_series", None)
+    wave_labels = d.get("wave_labels", None)
 
     for idx, (cube, base_title) in enumerate(panels):
         r, c = divmod(idx, n_cols)
@@ -315,12 +319,20 @@ def _frame_worker(t: int) -> None:
             lam   = float(kf_lam[wi][t])
             spd   = abs(float(kf_spd[wi][t]))
             valid = bool(kf_valid[wi][t])
+            sup   = bool(kf_sup[wi][t]) if kf_sup is not None else False
+            into_lbl = None
+            if sup and kf_sup_into is not None and wave_labels is not None:
+                into_id = int(kf_sup_into[wi][t])
+                if 0 <= into_id < len(wave_labels):
+                    into_lbl = " ".join(wave_labels[into_id].split()[:2])  # e.g. "Family 2"
             if _np.isnan(az) or _np.isnan(lam) or _np.isnan(spd):
                 line2 = f"az={'---':>5s}°  \u03bb={'---':>5s} km  c={'---':>5s} m/s  "
             else:
-                flag  = "  " if valid else " *"
+                flag  = " XX" if sup else ("  " if valid else " *")
                 line2 = f"az={az:5.1f}°  \u03bb={lam:5.1f} km  c={spd:5.1f} m/s{flag}"
-            title = f"Wave {wi + 1}\n{line2}"
+            wave_title = f"Wave {wi + 1} (-> {into_lbl})" if into_lbl else (
+                f"Wave {wi + 1} (suppressed)" if sup else f"Wave {wi + 1}")
+            title = f"{wave_title}\n{line2}"
         else:
             title = base_title
 
@@ -598,6 +610,102 @@ def _plot_ownership(
         print(f"  Saved: {out_path}")
 
 
+def _plot_kf_collisions(
+    kf_results: pd.DataFrame,
+    waves_detected: list,
+    out_path: str,
+    verbose: bool,
+) -> None:
+    """
+    Gantt-style plot showing KF collision episodes per wave (see
+    flag_kf_wave_collisions). One row per wave; amber = in a collision
+    episode and judged the primary/kept wave, red = in a collision episode
+    and judged the likely-contaminated one for that episode.
+    """
+    from matplotlib.patches import Patch
+
+    n_waves = len(waves_detected)
+    if n_waves == 0 or len(kf_results) == 0 or "collision_id" not in kf_results.columns:
+        return
+
+    time_vals = pd.to_datetime(sorted(kf_results["time"].unique()))
+    n_frames = len(time_vals)
+    if n_frames == 0:
+        return
+    t_f64 = time_vals.values.astype("datetime64[ns]").astype(np.float64)
+    t_range = t_f64.max() - t_f64.min() if t_f64.max() != t_f64.min() else 1.0
+
+    CLR_PRIMARY = "#f0a500"
+    CLR_LOSER   = "#d62728"
+    color_map   = {"primary": CLR_PRIMARY, "loser": CLR_LOSER}
+
+    fig, axes = plt.subplots(n_waves, 1, figsize=(13, 1.2 * n_waves), sharex=True, squeeze=False)
+    axes = axes[:, 0]
+
+    def _draw_state(ax, state_arr):
+        ax.barh(0, 1.0, left=0, height=0.7, color="whitesmoke", edgecolor="lightgray", lw=0.5)
+        rs, cur, in_run = 0, None, False
+        for i, s in enumerate(state_arr):
+            if s != cur:
+                if in_run and cur in color_map:
+                    left  = (t_f64[rs] - t_f64[0]) / t_range
+                    width = (t_f64[i - 1] - t_f64[rs]) / t_range
+                    ax.barh(0, width, left=left, height=0.7,
+                            color=color_map[cur], alpha=0.85, edgecolor="none")
+                rs, cur, in_run = i, s, True
+        if in_run and cur in color_map:
+            left  = (t_f64[rs] - t_f64[0]) / t_range
+            width = (t_f64[-1] - t_f64[rs]) / t_range
+            ax.barh(0, width, left=left, height=0.7,
+                    color=color_map[cur], alpha=0.85, edgecolor="none")
+
+    any_collision = False
+    for wi, wave in enumerate(waves_detected):
+        wdf = kf_results[kf_results["wave_id"] == wi].copy()
+        wdf["time"] = pd.to_datetime(wdf["time"])
+        wdf = wdf.set_index("time").reindex(time_vals)
+
+        state = []
+        for _, row in wdf.iterrows():
+            cid = row.get("collision_id", -1)
+            if pd.isna(cid) or cid < 0:
+                state.append(None)
+            elif bool(row.get("collision_primary", True)):
+                state.append("primary")
+            else:
+                state.append("loser")
+                any_collision = True
+
+        ax = axes[wi]
+        _draw_state(ax, state)
+        ax.set_yticks([])
+        ax.set_xlim(0, 1)
+        n_coll = sum(1 for s in state if s is not None)
+        ax.set_ylabel(f"W{wi + 1}\n({n_coll} fr.)", fontsize=7, rotation=0, labelpad=42, va="center")
+        ax.text(0.005, 0, wave["label"][:38], fontsize=7, va="center")
+
+    n_ticks  = min(8, n_frames)
+    tick_pos = np.linspace(0, 1, n_ticks)
+    tick_idx = (tick_pos * (n_frames - 1)).astype(int).clip(0, n_frames - 1)
+    axes[-1].set_xticks(tick_pos)
+    axes[-1].set_xticklabels(
+        [str(time_vals[i])[:16] for i in tick_idx], rotation=30, fontsize=7,
+    )
+
+    fig.legend(
+        handles=[Patch(color=CLR_PRIMARY, label="in collision, kept (primary)"),
+                 Patch(color=CLR_LOSER,   label="in collision, likely contaminated")],
+        loc="upper right", fontsize=8, ncol=2,
+    )
+    fig.suptitle("KF Collision Episodes by Wave", fontsize=12)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    if verbose:
+        note = "" if any_collision else "  (no collisions detected)"
+        print(f"  Saved: {out_path}{note}")
+
+
 def _write_kf_table(
     kf_results: pd.DataFrame,
     waves_detected: list,
@@ -756,6 +864,8 @@ def run_airglow_pipeline(
     activity_threshold: float = 0.10,
     bin_width_min: int = 60,
     min_valid_frames: int = 5,
+    # ── KF collision check (second-pass reconstruction) ───────────────────────
+    kf_collision_corr_threshold: float = 0.7,
     # ── Animation ─────────────────────────────────────────────────────────────
     frame_dpi: int = 72,
     movie_fps: int = 5,
@@ -874,6 +984,13 @@ def run_airglow_pipeline(
         Bin width for nightly KF statistics (minutes).
     min_valid_frames : int
         Minimum valid frames per bin for statistics to be reported.
+    kf_collision_corr_threshold : float
+        Smoothed per-frame Pearson r, between two waves' second-pass Gabor
+        reconstructions, at or above which they're judged to be
+        reconstructing the same physical structure (see
+        flag_kf_wave_collisions_by_correlation). Default 0.7 -- calibrated
+        empirically on real data, not check_duplicate_waves's 0.5 (see
+        that function's docstring for why).
     frame_dpi : int
         DPI for animation frames (72 = fast preview, 150 = publication).
     movie_fps : int
@@ -903,8 +1020,16 @@ def run_airglow_pipeline(
         ``composite``           — (n_time, ny, nx) Gabor composite
         ``complex_amplitudes``  — list of per-wave complex amplitude arrays
         ``data_omegak``         — (n_time, ny, nx) omega-k filtered reference
-        ``kf_results``          — pd.DataFrame of frame-by-frame KF output
-        ``kf_binned``           — pd.DataFrame of time-binned statistics
+        ``kf_results``          — pd.DataFrame of frame-by-frame KF output,
+                                   with collision_id/collision_group_wave_ids/
+                                   collision_primary/collision_primary_wave_id
+                                   columns from flag_kf_wave_collisions_by_
+                                   correlation (also written to
+                                   output_paths['kf_results_csv'])
+        ``kf_binned``           — pd.DataFrame of time-binned statistics,
+                                   computed AFTER dedup (collision_primary ==
+                                   False frames excluded, so a wave judged a
+                                   duplicate of another isn't double-counted)
         ``correlation_stats``   — dict with per-wave and composite Pearson r
         ``output_paths``        — dict mapping label → file path for all outputs
     """
@@ -1031,6 +1156,36 @@ def run_airglow_pipeline(
             min_detections = min_detections,
         )
     _vprint(f"  {len(families)} family/families retained.")
+
+    if len(families) == 0:
+        # No waves detected this night (clouds, moon, quiet geomagnetic
+        # conditions, equipment gap, etc.) -- a real, expected outcome across
+        # a multi-year batch, not an error. Everything downstream assumes at
+        # least one family (families_to_xarray raises ValueError on an empty
+        # list, families[0] is accessed directly for Gabor setup), so bail
+        # out here with a well-formed result instead of crashing the whole
+        # night's run. Same key set as the full return below; wave-dependent
+        # fields are empty/None and output_paths only has what Steps 1-2
+        # already produced.
+        _vprint("  No wave families detected -- skipping Steps 4-9 for this night.")
+        return {
+            "ds_full":            ds_full,
+            "window_results":     window_results,
+            "families":           families,
+            "waves_detected":     [],
+            "wave_cubes":         [],
+            "composite":          None,
+            "wave_correlation_matrix":  None,
+            "flagged_duplicate_waves": [],
+            "wave_cubes_kf":      [],
+            "composite_kf":       None,
+            "complex_amplitudes": [],
+            "data_omegak":        None,
+            "kf_results":         pd.DataFrame(),
+            "kf_binned":          pd.DataFrame(),
+            "correlation_stats":  None,
+            "output_paths":       output_paths,
+        }
 
     with _maybe_quiet(verbose):
         fig_ts = plot_wave_family_timeseries(
@@ -1268,18 +1423,6 @@ def run_airglow_pipeline(
             lambda_h_max_km    = lambda_h_max_km,
         )
 
-    with _maybe_quiet(verbose):
-        kf_binned = compute_binned_wave_stats(
-            kf_results,
-            bin_width_min    = bin_width_min,
-            min_valid_frames = min_valid_frames,
-        )
-
-    if len(kf_binned) > 0:
-        _kfb_path = str(results_dir / f"{stem}_kf_binned.csv")
-        kf_binned.to_csv(_kfb_path, index=False, float_format="%.4f")
-        output_paths["kf_binned_csv"] = _kfb_path
-
     _kf_ts_path = str(results_dir / f"{stem}_kf_timeseries.png")
     _plot_kf_timeseries(kf_results, waves_detected, time_kf, _kf_ts_path, verbose)
     output_paths["kf_timeseries"] = _kf_ts_path
@@ -1349,6 +1492,93 @@ def run_airglow_pipeline(
         )
     _vprint("  Second-pass reconstruction complete.")
 
+    # ── Step 8b-collision-check: cross-correlate the second-pass reconstructions ─
+    # Must run here, not before Step 8b, since it needs wave_cubes_kf to exist.
+    # See flag_kf_wave_collisions_by_correlation's docstring for why this
+    # replaced the earlier orientation/wavelength-tolerance check.
+    with _maybe_quiet(verbose):
+        kf_results = flag_kf_wave_collisions_by_correlation(
+            kf_results, waves_detected, waves_kf, wave_cubes_kf, time_vals,
+            corr_threshold = kf_collision_corr_threshold,
+            dir_tol_deg    = dir_tol_deg,
+            lambda_tol_km  = lambda_tol_km,
+            verbose        = verbose,
+        )
+    _kf_coll_path = str(results_dir / f"{stem}_kf_collisions.png")
+    _plot_kf_collisions(kf_results, waves_detected, _kf_coll_path, verbose)
+    output_paths["kf_collisions"] = _kf_coll_path
+
+    # ── Per-frame KF results, with collision annotations, to disk ─────────────
+    # The only persisted record of which (wave, frame) rows were judged
+    # duplicates -- everything else from the collision check (the Gantt plot,
+    # the composite_kf suppression below) is either a picture or an in-memory
+    # effect. Written here, after flag_kf_wave_collisions_by_correlation, so
+    # collision_id/collision_group_wave_ids/collision_primary/
+    # collision_primary_wave_id are already populated.
+    _kf_results_path = str(results_dir / f"{stem}_kf_results.csv")
+    kf_results.to_csv(_kf_results_path, index=False, float_format="%.4f")
+    output_paths["kf_results_csv"] = _kf_results_path
+
+    # ── Binned wave statistics, computed AFTER dedup ───────────────────────────
+    # Must run here (not right after analyze_all_waves_kalman, where it used to
+    # run) so a wave's suppressed (collision_primary == False) frames are
+    # excluded from the climatology -- otherwise a duplicate detection that
+    # merged into another wave here would still get counted in kf_binned_csv
+    # as if it were a distinct, real wave.
+    with _maybe_quiet(verbose):
+        kf_binned = compute_binned_wave_stats(
+            kf_results[kf_results["collision_primary"]],
+            bin_width_min    = bin_width_min,
+            min_valid_frames = min_valid_frames,
+        )
+
+    if len(kf_binned) > 0:
+        _kfb_path = str(results_dir / f"{stem}_kf_binned.csv")
+        kf_binned.to_csv(_kfb_path, index=False, float_format="%.4f")
+        output_paths["kf_binned_csv"] = _kfb_path
+
+    # ── Step 8b-collision-suppress: drop the losing wave from composite_kf ────
+    # flag_kf_wave_collisions_by_correlation just judged, per episode, which
+    # wave is the "real" one. Zero the loser's contribution for exactly the
+    # frames it lost, so the two waves' Gabor kernels stop double-counting
+    # the same physical wave in composite_kf/wave_cubes_kf -- otherwise the
+    # collision flag stays purely informational and the duplicate still
+    # shows up in the reconstruction, movie, and per-wave amplitude stats.
+    #
+    # Deliberately NOT re-running RMS calibration afterward: _build_composite's
+    # scale factor is one global scalar for the whole night, so recalibrating
+    # post-suppression would inflate every OTHER wave's amplitude too (they'd
+    # get rescaled up to compensate for the energy this removed), contaminating
+    # waves that were never part of any collision. The single calibration pass
+    # above -- against the full, uncollapsed decomposition -- is the physically
+    # motivated one; composite_kf's RMS is allowed to legitimately dip below
+    # the input RMS during collision episodes, since real (if duplicated)
+    # energy was removed.
+    _kf_suppressed_series = [np.zeros(n_time, dtype=bool) for _ in waves_detected]
+    _kf_suppressed_into_series = [np.full(n_time, -1, dtype=int) for _ in waves_detected]
+    for wi, wave in enumerate(waves_detected):
+        wdf = kf_results[kf_results["wave_id"] == wi]
+        if len(wdf) == 0 or "collision_primary" not in wdf.columns:
+            continue
+        losing = wdf[~wdf["collision_primary"]]
+        if len(losing) == 0:
+            continue
+        _t_kf_ns    = pd.to_datetime(losing["time"].values).astype(np.int64)
+        primary_ids = losing["collision_primary_wave_id"].values
+        kf_idx      = np.searchsorted(_t_full_ns, _t_kf_ns).clip(0, n_time - 1)
+        match       = np.abs(_t_full_ns[kf_idx] - _t_kf_ns) < int(1e9)
+        kf_idx      = kf_idx[match]
+        primary_ids = primary_ids[match]
+        if len(kf_idx) == 0:
+            continue
+        wave_cubes_kf[wi][kf_idx] = 0.0
+        _kf_suppressed_series[wi][kf_idx] = True
+        _kf_suppressed_into_series[wi][kf_idx] = primary_ids
+        _vprint(f"  {wave['label']}: suppressed {len(kf_idx)} frame(s) from composite_kf "
+                f"(lost a KF collision episode).")
+
+    composite_kf = np.sum(wave_cubes_kf, axis=0)
+
     # ── Step 9: Animation ─────────────────────────────────────────────────────
     if make_animation:
         _vprint(
@@ -1387,6 +1617,9 @@ def run_airglow_pipeline(
             "kf_lam_series":   _kf_lam_series,
             "kf_spd_series":   _kf_spd_series,
             "kf_valid_series": _kf_valid_series,
+            "kf_suppressed_series": _kf_suppressed_series,
+            "kf_suppressed_into_series": _kf_suppressed_into_series,
+            "wave_labels":     [w["label"] for w in waves_detected],
         }
 
         if n_workers > 1:

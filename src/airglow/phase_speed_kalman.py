@@ -59,6 +59,7 @@ Convention B full-circle [0°, 360°).
 import numpy as np
 import pandas as pd
 import warnings
+from scipy.stats import pearsonr
 
 from airglow.OmegaK_enhanced import circular_mean, circular_std
 
@@ -1244,6 +1245,266 @@ def analyze_all_waves_kalman(
                   f'T={wdf["kf_period_min"].mean():.1f} min  '
                   f'({len(wdf)} valid, {n_act}/{n_all} active)')
         print('=' * 70)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc cross-wave collision detection
+# ---------------------------------------------------------------------------
+
+def flag_kf_wave_collisions_by_correlation(
+    kf_results: pd.DataFrame,
+    waves_detected: list,
+    waves_kf: list,
+    wave_cubes_kf: list,
+    time_vals: np.ndarray,
+    corr_threshold: float = 0.7,
+    smoothing_window: int = 5,
+    min_episode_frames: int = 3,
+    dir_tol_deg: float = 22.5,
+    lambda_tol_km: float = 20.0,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Flag periods where two or more waves' KF-refined second-pass Gabor
+    reconstructions are essentially reconstructing the same physical
+    structure -- the same failure mode flag_kf_wave_collisions (parameter-
+    tolerance based) targeted, but detected directly from the reconstructed
+    fields instead of from orientation/wavelength distance.
+
+    Comparing kf_orient_deg/kf_lambda_km against fixed tolerances (the
+    previous approach) has two blind spots: it isn't scale-aware (a fixed
+    lambda_tol_km is a huge relative tolerance for a short wave and a tiny
+    one for a long wave), and it ignores phase -- two waves can sit just
+    outside the numeric tolerance while their actual reconstructed spatial
+    fields are nearly identical, or have similar orientation/wavelength by
+    coincidence while being spatially distinct. Cross-correlating
+    wave_cubes_kf directly (same per-frame Pearson r used by
+    gabor_reconstruction.check_duplicate_waves, here resolved per-frame
+    instead of averaged over the whole night) measures the thing that
+    actually matters: are two waves painting the same picture.
+
+    Must run AFTER the second-pass reconstruction (wave_cubes_kf has to
+    exist), unlike the old parameter-based check which only needed
+    kf_results and so could run before it.
+
+    Resolution is done in two stages, same rationale as the previous
+    version (avoid frame-by-frame flip-flopping over which wave "wins"):
+
+    1. Each pair's per-frame Pearson r is smoothed with a rolling mean
+       before thresholding; smoothed-collision runs shorter than
+       min_episode_frames are discarded as noise.
+    2. Per frame, waves connected by a smoothed r >= corr_threshold are
+       grouped via connected components -- not pairwise-only, so a three
+       (or more)-way collision (e.g. four waves all correlating with their
+       neighbors around the same k-space region) resolves as one group
+       instead of overlapping independent pairs. A run of frames keeps its
+       episode identity only while the group's exact membership is stable;
+       a member joining or leaving closes the old episode and opens a new
+       one. Within each episode, ONE wave is judged primary: whichever
+       stayed closest, averaged over the episode, to its own founding
+       parameters (waves_detected[i]['orientation_deg']/['wavelength_km']).
+       dir_tol_deg/lambda_tol_km are used only to normalize orientation vs.
+       wavelength distance onto comparable scales for that tie-break --
+       they no longer gate collision detection itself.
+
+    Purely informational: returns a copy of kf_results with new columns;
+    the caller (airglow_pipeline.py Step 8b / notebook Section 12) is
+    responsible for acting on collision_primary if it wants to suppress the
+    losing wave's contribution to composite_kf.
+
+    Parameters
+    ----------
+    kf_results : pd.DataFrame
+        Output of analyze_all_waves_kalman().
+    waves_detected : list of dict
+        For wave['label'] (printed summary) and founding
+        wave['orientation_deg']/['wavelength_km'] (primary tie-break).
+    waves_kf : list of dict
+        Per-wave dicts with 'orientation_deg_series'/'wavelength_km_series'
+        (n_time,) arrays on the full night grid -- the same dicts already
+        built for reconstruct_all_waves() in Step 8b/Section 12.
+    wave_cubes_kf : list of np.ndarray, each (n_time, ny, nx)
+        Output of reconstruct_all_waves() for the second pass.
+    time_vals : np.ndarray of datetime64
+        Full night time grid, same length/order as wave_cubes_kf[i].
+    corr_threshold : float
+        Smoothed per-frame Pearson r at or above which two waves are
+        considered to be reconstructing the same structure. Default 0.7,
+        not 0.5 (gabor_reconstruction.check_duplicate_waves's default,
+        which averages r over the whole night rather than gating per
+        frame) -- calibrated empirically on real data: at 0.5, transient
+        excursions in genuinely-distinct pairs (mean r ~0.3, briefly
+        crossing 0.5 for ~10% of the night) still formed spurious
+        episodes, and connected-components let a moderately-correlated
+        "hub" wave transitively merge otherwise-unrelated waves into
+        oversized groups. At 0.7 (just above the observed p99 of ~0.68
+        across all pairs x frames), only genuinely persistent duplicates
+        cross threshold.
+    smoothing_window : int
+        Rolling-mean window (frames) applied to each pair's correlation
+        time series before thresholding.
+    min_episode_frames : int
+        Minimum contiguous frames of stable group membership to count as a
+        real episode rather than a noise blip.
+    dir_tol_deg, lambda_tol_km : float
+        Normalization scale for combining orientation and wavelength
+        distance in the primary tie-break (not a detection threshold).
+    verbose : bool
+        Print a summary of detected episodes.
+
+    Returns
+    -------
+    kf_results : pd.DataFrame
+        Copy of the input with four new columns:
+            collision_id           -- int, unique per episode; -1 where
+                                       not in collision.
+            collision_group_wave_ids -- str, comma-separated wave labels in
+                                       this episode's group; "" where not
+                                       in collision.
+            collision_primary      -- bool, True if this wave is judged
+                                       the "real" one for its episode
+                                       (always True where not in collision).
+            collision_primary_wave_id -- int, wave_id of whoever won this
+                                       row's episode (same value for every
+                                       member, winner or not); -1 where not
+                                       in collision. Lets a caller label a
+                                       suppressed frame with which family it
+                                       was folded into.
+    """
+    df = kf_results.copy()
+    df["collision_id"] = -1
+    df["collision_group_wave_ids"] = ""
+    df["collision_primary_wave_id"] = -1
+    df["collision_primary"] = True
+
+    n = len(waves_detected)
+    if n < 2 or len(wave_cubes_kf) < 2:
+        if verbose:
+            print("No KF collision check: fewer than 2 waves.")
+        return df
+
+    n_time = wave_cubes_kf[0].shape[0]
+
+    # ── Per-pair smoothed correlation time series ───────────────────────────
+    smoothed = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            cube_i, cube_j = wave_cubes_kf[i], wave_cubes_kf[j]
+            raw = np.full(n_time, np.nan)
+            for t in range(n_time):
+                a, b = cube_i[t].ravel(), cube_j[t].ravel()
+                if not (np.any(a) and np.any(b)):
+                    continue
+                m = np.isfinite(a) & np.isfinite(b)
+                if m.sum() > 1:
+                    r, _ = pearsonr(a[m], b[m])
+                    if np.isfinite(r):
+                        raw[t] = r
+            smoothed[(i, j)] = (
+                pd.Series(raw).rolling(window=smoothing_window, min_periods=1).mean().to_numpy()
+            )
+
+    # ── Per-frame connected components on the correlation graph ────────────
+    all_ids = list(range(n))
+
+    def _components(edges):
+        parent = {wid: wid for wid in all_ids}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for a, b in edges:
+            union(a, b)
+        groups = {}
+        for wid in all_ids:
+            groups.setdefault(find(wid), set()).add(wid)
+        return [frozenset(g) for g in groups.values() if len(g) >= 2]
+
+    frame_groups = []
+    for t in range(n_time):
+        edges = [pair for pair, s in smoothed.items()
+                 if np.isfinite(s[t]) and s[t] >= corr_threshold]
+        frame_groups.append(set(_components(edges)))
+
+    # ── Episode detection: a group keeps its identity only while its exact
+    #    membership is stable; joining/leaving starts a new episode. ───────
+    episodes = []
+    open_eps = {}
+    for t in range(n_time + 1):
+        active = frame_groups[t] if t < n_time else set()
+        for g in list(open_eps.keys()):
+            if g not in active:
+                start = open_eps.pop(g)
+                if t - start >= min_episode_frames:
+                    episodes.append((g, start, t - 1))
+        for g in active:
+            if g not in open_eps:
+                open_eps[g] = t
+
+    if not episodes:
+        if verbose:
+            print(f"No correlation-based KF collisions detected (threshold={corr_threshold:.2f}).")
+        return df
+
+    # ── Resolve primary per episode, write back into kf_results ────────────
+    def _circ_diff_180(a, b):
+        d = np.abs(a - b) % 180.0
+        return np.minimum(d, 180.0 - d)
+
+    label_map = {i: w["label"] for i, w in enumerate(waves_detected)}
+    _t_full_ns = time_vals.astype("datetime64[ns]").astype(np.int64)
+
+    next_cid = 0
+    printed = []
+    for group, t_start, t_end in episodes:
+        seg = slice(t_start, t_end + 1)
+        dists = {}
+        for wid in group:
+            gi  = float(waves_detected[wid]["orientation_deg"]) % 180.0
+            gli = float(waves_detected[wid]["wavelength_km"])
+            oi  = waves_kf[wid]["orientation_deg_series"][seg]
+            li  = waves_kf[wid]["wavelength_km_series"][seg]
+            d = np.nanmean(_circ_diff_180(oi % 180.0, gi) / dir_tol_deg
+                            + np.abs(li - gli) / lambda_tol_km)
+            dists[wid] = d if np.isfinite(d) else np.inf
+        primary = min(dists, key=dists.get)
+
+        cid = next_cid
+        next_cid += 1
+        group_str = ", ".join(label_map[w] for w in sorted(group))
+        printed.append((group, t_start, t_end, primary))
+
+        for wid in group:
+            wmask = (df["wave_id"] == wid).to_numpy()
+            wtimes_ns = pd.to_datetime(df.loc[wmask, "time"].values).astype(np.int64)
+            kf_idx = np.searchsorted(_t_full_ns, wtimes_ns).clip(0, n_time - 1)
+            match = np.abs(_t_full_ns[kf_idx] - wtimes_ns) < int(1e9)
+            in_episode = match & (kf_idx >= t_start) & (kf_idx <= t_end)
+            idx = df.index[wmask][in_episode]
+            df.loc[idx, "collision_id"] = cid
+            df.loc[idx, "collision_group_wave_ids"] = group_str
+            df.loc[idx, "collision_primary"] = (wid == primary)
+            df.loc[idx, "collision_primary_wave_id"] = primary
+
+    if verbose:
+        print(f"WARNING: {len(episodes)} correlation-based KF collision episode(s) "
+              f"detected (threshold={corr_threshold:.2f}):")
+        for group, t_start, t_end, primary in printed:
+            members = ", ".join(label_map[w] for w in sorted(group))
+            print(f"  {{{members}}}  frames {t_start}-{t_end} ({t_end - t_start + 1} frames) "
+                  f"-- kept {label_map[primary]}")
+
+    return df
 
     return df
 
