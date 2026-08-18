@@ -293,6 +293,10 @@ def build_wave_families(
         d = abs(a - b) % 180
         return min(d, 180 - d)
 
+    def _full_circle_diff(a, b):
+        d = abs(a - b) % 360
+        return min(d, 360 - d)
+
     # Flatten all detections
     all_waves = []
     for r in window_results:
@@ -325,12 +329,23 @@ def build_wave_families(
     # be split into ~(60/dir_tol_deg) families, each covering one segment
     # of the rotation.  The Voronoi step in build_waves_for_gabor then
     # stitches their reconstructions into a seamless time series.
+    # _angular_diff alone is not enough: it wraps every 180 deg, so an axis
+    # of 14 deg and one of 175 deg read as only 19 deg apart (both sit near
+    # the 0/180 boundary from opposite sides) even though the two waves
+    # propagate in nearly opposite true directions (azimuth_full 194 deg vs
+    # 355 deg, 161 deg apart) -- silently merging genuinely different waves
+    # into one "family" and violating the fixed-founding-centroid invariant
+    # this loop is supposed to guarantee. Require azimuth_full proximity
+    # too (a real full-circle distance, not axis-only) so only detections
+    # that agree on both the spatial axis AND the propagation direction can
+    # join the same group.
     groups = []
     for w in all_waves:
         matched = False
         for g in groups:
             if (
                 _angular_diff(w["direction"], g["direction_center"]) < dir_tol_deg
+                and _full_circle_diff(w["azimuth_full"], g["azimuth_full_center"]) < dir_tol_deg
                 and abs(w["wavelength"] - g["wavelength_center"]) < lambda_tol_km
             ):
                 g["members"].append(w)
@@ -340,9 +355,10 @@ def build_wave_families(
                 break
         if not matched:
             groups.append({
-                "direction_center":  w["direction"],
-                "wavelength_center": w["wavelength"],
-                "members":           [w],
+                "direction_center":    w["direction"],
+                "azimuth_full_center": w["azimuth_full"],
+                "wavelength_center":   w["wavelength"],
+                "members":             [w],
             })
 
     # Per-window deduplication: when the peak-finder splits one wave's power

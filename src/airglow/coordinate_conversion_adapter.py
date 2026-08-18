@@ -6,11 +6,13 @@ and explains when/how to use it with the new Gabor code.
 
 KEY INSIGHT:
 -----------
-Your convert_angle() does: θ_new = (90 - θ_old) % 180
+convert_angle() does: theta_new = 90 - theta_old
 
 This swaps between two conventions:
-- Convention A: 0° = East, 90° = North  (geographic/standard)
-- Convention B: 0° = North, 90° = West  (90° counterclockwise rotation)
+- Convention A: 0 deg = East, 90 deg = North, counterclockwise (standard math angle)
+- Convention B: 0 deg = North, 90 deg = East, clockwise (geographic compass bearing --
+  matches the k-vector/propagation-direction convention used throughout the rest of
+  this codebase, e.g. phase_speed_kalman.py's orientation_deg/azimuth)
 
 In your current workflow:
 - FFT uses Convention A (0° = East)
@@ -24,6 +26,21 @@ In the NEW code:
 
 However, if you want results in Convention B (to match your old outputs):
 - Apply convert_angle() to ALL output orientations
+
+BUG FIX (see CaseStudy_RealData_OneNight.ipynb history): the previous
+implementation wrapped negative results back into [0, 180) via
+`np.where(result < 0, 180 + result, result)`. That wrap is mathematically
+unnecessary (theta_new = 90 - theta_old is already its own inverse without
+it) and actively harmful for create_gabor_kernel's use of this function's
+output as a raw angle fed to cos/sin: the wrap introduces a genuine
+discontinuity exactly at theta_old = 90 deg (convert_angle(89.99) ~ 0 vs
+convert_angle(90.01) ~ 180 -- a ~180 deg jump for two inputs that should
+give nearly-identical kernels), which flips the kernel to its complex
+conjugate and inverts the sign of every downstream omega/direction estimate
+for any wave whose orientation_deg (axis) exceeds 90 deg. Verified fixed
+against a synthetic wave with known ground-truth direction across all four
+quadrants (0-360 deg) -- see the investigation in that notebook's history
+for the empirical before/after comparison.
 """
 
 import numpy as np
@@ -32,34 +49,39 @@ import numpy as np
 def convert_angle(angles):
     """
     Convert angles between two reference systems.
-    Both systems constrained to 0-180 degrees.
-    This transformation is reversible using the same function.
-    
-    System A (geographic): 0° = East, 90° = North
-    System B (rotated):    0° = North, 90° = West
-    
+    This transformation is reversible using the same function
+    (theta_new = 90 - theta_old is its own inverse).
+
+    System A (geographic/math): 0 deg = East, 90 deg = North, counterclockwise
+    System B (compass bearing): 0 deg = North, 90 deg = East, clockwise --
+        the k-vector/propagation-direction convention used elsewhere in this
+        codebase (e.g. orientation_deg/azimuth in phase_speed_kalman.py)
+
+    Deliberately NOT wrapped into [0, 180) -- see the module docstring's
+    "BUG FIX" note for why that wrap is both unnecessary and harmful here.
+    Callers that pass angles already in [0, 180) get a result in (-90, 90];
+    the reversibility property holds regardless of range.
+
     Parameters:
     -----------
     angles : float or array-like
         Input angle(s) in degrees
-        
+
     Returns:
     --------
     float or ndarray
         Converted angle(s) in degrees
     """
     angles = np.asarray(angles)
-    result = 90 - angles
-    result = np.where(result < 0, 180 + result, result)
-    return result
+    return 90 - angles
 
 
 def apply_conversion_to_results(results_df, convert=True):
     """
     Apply coordinate conversion to Gabor results DataFrame
     
-    Use this if you want results in Convention B (0° = North) to match
-    your old workflow output format.
+    Use this if you want results in Convention B (0 deg = North, 90 deg =
+    East, clockwise) to match your old workflow output format.
     
     Parameters:
     -----------
@@ -106,13 +128,12 @@ if __name__ == "__main__":
               |
               |
               └──────→ East (0°)
-    
-    Convention B (YOUR old Gabor): 0° = North, 90° = West
+
+    Convention B (YOUR old Gabor): 0° = North, 90° = East, clockwise
          North ↑ (0°)
               |
               |
-         West ←──────
-              (90°)
+              └──────→ East (90°)
     
     RECOMMENDATION:
     ---------------

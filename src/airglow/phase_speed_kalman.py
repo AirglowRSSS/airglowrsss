@@ -378,6 +378,17 @@ def _kalman_theta_tracker(
     # with equal validity.  Fold each observation to whichever of (z, z+π) is
     # closer to theta_init_rad (the ω-k propagation direction), which provides
     # the ground truth on which half-circle the wave is actually traveling.
+    #
+    # Tried anchoring this fold to the filter's running prediction (x_pred[0])
+    # instead of the fixed theta_init_rad, hoping it would let the filter
+    # track a wave whose true direction genuinely drifts far from its initial
+    # detection. It didn't help: the fold and the running prediction just
+    # reinforce each other from frame 1 onward regardless of what the raw
+    # signal says, so a family whose raw measurement disagrees with its own
+    # theta_init from the very first frame stays locked near that anchor
+    # either way. Reverted -- see CaseStudy_RealData_OneNight.ipynb, DOY 173
+    # 2023 Family 2, whose raw theta sits at ~170-220 deg all night despite
+    # theta_init_rad being 14/194 deg either way.
     for t in range(n):
         if not np.isfinite(theta_obs_raw[t]):
             continue
@@ -1104,7 +1115,8 @@ def analyze_all_waves_kalman(
                 stacklevel=2,
             )
             kf_kh_all.append(dict(kh_est=np.full(n_time, k_h_init),
-                                  kh_std=np.full(n_time, np.nan)))
+                                  kh_std=np.full(n_time, np.nan),
+                                  wavelength_kernel_mismatch=np.zeros(n_time, dtype=bool)))
             continue
 
         # Use the omega-filter validity mask (same as theta tracker)
@@ -1245,6 +1257,140 @@ def analyze_all_waves_kalman(
                   f'T={wdf["kf_period_min"].mean():.1f} min  '
                   f'({len(wdf)} valid, {n_act}/{n_all} active)')
         print('=' * 70)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc azimuth-sign validation
+# ---------------------------------------------------------------------------
+
+def validate_wave_azimuth_sign(
+    kf_results: pd.DataFrame,
+    waves_detected: list,
+    min_valid_frames: int = 10,
+    flip_threshold: float = 0.5,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Cross-check each wave's fixed, full-circle ``azimuth`` (the one-time ω-k
+    detection value stored in ``wave['azimuth']``, used verbatim as
+    ``kf_prop_azimuth_deg`` and as the theta-tracker's disambiguation anchor
+    for the whole night) against the sign of that same wave's own
+    frame-by-frame ``kf_omega_rads``.
+
+    Why this can disagree
+    ----------------------
+    ``kf_omega_rads``'s sign is a genuinely independent, continuously
+    re-measured quantity: ``angle(conj(conv_t) * conv_{t-1}) / dt`` on the
+    Gabor-filtered complex field, referenced against the wave's fixed
+    ``orientation_deg`` axis.  By construction (verified empirically against
+    a synthetic wave of known direction — a south-propagating wave on a
+    0 deg N-S axis measures negative ω, matching the documented "negative =
+    opposite of orientation_deg" convention), positive ω means the wave is
+    propagating toward ``orientation_deg``; negative means toward
+    ``orientation_deg + 180``.
+
+    ``wave['azimuth']`` is a *different*, one-time measurement made upstream
+    at the original ω-k detection (before any Kalman tracking), and is never
+    revisited afterward — deliberately, to avoid noise-driven sign-flip
+    artefacts (see ``_kalman_omega_tracker``'s docstring). That means if the
+    original detection assigned the wrong lobe to a family (or the wave's
+    true direction is simply inconsistent with it), nothing downstream will
+    ever catch it — ``kf_prop_azimuth_deg`` and the theta-tracker's
+    disambiguation anchor both just inherit the same fixed value all night,
+    self-consistently, without ever being checked against the independently
+    re-measured ω sign.
+
+    This function does that check once, after the first-pass Kalman fit.
+
+    Parameters
+    ----------
+    kf_results : pd.DataFrame
+        Output of ``analyze_all_waves_kalman`` (needs ``wave_id``,
+        ``kf_omega_rads``, ``innovation_valid``).
+    waves_detected : list of dict
+        Needs ``orientation_deg`` and ``azimuth`` per wave.
+    min_valid_frames : int
+        Minimum number of valid frames required before a wave's azimuth is
+        judged flippable at all — too few frames make the sign vote
+        unreliable.
+    flip_threshold : float
+        A wave is flagged when the fraction of valid frames whose
+        ``kf_omega_rads`` sign *matches* what ``wave['azimuth']`` implies
+        falls below this (i.e. the majority of frames disagree).
+
+    Returns
+    -------
+    pd.DataFrame, one row per wave:
+        wave_id, label, orientation_deg, azimuth_deg, expected_sign
+        (+1/-1, what ``azimuth_deg`` implies for sign(ω)), n_valid_frames,
+        frac_matching (fraction of valid frames agreeing with
+        expected_sign), suggested_azimuth_deg (``orientation_deg`` or
+        ``orientation_deg + 180``, whichever the *measured* ω sign
+        majority actually supports), flagged (bool).
+    """
+    rows = []
+    for wi, wave in enumerate(waves_detected):
+        orient = float(wave["orientation_deg"]) % 360.0
+        az     = float(wave["azimuth"]) % 360.0
+        diff   = circular_diff_deg(az, orient)          # [-180, 180)
+        expected_sign = 1 if abs(diff) < 90.0 else -1
+
+        wdf = kf_results[
+            (kf_results["wave_id"] == wi) & kf_results["innovation_valid"]
+        ]
+        omega = wdf["kf_omega_rads"].values
+        omega = omega[np.isfinite(omega) & (omega != 0.0)]
+        n = len(omega)
+
+        if n == 0:
+            rows.append(dict(
+                wave_id=wi, label=wave["label"], orientation_deg=orient,
+                azimuth_deg=az, expected_sign=expected_sign,
+                n_valid_frames=0, frac_matching=np.nan,
+                suggested_azimuth_deg=np.nan, flagged=False,
+            ))
+            continue
+
+        measured_sign = 1 if np.sum(omega > 0) >= np.sum(omega < 0) else -1
+        frac_matching = float(np.mean(np.sign(omega) == expected_sign))
+        flagged = (n >= min_valid_frames) and (frac_matching < flip_threshold)
+        suggested_az = orient if measured_sign == 1 else (orient + 180.0) % 360.0
+
+        rows.append(dict(
+            wave_id=wi, label=wave["label"], orientation_deg=orient,
+            azimuth_deg=az, expected_sign=expected_sign,
+            n_valid_frames=n, frac_matching=frac_matching,
+            suggested_azimuth_deg=suggested_az, flagged=flagged,
+        ))
+
+    df = pd.DataFrame(rows)
+
+    if verbose:
+        print("\nAZIMUTH-SIGN VALIDATION (fixed wave['azimuth'] vs measured KF omega sign)")
+        print("-" * 70)
+        any_flagged = False
+        for _, r in df.iterrows():
+            if r["n_valid_frames"] == 0:
+                print(f"  {r['label']}: no valid frames -- skipped")
+                continue
+            flag_str = ""
+            if r["flagged"]:
+                any_flagged = True
+                flag_str = (f"  <-- SUSPECT: majority of frames disagree; "
+                            f"measured direction looks like "
+                            f"{r['suggested_azimuth_deg']:.1f} deg, "
+                            f"not the labeled {r['azimuth_deg']:.1f} deg")
+            print(f"  {r['label']}: az={r['azimuth_deg']:.1f} deg  "
+                  f"match={100*r['frac_matching']:.0f}% of {r['n_valid_frames']} "
+                  f"valid frames{flag_str}")
+        if any_flagged:
+            print("\n  NOTE: flagged waves' kf_prop_azimuth_deg / kf_orient_deg are "
+                  "anchored to a fixed azimuth that this night's own KF measurements "
+                  "persistently contradict -- treat those families' direction labels "
+                  "with caution until the root cause is fixed.")
+        print("=" * 70)
 
     return df
 

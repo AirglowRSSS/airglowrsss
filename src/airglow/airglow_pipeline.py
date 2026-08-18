@@ -63,6 +63,7 @@ from airglow.phase_speed_kalman import (
     analyze_all_waves_kalman,
     compute_binned_wave_stats,
     flag_kf_wave_collisions_by_correlation,
+    validate_wave_azimuth_sign,
     circular_diff_deg,
 )
 from airglow.wave_validation import (
@@ -333,6 +334,34 @@ def _frame_worker(t: int) -> None:
             wave_title = f"Wave {wi + 1} (-> {into_lbl})" if into_lbl else (
                 f"Wave {wi + 1} (suppressed)" if sup else f"Wave {wi + 1}")
             title = f"{wave_title}\n{line2}"
+
+            # Velocity vector: direction+speed of this wave at this frame,
+            # centered in the panel (pixel coords here, unlike the notebook's
+            # km-coordinate version). Convention B: 0 deg = North (+y, since
+            # origin="lower"), 90 deg = East (+x), clockwise. Purely a
+            # visualization aid -- lets the computed direction/speed be
+            # checked by eye against the crest motion actually visible in
+            # the reconstruction. A wave at _ARROW_SPEED_REF_MS reaches the
+            # full _ARROW_MAX_LEN_FRAC-of-panel arrow length. Drawn for both
+            # normal (black) and "*" / coasting (grey, innovation_valid=False)
+            # frames -- not drawn for "XX" suppressed frames (nothing is
+            # reconstructed there).
+            if not (_np.isnan(az) or _np.isnan(spd)) and not sup:
+                _ARROW_SPEED_REF_MS  = 150.0
+                _ARROW_MAX_LEN_FRAC  = 0.35
+                _arrow_color = "black" if valid else "grey"
+                ny_px, nx_px = cube[t].shape
+                cx, cy = nx_px / 2.0, ny_px / 2.0
+                az_rad = _np.deg2rad(az)
+                ux, uy = _np.sin(az_rad), _np.cos(az_rad)
+                arrow_len_px = (min(spd / _ARROW_SPEED_REF_MS, 1.0)
+                                * _ARROW_MAX_LEN_FRAC * min(nx_px, ny_px))
+                ax.annotate(
+                    "", xy=(cx + ux * arrow_len_px, cy + uy * arrow_len_px),
+                    xytext=(cx, cy),
+                    arrowprops=dict(arrowstyle="-|>", color=_arrow_color, lw=2.0, mutation_scale=16),
+                )
+                ax.plot(cx, cy, marker="o", color=_arrow_color, markersize=3)
         else:
             title = base_title
 
@@ -1392,35 +1421,57 @@ def run_airglow_pipeline(
         time_kf.astype("datetime64[s]").astype(float)
     )))
 
+    def _run_kf():
+        with _maybe_quiet(verbose):
+            return analyze_all_waves_kalman(
+                waves_detected     = waves_detected,
+                complex_amplitudes = cmplx_sl,
+                time_vals          = time_kf,
+                dt                 = dt_seconds,
+                q_omega            = kf_q_omega,
+                q_domega           = kf_q_domega,
+                r_sigma_base       = kf_r_sigma_base,
+                snr_min_amplitude  = kf_snr_min,
+                chi2_gate          = kf_chi2_gate,
+                hard_chi2_gate     = kf_hard_chi2_gate,
+                dwell_time         = kf_dwell_time,
+                dominant_window    = kf_dom_window,
+                verbose            = verbose,
+                kx_obs_list        = kx_obs_sl,
+                ky_obs_list        = ky_obs_sl,
+                btheta_rad         = gabor_btheta,
+                kf_q_theta         = kf_q_theta,
+                kf_q_dtheta        = kf_q_dtheta,
+                kf_r_theta_deg     = kf_r_theta_deg,
+                rms_omegak         = rms_omegak,
+                rms_wave_cubes     = rms_wave_cubes,
+                activity_threshold = activity_threshold,
+                kf_q_kh            = kf_q_kh,
+                kf_q_dkh           = kf_q_dkh,
+                kf_r_kh_frac       = kf_r_kh_frac,
+                lambda_h_min_km    = lambda_h_min_km,
+                lambda_h_max_km    = lambda_h_max_km,
+            )
+
+    kf_results = _run_kf()
+
+    # ── Step 8-validate: informational only -- cross-check each wave's fixed
+    # azimuth against its own measured KF omega sign and flag disagreement.
+    # Deliberately NOT auto-corrected: kf_omega_rads's sign is exactly the
+    # signal _kalman_omega_tracker's own docstring warns against trusting for
+    # direction ("noise bursts that push the cross-correlation phasor across
+    # zero contaminate the sign estimate... tracking |ω| eliminates all such
+    # artefacts") -- that's why kf_prop_azimuth_deg is hard-fixed to
+    # wave['azimuth'] regardless of ω's sign, by original design. An earlier
+    # version of this step auto-flipped flagged waves' azimuth, which on real
+    # (not synthetic) data flipped at least one *already-correct* azimuth
+    # (confirmed against real imagery), because the sign-vote is systematically
+    # biased toward orientation_deg (always < 180°) rather than reflecting a
+    # genuine, evenly-distributed real-data disagreement. Kept as a flag only
+    # -- worth a manual look, not a safe automatic correction.
     with _maybe_quiet(verbose):
-        kf_results = analyze_all_waves_kalman(
-            waves_detected     = waves_detected,
-            complex_amplitudes = cmplx_sl,
-            time_vals          = time_kf,
-            dt                 = dt_seconds,
-            q_omega            = kf_q_omega,
-            q_domega           = kf_q_domega,
-            r_sigma_base       = kf_r_sigma_base,
-            snr_min_amplitude  = kf_snr_min,
-            chi2_gate          = kf_chi2_gate,
-            hard_chi2_gate     = kf_hard_chi2_gate,
-            dwell_time         = kf_dwell_time,
-            dominant_window    = kf_dom_window,
-            verbose            = verbose,
-            kx_obs_list        = kx_obs_sl,
-            ky_obs_list        = ky_obs_sl,
-            btheta_rad         = gabor_btheta,
-            kf_q_theta         = kf_q_theta,
-            kf_q_dtheta        = kf_q_dtheta,
-            kf_r_theta_deg     = kf_r_theta_deg,
-            rms_omegak         = rms_omegak,
-            rms_wave_cubes     = rms_wave_cubes,
-            activity_threshold = activity_threshold,
-            kf_q_kh            = kf_q_kh,
-            kf_q_dkh           = kf_q_dkh,
-            kf_r_kh_frac       = kf_r_kh_frac,
-            lambda_h_min_km    = lambda_h_min_km,
-            lambda_h_max_km    = lambda_h_max_km,
+        kf_az_validation = validate_wave_azimuth_sign(
+            kf_results, waves_detected, verbose=verbose,
         )
 
     _kf_ts_path = str(results_dir / f"{stem}_kf_timeseries.png")
@@ -1430,6 +1481,10 @@ def run_airglow_pipeline(
     _kf_tbl_path = str(results_dir / f"{stem}_kf_table.txt")
     _write_kf_table(kf_results, waves_detected, _kf_tbl_path, verbose)
     output_paths["kf_table"] = _kf_tbl_path
+
+    _kf_az_val_path = str(results_dir / f"{stem}_kf_azimuth_validation.csv")
+    kf_az_validation.to_csv(_kf_az_val_path, index=False, float_format="%.4f")
+    output_paths["kf_azimuth_validation"] = _kf_az_val_path
 
     # ── Step 8b: Second-pass Gabor reconstruction using KF estimates ──────────
     # Uses KF-refined per-frame orientation and wavelength as the kernel
