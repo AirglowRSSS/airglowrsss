@@ -657,11 +657,32 @@ def build_waves_for_gabor(families, time_grid, n_stds=3.0,
         d = abs(a - b) % 180
         return min(d, 180 - d)
 
+    # Mirrors build_wave_families's own _full_circle_diff (wave_validation.py)
+    # -- that one is a nested function local to build_wave_families and isn't
+    # importable without hoisting it out of an already-correct module, so the
+    # 2-line pattern is duplicated here rather than the object being reused.
+    def _full_circle_diff(a, b):
+        d = abs(a - b) % 360
+        return min(d, 360 - d)
+
+    # _adiff alone is not enough: it wraps every 180 deg, so two families whose
+    # axes coincide but whose true propagation directions are ~180 deg apart
+    # (azimuth_full ~19 deg vs ~201 deg) pass the axis check and get pulled
+    # into one Voronoi group even though they are two distinct, counter-
+    # propagating waves -- the group's Voronoi tie-break then hands one of
+    # them's covered frames to the other, and downstream the weaker one's
+    # frozen, ownership-blind second-pass reconstruction reconstructs the
+    # stronger one's real signal under its own label (see
+    # FAMILY13_INVESTIGATION.md). Require azimuth_full proximity too, exactly
+    # as build_wave_families already does for its own (upstream, and already
+    # correct) grouping step -- see wave_validation.py:338-341.
     group_id = list(range(n_fam))
     for i in range(n_fam):
         for j in range(i + 1, n_fam):
             if (_adiff(families[i]["direction_center"],
                        families[j]["direction_center"]) < voronoi_dir_tol
+                    and _full_circle_diff(families[i]["azimuth_full_center"],
+                                           families[j]["azimuth_full_center"]) < voronoi_dir_tol
                     and abs(families[i]["wavelength_center"]
                             - families[j]["wavelength_center"]) < voronoi_lam_tol):
                 old_g = group_id[j]; new_g = group_id[i]

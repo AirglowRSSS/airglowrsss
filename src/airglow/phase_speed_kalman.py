@@ -1476,12 +1476,48 @@ def flag_kf_wave_collisions_by_correlation(
     label_map = {i: w["label"] for i, w in enumerate(waves_detected)}
     _t_full_ns = time_vals.astype("datetime64[ns]").astype(np.int64)
 
+    # Per-wave amplitude, aligned to the same 0..n_time-1 frame-index grid
+    # waves_kf[wid]'s series / t_start,t_end already use. kf_results'S OWN
+    # "frame_idx" column is NOT this grid -- it's relative to the edge-
+    # trimmed slice [edge_frames, n_time_full-edge_frames) (see
+    # airglow_pipeline.py's edge_frames = ntaps // 2), offset from the full
+    # night grid wave_cubes_kf/t_start/t_end use by edge_frames frames.
+    # Sorting by frame_idx alone would silently read the wrong segment (~6
+    # frames off with the default ntaps=13) -- confirmed by direct
+    # instrumentation while implementing this fix, not assumed. Mirror the
+    # same timestamp-based alignment the write-back loop below already uses
+    # (kf_idx via searchsorted against _t_full_ns) instead.
+    amp_by_wave = {}
+    for wid in range(n):
+        wmask = (df["wave_id"] == wid).to_numpy()
+        wtimes_ns = pd.to_datetime(df.loc[wmask, "time"].values).astype(np.int64)
+        kf_idx = np.searchsorted(_t_full_ns, wtimes_ns).clip(0, n_time - 1)
+        match = np.abs(_t_full_ns[kf_idx] - wtimes_ns) < int(1e9)
+        amp_full = np.zeros(n_time, dtype=float)
+        amp_vals = df.loc[wmask, "amplitude"].to_numpy()
+        amp_full[kf_idx[match]] = amp_vals[match]
+        amp_by_wave[wid] = amp_full
+
     next_cid = 0
     printed = []
     for group, t_start, t_end in episodes:
         seg = slice(t_start, t_end + 1)
         dists = {}
+        eligible = set()
         for wid in group:
+            # A wave with amplitude == 0 for every frame of this episode has
+            # no real signal to have "stayed close to its founding parameters"
+            # -- its orientation/wavelength series is frozen at kh_init /
+            # theta_init by construction (no observation ever updates it), so
+            # it trivially wins the distance comparison below against any
+            # genuinely-tracking wave. NaN is treated the same as 0 here: the
+            # established no-detection path assigns an exact 0.0+0.0j (not
+            # NaN), but a NaN amplitude carries no real signal either way,
+            # whatever its origin. See TIEBREAK_FIX_DESIGN.md.
+            amp_i = np.nan_to_num(amp_by_wave[wid][seg], nan=0.0)
+            if not np.all(amp_i < 1e-9):
+                eligible.add(wid)
+
             gi  = float(waves_detected[wid]["orientation_deg"]) % 180.0
             gli = float(waves_detected[wid]["wavelength_km"])
             oi  = waves_kf[wid]["orientation_deg_series"][seg]
@@ -1489,7 +1525,14 @@ def flag_kf_wave_collisions_by_correlation(
             d = np.nanmean(_circ_diff_180(oi % 180.0, gi) / dir_tol_deg
                             + np.abs(li - gli) / lambda_tol_km)
             dists[wid] = d if np.isfinite(d) else np.inf
-        primary = min(dists, key=dists.get)
+
+        # If every member is signal-free for this episode (a "both frozen"
+        # episode), nothing real is being reconstructed by anyone in it --
+        # composite_kf is unaffected by who's labeled primary, so fall back
+        # to the original (moot) distance-only choice rather than add
+        # special-case behavior to a path with no material effect.
+        candidates = eligible if eligible else set(dists)
+        primary = min(candidates, key=dists.get)
 
         cid = next_cid
         next_cid += 1

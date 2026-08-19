@@ -290,6 +290,8 @@ def _frame_worker(t: int) -> None:
     frames_dir = d["frames_dir"]
     time_lbl   = d["time_labels"][t]
     n_time     = d["n_time"]
+    east_km    = d["east_km"]
+    north_km   = d["north_km"]
 
     fig, axes = _plt.subplots(n_rows, n_cols, figsize=figsize)
     axes = _np.array(axes).reshape(n_rows, n_cols)
@@ -306,10 +308,11 @@ def _frame_worker(t: int) -> None:
     for idx, (cube, base_title) in enumerate(panels):
         r, c = divmod(idx, n_cols)
         ax   = axes[r, c]
-        im   = ax.imshow(
-            cube[t], origin="lower", cmap="RdBu_r",
-            vmin=-vmax, vmax=vmax, aspect="equal",
+        im   = ax.pcolormesh(
+            east_km, north_km, cube[t], cmap="RdBu_r",
+            vmin=-vmax, vmax=vmax, shading="auto",
         )
+        ax.set_aspect("equal")
         _plt.colorbar(im, ax=ax, shrink=0.85)
 
         # Build per-frame title for wave panels; static title for overview panels
@@ -335,39 +338,44 @@ def _frame_worker(t: int) -> None:
             title = f"{wave_title}\n{line2}"
 
             # Velocity vector: direction+speed of this wave at this frame,
-            # centered in the panel (pixel coords here, unlike the notebook's
-            # km-coordinate version). Convention B: 0 deg = North (+y, since
-            # origin="lower"), 90 deg = East (+x), clockwise. Purely a
+            # centered at (0, 0) km (panel center) -- matches
+            # CaseStudy_RealData_OneNight.ipynb's plot_second_pass_grid
+            # exactly (km coordinates, not pixels). Convention B: 0 deg =
+            # North (+north), 90 deg = East (+east), clockwise. Purely a
             # visualization aid -- lets the computed direction/speed be
             # checked by eye against the crest motion actually visible in
-            # the reconstruction. A wave at _ARROW_SPEED_REF_MS reaches the
-            # full _ARROW_MAX_LEN_FRAC-of-panel arrow length. Drawn for both
-            # normal (black) and "*" / coasting (grey, innovation_valid=False)
+            # the reconstruction. A wave at ARROW_SPEED_REF_MS reaches the
+            # full ARROW_MAX_LEN_KM arrow length. Drawn for both normal
+            # (black) and "*" / coasting (grey, innovation_valid=False)
             # frames -- not drawn for "XX" suppressed frames (nothing is
             # reconstructed there).
             if not (_np.isnan(az) or _np.isnan(spd)) and not sup:
-                _ARROW_SPEED_REF_MS  = 150.0
-                _ARROW_MAX_LEN_FRAC  = 0.35
+                _ARROW_SPEED_REF_MS = 150.0
+                _ARROW_MAX_LEN_KM   = 90.0
                 _arrow_color = "black" if valid else "grey"
-                ny_px, nx_px = cube[t].shape
-                cx, cy = nx_px / 2.0, ny_px / 2.0
                 az_rad = _np.deg2rad(az)
                 ux, uy = _np.sin(az_rad), _np.cos(az_rad)
-                arrow_len_px = (min(spd / _ARROW_SPEED_REF_MS, 1.0)
-                                * _ARROW_MAX_LEN_FRAC * min(nx_px, ny_px))
+                arrow_len_km = min(spd / _ARROW_SPEED_REF_MS, 1.0) * _ARROW_MAX_LEN_KM
                 ax.annotate(
-                    "", xy=(cx + ux * arrow_len_px, cy + uy * arrow_len_px),
-                    xytext=(cx, cy),
+                    "", xy=(ux * arrow_len_km, uy * arrow_len_km), xytext=(0, 0),
                     arrowprops=dict(arrowstyle="-|>", color=_arrow_color, lw=2.0, mutation_scale=16),
                 )
-                ax.plot(cx, cy, marker="o", color=_arrow_color, markersize=3)
+                ax.plot(0, 0, marker="o", color=_arrow_color, markersize=3)
         else:
             title = base_title
 
-        ax.set_title(title, fontsize=8, family="monospace")
-        ax.set_xlabel("East (px)", fontsize=7)
-        ax.set_ylabel("North (px)", fontsize=7)
-        ax.tick_params(labelsize=6)
+        # Matches the notebook: only per-wave panels (idx >= n_static) get
+        # monospace/fontsize 8; static overview panels get the default font
+        # at fontsize 9. Axis labels only on the left column/bottom row, not
+        # every panel, and no explicit tick-label size override (inherits
+        # rcParams default) -- all per the notebook's plot_second_pass_grid.
+        is_wave_panel = idx >= n_static and kf_az is not None
+        ax.set_title(title, fontsize=8 if is_wave_panel else 9,
+                     family="monospace" if is_wave_panel else None)
+        if c == 0:
+            ax.set_ylabel("North (km)")
+        if r == n_rows - 1:
+            ax.set_xlabel("East (km)")
 
     for idx in range(len(panels), n_rows * n_cols):
         r, c = divmod(idx, n_cols)
@@ -895,7 +903,7 @@ def run_airglow_pipeline(
     # ── KF collision check (second-pass reconstruction) ───────────────────────
     kf_collision_corr_threshold: float = 0.7,
     # ── Animation ─────────────────────────────────────────────────────────────
-    frame_dpi: int = 72,
+    frame_dpi: int = 100,
     movie_fps: int = 5,
     make_animation: bool = True,
     # ── Execution ─────────────────────────────────────────────────────────────
@@ -1020,7 +1028,8 @@ def run_airglow_pipeline(
         empirically on real data, not check_duplicate_waves's 0.5 (see
         that function's docstring for why).
     frame_dpi : int
-        DPI for animation frames (72 = fast preview, 150 = publication).
+        DPI for animation frames (72 = fast preview, 100 = matches
+        CaseStudy_RealData_OneNight.ipynb's movie rendering, 150 = publication).
     movie_fps : int
         Output mp4 frame rate.
     make_animation : bool
@@ -1639,7 +1648,12 @@ def run_airglow_pipeline(
         )
         n_pa   = len(panels_a); n_ca = 4
         n_ra   = (n_pa + n_ca - 1) // n_ca
-        vmax_a = 2.0 * float(np.nanstd(np.concatenate([c.ravel() for c, _ in panels_a])))
+        # Matches CaseStudy_RealData_OneNight.ipynb's plot_second_pass_grid:
+        # scale from the input data alone, not the full panel set (wave cubes
+        # individually have less variance than the raw input, so folding them
+        # into the same std would pull the scale away from what the notebook
+        # uses -- see VORONOI_FIX_STATUS.md-era discussion on movie styling).
+        vmax_a = 2.0 * float(np.nanstd(data_arr_full))
         shared = {
             "panels":          panels_a,
             "vmax_common":     vmax_a,
@@ -1650,6 +1664,8 @@ def run_airglow_pipeline(
             "frames_dir":      str(frames_dir),
             "time_labels":     [str(pd.to_datetime(t))[:19] for t in time_vals],
             "n_time":          n_time,
+            "east_km":         east_km,
+            "north_km":        north_km,
             # Per-frame KF label arrays (one (n_time,) array per wave)
             "n_static_panels": N_STATIC,
             "kf_az_series":    _kf_az_series,
