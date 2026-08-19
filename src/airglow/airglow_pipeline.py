@@ -63,8 +63,7 @@ from airglow.phase_speed_kalman import (
     analyze_all_waves_kalman,
     compute_binned_wave_stats,
     flag_kf_wave_collisions_by_correlation,
-    validate_wave_azimuth_sign,
-    circular_diff_deg,
+    build_kf_merge_log,
 )
 from airglow.wave_validation import (
     build_wave_families,
@@ -1455,25 +1454,6 @@ def run_airglow_pipeline(
 
     kf_results = _run_kf()
 
-    # ── Step 8-validate: informational only -- cross-check each wave's fixed
-    # azimuth against its own measured KF omega sign and flag disagreement.
-    # Deliberately NOT auto-corrected: kf_omega_rads's sign is exactly the
-    # signal _kalman_omega_tracker's own docstring warns against trusting for
-    # direction ("noise bursts that push the cross-correlation phasor across
-    # zero contaminate the sign estimate... tracking |ω| eliminates all such
-    # artefacts") -- that's why kf_prop_azimuth_deg is hard-fixed to
-    # wave['azimuth'] regardless of ω's sign, by original design. An earlier
-    # version of this step auto-flipped flagged waves' azimuth, which on real
-    # (not synthetic) data flipped at least one *already-correct* azimuth
-    # (confirmed against real imagery), because the sign-vote is systematically
-    # biased toward orientation_deg (always < 180°) rather than reflecting a
-    # genuine, evenly-distributed real-data disagreement. Kept as a flag only
-    # -- worth a manual look, not a safe automatic correction.
-    with _maybe_quiet(verbose):
-        kf_az_validation = validate_wave_azimuth_sign(
-            kf_results, waves_detected, verbose=verbose,
-        )
-
     _kf_ts_path = str(results_dir / f"{stem}_kf_timeseries.png")
     _plot_kf_timeseries(kf_results, waves_detected, time_kf, _kf_ts_path, verbose)
     output_paths["kf_timeseries"] = _kf_ts_path
@@ -1481,10 +1461,6 @@ def run_airglow_pipeline(
     _kf_tbl_path = str(results_dir / f"{stem}_kf_table.txt")
     _write_kf_table(kf_results, waves_detected, _kf_tbl_path, verbose)
     output_paths["kf_table"] = _kf_tbl_path
-
-    _kf_az_val_path = str(results_dir / f"{stem}_kf_azimuth_validation.csv")
-    kf_az_validation.to_csv(_kf_az_val_path, index=False, float_format="%.4f")
-    output_paths["kf_azimuth_validation"] = _kf_az_val_path
 
     # ── Step 8b: Second-pass Gabor reconstruction using KF estimates ──────────
     # Uses KF-refined per-frame orientation and wavelength as the kernel
@@ -1591,6 +1567,14 @@ def run_airglow_pipeline(
         _kfb_path = str(results_dir / f"{stem}_kf_binned.csv")
         kf_binned.to_csv(_kfb_path, index=False, float_format="%.4f")
         output_paths["kf_binned_csv"] = _kfb_path
+
+    # ── Merge-log audit: wave_ids fully absorbed into another wave all night,
+    # invisible to kf_binned above since it only ever sees collision_primary
+    # frames. Built from the same, unfiltered kf_results.
+    kf_merge_log = build_kf_merge_log(kf_results, night=stem)
+    _kfml_path = str(results_dir / f"{stem}_kf_merge_log.csv")
+    kf_merge_log.to_csv(_kfml_path, index=False, float_format="%.4f")
+    output_paths["kf_merge_log_csv"] = _kfml_path
 
     # ── Step 8b-collision-suppress: drop the losing wave from composite_kf ────
     # flag_kf_wave_collisions_by_correlation just judged, per episode, which
