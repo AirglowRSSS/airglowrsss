@@ -1532,6 +1532,43 @@ def run_airglow_pipeline(
         )
     _vprint("  Second-pass reconstruction complete.")
 
+    # ── Step 8b-ownership-gate: zero wave_cubes_kf for frames a wave doesn't
+    #    legitimately own ──────────────────────────────────────────────────
+    # Mirrors the first pass's own NaN-orientation-series -> cube[t] = 0.0
+    # pattern (gabor_reconstruction.py's _reconstruct_adaptive), which the
+    # second pass never had. waves_kf's orientation_deg_series/
+    # wavelength_km_series come from the causal KF, which COASTS through
+    # frames a wave doesn't own (producing a finite, not NaN, per-frame
+    # value) -- so without this gate the second-pass kernel still gets
+    # built and applied there, reconstructing whatever real signal happens
+    # to fall in a nearby wave's passband under this wave's own
+    # frozen/stale label. This is the root cause FAMILY13_INVESTIGATION.md
+    # traced the borrowed-signal symptom to (Family 13 visually showing
+    # Family 6's real signal during its own unowned early-night span).
+    # waves_detected[i]['_owned_mask'] (Stage B's own per-frame ownership
+    # answer, structural and pass-independent, unaffected by which pass is
+    # reconstructing) is the correct gate.
+    #
+    # Must run HERE, before Step 8b-collision-check below, not after --
+    # confirmed with direct evidence (stage4_kickoff_task.md Task 2), not
+    # assumed: on DOY 173, running collision-check on the UNGATED cubes
+    # flags Family 13 as "in a collision episode" for 41 rows, 28 of which
+    # are on frames it doesn't even own (spurious contamination from its
+    # own borrowed-signal artifact, not a real collision). Gating first
+    # drops this to 13 flagged rows, ALL on legitimately-owned frames --
+    # zero contamination. This isn't just a cleaner kf_results/
+    # kf_merge_log record either: gating order changes the actual
+    # collision-suppression OUTCOME for other waves too (up to 8 waves on
+    # DOY 173 alone showed a materially different final wave_cubes_kf
+    # depending on ordering), because an unowned wave's spurious signal can
+    # otherwise distort which wave "wins" a correlation-based collision
+    # against it.
+    for _wi, _wave in enumerate(waves_detected):
+        _owned = _wave.get("_owned_mask")
+        if _owned is not None:
+            wave_cubes_kf[_wi][~_owned] = 0.0
+    composite_kf = np.sum(wave_cubes_kf, axis=0)
+
     # ── Step 8b-collision-check: cross-correlate the second-pass reconstructions ─
     # Must run here, not before Step 8b, since it needs wave_cubes_kf to exist.
     # See flag_kf_wave_collisions_by_correlation's docstring for why this
