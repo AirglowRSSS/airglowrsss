@@ -9,17 +9,30 @@ the permanent final schema (`refactor_foundation.md`'s persistence-boundary
 demand; `kernel_tuning.py`'s output stays diagnostic-only, never persisted).
 
 Design source: `STEP5_DESIGN_SCOPING.md` Tasks 2-4, built as specified
-there for the initial version. Revised once, per `stage4_fix_and_revalidate_task.md`
-Task 2: the initial version's episode-agreement logic (flat per-episode
-unanimous vote) let a single tiny, low-confidence episode -- as short as 3
-frames, split off from a much longer real presence by a 1-frame validity
-dropout -- flip a whole wave's disagreement flag, diagnosed concretely
-against DOY173 Family13 and three other cases
-(`STAGE4_FINAL_ESTIMATION_KICKOFF.md`, `stage4_fix_and_revalidate_task.md`'s
-own diagnosis). Replaced with episode merging across short gaps
-(`merge_close_episodes`) plus a frame-count-weighted majority vote
-(`resolve_wave_lobe`) -- see both functions' own docstrings for the full
-reasoning and the diagnosed cases each one resolves.
+there for the initial version, then revised twice:
+
+    - `stage4_fix_and_revalidate_task.md` Task 2: the initial version's
+      episode-agreement logic (flat per-episode unanimous vote) let a
+      single tiny, low-confidence episode -- as short as 3 frames, split
+      off from a much longer real presence by a 1-frame validity dropout
+      -- flip a whole wave's disagreement flag, diagnosed concretely
+      against DOY173 Family13 and three other cases
+      (`STAGE4_FINAL_ESTIMATION_KICKOFF.md`,
+      `stage4_fix_and_revalidate_task.md`'s own diagnosis). Replaced with
+      episode merging across short gaps (`merge_close_episodes`) plus a
+      frame-count-weighted majority vote (`resolve_wave_lobe`) -- this
+      part stands, see both functions' own docstrings for the full
+      reasoning.
+    - `stage4_reconsider_autoresolve_task.md` Task 1: that same round also
+      changed a wave to ALWAYS resolve to the majority-pooled azimuth
+      regardless of the disagreement flag. Reverted -- `STEP5_DESIGN_SCOPING.md`
+      Task 3 and an earlier explicit decision in this thread were both
+      clear that a genuinely-disagreeing wave gets flagged, not silently
+      resolved to a value presented as equally trustworthy. The actual bug
+      that had motivated the auto-resolve change (a validation script
+      naively averaging per-frame values across genuinely different
+      resolved hemispheres) was fixed in the script instead, where it
+      belonged.
 
 Pipeline within this module, per wave:
 
@@ -35,27 +48,27 @@ Pipeline within this module, per wave:
        against Family 6/13 (DOY173) and recalibrated/reconfirmed against
        the same two cases in FULL_BATCH_PREVALENCE_BASELINE.md before this
        module was built.
-    4. The wave ALWAYS resolves to the frame-count-weighted MAJORITY sign's
-       pooled azimuth (pooling every valid frame across every episode
-       together) -- the single best available estimate. `lobe_disagreement`
-       is set when the minority sign's frame share exceeds
-       `MINORITY_DISAGREEMENT_FRAC` -- a confidence/QC annotation on that
-       estimate, not a gate on whether one gets computed (revised from the
-       initial version's NaN-on-disagreement behavior, which produced a
-       misleading circular mean when a caller averaged per-frame values
-       spanning genuinely different resolved hemispheres -- see
-       `resolve_wave_lobe`'s own docstring).
-    5. Per episode, using the wave-level resolved lobe: offline-smooth
-       orientation (raw per-frame arctan2, folded toward the WAVE-level
-       resolved azimuth -- not any founding value -- then np.unwrap()'d,
-       then RTS via smoothing.py's _forward_backward with circular=False
-       -- the fold-toward-founding behavior smooth_orientation() carries
-       for kernel_tuning.py's purposes is deliberately NOT reused here,
-       per Task 4's explicit instruction), wavelength (smooth_wavenumber(),
+    4. If the frame-count-weighted MAJORITY sign holds more than
+       `1 - MINORITY_DISAGREEMENT_FRAC` of total valid frames: collapse to
+       ONE lobe for the wave's entire life (pooling all valid frames).
+       Otherwise (`lobe_disagreement=True`): NO wave-level azimuth is
+       asserted -- each episode keeps its own independently-resolved
+       azimuth/sign for its own smoothing (Task 3's own flagged judgment
+       call: don't pick/average ACROSS disagreeing episodes into one
+       number; each episode's own resolution, on its own terms, is still
+       valid).
+    5. Per episode: offline-smooth orientation (raw per-frame arctan2,
+       folded toward whichever azimuth Step 4 assigned that episode -- the
+       wave-level one when agreeing, that episode's own when not -- never
+       any founding value -- then np.unwrap()'d, then RTS via
+       smoothing.py's _forward_backward with circular=False -- the
+       fold-toward-founding behavior smooth_orientation() carries for
+       kernel_tuning.py's purposes is deliberately NOT reused here, per
+       Task 4's explicit instruction), wavelength (smooth_wavenumber(),
        reused directly and unchanged -- Task 4: "no sign issue, no
        episode-level disambiguation needed here"), and speed (the sign-
-       corrected omega -- majority_sign * |angle(A_cross(t))| -- via the
-       new smooth_omega(), divided by the smoothed k_h).
+       corrected omega -- via the new smooth_omega(), divided by the
+       smoothed k_h).
 
 Output is per-frame (one row per wave per frame, valid or not) plus an
 hourly aggregate built from the same per-frame trajectory -- both from one
@@ -197,20 +210,35 @@ def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
                 sign_frac=sign_frac, n_frames=int(m.sum()))
 
 
-MINORITY_DISAGREEMENT_FRAC = 0.20
+MINORITY_DISAGREEMENT_FRAC = 0.30
 """
 Disagreement threshold for `resolve_wave_lobe`: flag when the minority
-sign's share of total valid frames exceeds this. A stated judgment call,
-not an empirically re-derived cutoff (that would need its own full-batch
-analysis, out of scope for `stage4_fix_and_revalidate_task.md`) -- chosen
-and reported transparently as such, the same discipline
-`FULL_BATCH_PREVALENCE_BASELINE.md` demanded of `sign_frac`'s old 0.7 cutoff.
-Checked against the diagnosed cases before adopting: cleanly separates
-DOY150 Family4 (5% minority after merging -> resolves, matches its
-established ~13 deg direction) from DOY144 Family7 (43%), DOY154 Family5
-(34%), and DOY154 Family14 (45%) (all stay flagged -- genuinely close
-splits, not fragmentation artifacts; Family5 additionally reproduces
-FULL_BATCH_PREVALENCE_BASELINE.md's own flagged=True finding for that wave).
+sign's share of total valid frames exceeds this.
+
+Empirically positioned, not just a small-sample-fitted guess --
+`stage4_reconsider_autoresolve_task.md` Task 2 computed `minority_frac`
+for all 227 waves in the full 2022 LOW batch (DOY143-159) and found a real
+bimodal distribution: 74.4% of waves cluster below 0.05 minority
+(confident, near-unanimous), a second mode (9.7%) sits at 0.35-0.50
+(genuinely near-even splits), and 0.20-0.35 is a real low-density valley
+between them (10 of 227 waves), with the single sparsest bin at exactly
+0.30-0.35 (1 wave) -- a genuine natural separation, unlike `sign_frac`'s
+smooth, non-separating distribution at any cutoff from 0.5-0.9
+(`FULL_BATCH_PREVALENCE_BASELINE.md`). An initial value of 0.20 (chosen
+from 4 diagnosed cases before the full-batch check existed) sat at the
+valley's edge rather than its center; moved to 0.30 here, matching the
+distribution's actual sparsest point
+(`stage4_final_threshold_closeout.md` Task 1) -- affects ~9 of 227 waves
+relative to 0.20, all within the low-density valley itself, not a
+wholesale reclassification.
+
+Checked against the diagnosed cases before either value was adopted:
+cleanly separates DOY150 Family4 (5% minority after merging -> resolves,
+matches its established ~13 deg direction) from DOY144 Family7 (43%),
+DOY154 Family5 (34%), and DOY154 Family14 (45%) (all stay flagged --
+genuinely close splits, not fragmentation artifacts; Family5 additionally
+reproduces FULL_BATCH_PREVALENCE_BASELINE.md's own flagged=True finding
+for that wave).
 """
 
 
@@ -225,20 +253,30 @@ def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
     two long flanking episodes both landing within ~9 deg of the correct
     direction -- purely because a 3-frame middle fragment disagreed).
 
-    The wave ALWAYS resolves to the majority sign's pooled azimuth
-    (computed by pooling every valid frame across every episode together,
-    not by averaging independent per-episode azimuths) -- this is the
-    single best available estimate regardless of the disagreement flag's
-    state. `disagreement` is a confidence/QC annotation on top of that
-    estimate, not a gate on whether one gets computed: per
-    `STEP5_DESIGN_SCOPING.md` Task 3's own flagged judgment call, a
-    disagreeing wave is not auto-split into synthetic sub-waves, but this
-    module's reading of "flag for manual review" is "compute the best
-    single answer AND flag it," not "withhold an answer" -- the earlier
-    NaN-on-disagreement behavior actively produced a misleading circular
-    mean when a caller naively averaged per-frame values spanning
-    genuinely different resolved hemispheres across episodes; always
-    resolving via the majority avoids reintroducing that failure mode.
+    **Reverted per `stage4_reconsider_autoresolve_task.md` Task 1**: an
+    earlier version of this function always resolved to the majority
+    sign's pooled azimuth regardless of `disagreement`, reasoning that
+    withholding a value entirely was a worse failure mode than a
+    lower-confidence one. That reasoning was itself wrong, or at least not
+    this module's call to make: `STEP5_DESIGN_SCOPING.md` Task 3 and an
+    explicit earlier decision in this thread were both clear that a
+    genuinely-disagreeing wave gets flagged, full stop -- not silently
+    resolved to a pooled value "presented as if it were as trustworthy as
+    any other result" (the reverting task's own words). The actual bug
+    that motivated the auto-resolve change -- a caller naively averaging
+    per-frame values across genuinely different resolved hemispheres --
+    is a validation-script problem, fixed there (skip/branch on
+    `lobe_disagreement` before averaging), not a reason to change this
+    module's output policy.
+
+    `wave_azimuth_deg`/`wave_sign_frac` are therefore NaN when
+    `disagreement` is True -- no wave-level answer is asserted. Each
+    episode still gets its own independently-resolved azimuth/sign
+    (`ep_results`), used for that episode's own smoothing in
+    `estimate_wave_final` -- STEP5_DESIGN_SCOPING.md's language is
+    specifically about not picking/averaging ACROSS disagreeing episodes
+    into one wave-level number, not about withholding each episode's own,
+    independently-valid-on-its-own-terms resolution.
 
     Returns
     -------
@@ -252,10 +290,12 @@ def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
         disagreement   : bool -- True when the minority sign's share
                          exceeds `minority_disagreement_frac`.
         wave_azimuth_deg : float -- the pooled, majority-consistent
-                         life-of-the-wave azimuth. NaN only if no usable
-                         frames exist anywhere.
+                         life-of-the-wave azimuth when NOT disagreeing.
+                         NaN when `disagreement` is True, or when no
+                         usable frames exist anywhere.
         wave_sign_frac : float -- `_averaged_sign_lobe`'s own sign_frac
-                         for the pooled (all-episodes) frame set.
+                         for the pooled (all-episodes) frame set, under
+                         the same NaN conditions as `wave_azimuth_deg`.
     """
     ep_results = []
     for (t0, t1) in episodes:
@@ -279,13 +319,19 @@ def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
     minority_frac = 1.0 - majority_frac
     disagreement = minority_frac > minority_disagreement_frac
 
-    all_idx = np.concatenate([np.arange(r["t_start"], r["t_end"] + 1) for r in ep_results])
-    pooled = _averaged_sign_lobe(kx, ky, complex_amp, all_idx)
-    # Pooled resolution's own sign should always match the frame-weighted
-    # majority by construction (same underlying frames, same weighting
-    # logic) -- not re-derived independently here, used directly.
-    wave_azimuth_deg = pooled["azimuth_deg"]
-    wave_sign_frac = pooled["sign_frac"]
+    if disagreement:
+        # No wave-level answer asserted -- see docstring. Per-episode
+        # results (ep_results) remain available for the caller.
+        wave_azimuth_deg = np.nan
+        wave_sign_frac = np.nan
+    else:
+        all_idx = np.concatenate([np.arange(r["t_start"], r["t_end"] + 1) for r in ep_results])
+        pooled = _averaged_sign_lobe(kx, ky, complex_amp, all_idx)
+        # Pooled resolution's own sign should always match the frame-weighted
+        # majority by construction (same underlying frames, same weighting
+        # logic) -- not re-derived independently here, used directly.
+        wave_azimuth_deg = pooled["azimuth_deg"]
+        wave_sign_frac = pooled["sign_frac"]
 
     return dict(episodes=ep_results, majority_sign=majority_sign, majority_frac=majority_frac,
                 disagreement=disagreement, wave_azimuth_deg=wave_azimuth_deg,
@@ -479,14 +525,21 @@ def estimate_wave_final(
 
     for eid, ep in enumerate(lobe["episodes"]):
         t0, t1 = ep["t_start"], ep["t_end"]
-        # ALWAYS use the wave-level, frame-weighted-majority pooled
-        # azimuth/sign as every episode's smoothing fold-reference --
-        # the single best available estimate regardless of the
-        # disagreement flag (see resolve_wave_lobe's own docstring for
-        # why this replaced the old per-episode-own-value fallback).
-        ep_azimuth = lobe["wave_azimuth_deg"]
-        ep_sign_frac = lobe["wave_sign_frac"]
-        ep_sign = lobe["majority_sign"]
+        # Per-episode azimuth/sign for smoothing's fold reference: when the
+        # wave-level lobe does NOT disagree, use the POOLED wave-level
+        # azimuth/sign (stronger estimate, more data, and consistent across
+        # every episode); when it DOES disagree, fall back to each
+        # episode's OWN independently-resolved azimuth/sign -- reverted
+        # per `stage4_reconsider_autoresolve_task.md` Task 1, see
+        # resolve_wave_lobe's own docstring for why.
+        if not lobe["disagreement"]:
+            ep_azimuth = lobe["wave_azimuth_deg"]
+            ep_sign_frac = lobe["wave_sign_frac"]
+            ep_sign = lobe["majority_sign"]
+        else:
+            ep_azimuth = ep["azimuth_deg"]
+            ep_sign_frac = ep["sign_frac"]
+            ep_sign = ep["sign"]
 
         sm = _smooth_episode(
             kx, ky, complex_amp, dt, t0, t1, ep_azimuth, ep_sign,
