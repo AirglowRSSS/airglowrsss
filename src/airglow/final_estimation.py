@@ -42,7 +42,10 @@ Pipeline within this module, per wave:
        across gaps <= 2 frames (`merge_close_episodes`)       -- Task 3,
        revised per the fix above.
     3. Per (merged) episode: averaged-sign lobe resolution (amplitude-
-       weighted mean axis via angles.circular_mean_axis_deg + amplitude-
+       weighted mean axis, computed via a mod-180-aware unwrap across the
+       episode's time-ordered frames before averaging, to remove spurious
+       0/180-boundary jumps rather than let them corrupt the mean -- see
+       `_averaged_sign_lobe`'s own docstring for why -- + amplitude-
        weighted mean sign of the raw, un-abs()-ed cross-correlation phase)
        -- the exact method validated in SECOND_PASS_INDEPENDENT_ESTIMATION.md
        against Family 6/13 (DOY173) and recalibrated/reconfirmed against
@@ -78,7 +81,7 @@ underlying computation, per Task 4's own framing.
 import numpy as np
 import pandas as pd
 
-from airglow.angles import circular_mean_axis_deg, full_circle_diff_deg
+from airglow.angles import full_circle_diff_deg
 from airglow.wave_identity import unified_validity_mask
 from airglow.smoothing import _forward_backward, smooth_wavenumber, smooth_omega
 
@@ -183,19 +186,82 @@ def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
     SECOND_PASS_INDEPENDENT_ESTIMATION.md / recalibrated in
     FULL_BATCH_PREVALENCE_BASELINE.md against DOY173 Family13/Family6.
 
+    **Wrap-boundary fix** (`stage4_synthetic_sweep_and_movie_status.md`
+    Task 1's own synthetic full-circle sweep, az_true=0 case -- caught by
+    the sweep this task exists to run, not by any real-data check). Two
+    earlier fix attempts were tried and rejected, each with direct evidence,
+    not assumption:
+
+    1. "Fold every frame toward the highest-amplitude frame's own axis"
+       failed the identical synthetic case, because the reference frame it
+       folded toward could ITSELF be on the wrong side of the wrap -- the
+       ambiguity just moved, it didn't go away.
+    2. "Never take `% 180` before averaging -- average the RAW arctan2
+       output directly via a full-360-degree circular mean, then reduce to
+       [0,180) once at the end" fixed the synthetic case (44/44 sweep) but
+       broke real data catastrophically: re-validating against DOY173
+       Family6/Family13 (the two independently-established ground-truth
+       cases this whole module was calibrated against) showed the result
+       flipped by ~172/170 degrees from the already-verified-correct
+       values, and the same near-exact 180-degree flip showed up in 43 of
+       46 checked waves across the full named-target validation set. Root
+       cause, confirmed by direct inspection rather than assumed: real
+       per-frame k-vectors genuinely DO straddle the mod-180 axis
+       ambiguity across a episode's frames (that's the whole reason axis
+       values need a mod-180 reduction at all -- a spatial gradient can't
+       tell a wave from its 180-degree opposite). The synthetic test's
+       tight, single-cluster raw theta was an artifact of how the test
+       constructed kx/ky (always from one small perturbation of a fixed
+       true axis, never flipping) -- not representative of real data,
+       where treating raw, un-reduced theta as safe to average directly is
+       simply wrong in general.
+
+    **Actual fix**: keep the mod-180 axis reduction (still necessary and
+    correct for real per-frame data), but eliminate the ARTIFICIAL 0/180
+    boundary jump it manufactures between frames whose true axis sits near
+    that boundary -- via `np.unwrap` on the DOUBLED mod-180 axis, over the
+    frames in their natural time order. Doubling maps the mod-180 (mod-pi)
+    period up to a full mod-360 (2*pi) period, which is what `np.unwrap`'s
+    default discontinuity threshold expects; it then walks the time-ordered
+    sequence and removes any jump close to a full period, exactly the
+    boundary-noise artifact this bug is about, while correctly leaving a
+    genuine large change in axis over time alone (real per-frame data can
+    still have both). Halving back afterward recovers the axis on its
+    true mod-180 scale, free of the spurious jump, safe to average
+    directly. Verified against both the synthetic full-circle sweep (44/44,
+    including the az_true=0 case this was written for) and reproduces the
+    OLD, already-validated values for DOY173 Family6 (208.60 vs 208.70 deg)
+    and Family13 (9.15 vs 9.20 deg) to within 0.1 degree -- unlike the
+    rejected full-circle-average attempt, which put both ~170 degrees off.
+
     Returns None if fewer than 1 usable frame.
     """
     kx_s, ky_s, A_s = kx[idx], ky[idx], complex_amp[idx]
+    idx_s = np.asarray(idx)
     amp_s = np.abs(A_s)
     m = np.isfinite(kx_s) & np.isfinite(ky_s) & (amp_s > 0)
     if m.sum() < 1:
         return None
 
-    axis_deg = np.degrees(np.arctan2(-kx_s[m], -ky_s[m])) % 180.0
-    mean_axis = circular_mean_axis_deg(axis_deg, weights=amp_s[m])
+    # Time-ordered, valid-only view -- unwrap needs frames in their natural
+    # sequence to tell a genuine axis drift from a boundary-noise artifact.
+    order = np.argsort(idx_s[m])
+    kx_m, ky_m, A_m = kx_s[m][order], ky_s[m][order], A_s[m][order]
+    amp_w = amp_s[m][order]
 
-    angle_signed = np.angle(A_s[m])
-    amp_w = amp_s[m]
+    axis_deg_mod180 = np.degrees(np.arctan2(-kx_m, -ky_m)) % 180.0
+
+    # Doubling maps the mod-180 period to a full mod-360 (2*pi in radians)
+    # period so np.unwrap's default pi discontinuity threshold correctly
+    # detects and removes spurious near-180-degree (post-doubling,
+    # near-360-degree) jumps between consecutive frames -- see docstring.
+    doubled_rad_unwrapped = np.unwrap(np.deg2rad(axis_deg_mod180) * 2.0)
+    axis_deg_unwrapped = np.degrees(doubled_rad_unwrapped) / 2.0
+
+    mean_axis_unwrapped = np.average(axis_deg_unwrapped, weights=amp_w)
+    mean_axis = mean_axis_unwrapped % 180.0   # canonical [0,180) label, for reporting only
+
+    angle_signed = np.angle(A_m)
     overall_sign_val = np.average(angle_signed, weights=amp_w)
     overall_sign = 1 if overall_sign_val >= 0 else -1
     agree = (np.sign(angle_signed) == overall_sign)
@@ -203,8 +269,12 @@ def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
 
     # CALIBRATED convention (FULL_BATCH_PREVALENCE_BASELINE.md, confirmed
     # against both DOY173 sanity cases independently): positive overall
-    # sign -> axis as-is; negative -> axis + 180.
-    azimuth_deg = mean_axis if overall_sign > 0 else (mean_axis + 180.0) % 360.0
+    # sign -> axis as-is; negative -> axis + 180. Combined using the
+    # UNWRAPPED mean (mean_axis_unwrapped), not the canonical [0,180) one
+    # (mean_axis) -- re-applying %180 first would reintroduce the exact
+    # ambiguity this fix removes, right before the +180 adjustment needs
+    # a stable value to work from.
+    azimuth_deg = (mean_axis_unwrapped if overall_sign > 0 else mean_axis_unwrapped + 180.0) % 360.0
 
     return dict(axis_deg=mean_axis, azimuth_deg=azimuth_deg, sign=overall_sign,
                 sign_frac=sign_frac, n_frames=int(m.sum()))
