@@ -68,6 +68,7 @@ def _forward_backward(
     clamp=None,
     ext_valid: np.ndarray = None,
     require_snr_floor: bool = True,
+    hard_gate: bool = True,
 ) -> dict:
     """
     Forward Kalman filter (causal) + backward RTS smoother (offline), 2-state
@@ -135,6 +136,24 @@ def _forward_backward(
         a real, intentional difference between the two ported originals
         rather than silently unified -- confirmed by this module's forward-
         pass equivalence tests, not assumed.
+    hard_gate : bool
+        Whether `snr_ok AND gate_ok` (chi2) must BOTH hold for a frame to
+        actually update the state, or whether the frame always updates
+        (whenever finite/`amp>0`/`ext_valid`) regardless of those checks,
+        which are then computed purely as an `innovation_valid` diagnostic
+        label. True for orientation/wavenumber (matches
+        `_kalman_theta_tracker`'s unconditional hard gate, and
+        `_kalman_kh_tracker`'s -- which never even takes a `chi2_gate`
+        parameter, so `chi2_gate=None` already makes `gate_ok` trivially
+        True there regardless of this flag). **False for the omega
+        tracker** -- `_kalman_omega_tracker`'s own default is
+        `hard_chi2_gate=False` (`if innov_valid[t] or not hard_chi2_gate:
+        <update>` -- with the default, this condition is unconditionally
+        True), a real, previously-invisible difference from the theta
+        tracker's always-hard gate, found only by requiring exact
+        forward-pass equivalence during this module's own construction
+        (see `smooth_omega`'s regression test) -- not assumed identical
+        just because both trackers share the same 2-state kinematic shape.
 
     Returns
     -------
@@ -193,12 +212,12 @@ def _forward_backward(
                 innov = _wrap(innov)
             S = float((H @ P_pred @ H.T)[0, 0]) + R_t
             gate_ok = True if chi2_gate is None else ((innov ** 2 / S) <= chi2_gate)
+            innovation_valid[t] = snr_ok and gate_ok
 
-            if snr_ok and gate_ok:
+            if innovation_valid[t] or not hard_gate:
                 K = (P_pred @ H.T) / S
                 x = x_pred + K.ravel() * innov
                 P = (I2 - K @ H) @ P_pred
-                innovation_valid[t] = True
             else:
                 x, P = x_pred, P_pred
         else:
@@ -708,6 +727,125 @@ def smooth_wavenumber(
 
 
 # ---------------------------------------------------------------------------
+# Angular-frequency tracker -- offline counterpart to phase_speed_kalman.py's
+# _kalman_omega_tracker. Added for final_estimation.py (step 5) per
+# STEP5_DESIGN_SCOPING.md Task 4: "Speed: derived per-frame from the smoothed
+# omega ... propose smoothing the unfolded, sign-corrected omega directly,
+# i.e. sign(episode lobe) x |omega_obs(t)|, through the same RTS treatment as
+# orientation." kernel_tuning.py (step 3) deliberately does not use this --
+# omega/phase-speed is out of scope for kernel construction -- but it belongs
+# in this shared engine module regardless, per the module's own stated
+# purpose (the one shared offline engine for both steps 3 and 5, not just
+# whichever pieces step 3 happened to need first).
+# ---------------------------------------------------------------------------
+
+def smooth_omega(
+    omega_obs: np.ndarray,
+    amp_obs: np.ndarray,
+    dt: float,
+    omega_init: float = 0.0,
+    *,
+    q_omega: float = 1e-8,
+    q_domega: float = 1e-12,
+    r_sigma_base: float = 0.3,
+    snr_min_amplitude: float = 0.05,
+    chi2_gate: float = 9.0,
+) -> dict:
+    """
+    Track instantaneous angular frequency, offline (RTS-smoothed).
+
+    Offline counterpart to `_kalman_omega_tracker` (`phase_speed_kalman.py:83`)
+    -- identical state-space model (`x = [omega, domega/dt]`, linear/non-
+    circular innovation, same Q/R construction), so the forward pass
+    reproduces that function's output exactly (see this module's regression
+    tests). All defaults (`q_omega=1e-8`, `q_domega=1e-12`,
+    `r_sigma_base=0.3`) are unchanged from the ported original -- these
+    already have stated rationales there (see that function's own
+    docstring), not re-derived here.
+
+    Unlike `smooth_orientation`/`smooth_wavenumber`, this tracker uses
+    `_forward_backward`'s `hard_gate=False` -- `_kalman_omega_tracker`'s own
+    default is `hard_chi2_gate=False`, which makes its update condition
+    (`if innov_valid[t] or not hard_chi2_gate:`) unconditionally True: the
+    state always updates whenever `amp_obs[t] > 0` and `omega_obs[t]` is
+    finite, regardless of SNR or chi2 outlier status -- those are computed
+    only as an `innovation_valid` diagnostic label, never used to block the
+    update. This was NOT the assumption this module started with: an
+    earlier version reused the theta/kh trackers' always-hard gate for
+    omega too and failed its own forward-pass-equivalence regression test
+    against real (non-trivial) synthetic noise -- exact equivalence testing
+    is what caught this, not code inspection alone. `require_snr_floor=True`
+    is still passed (unlike `smooth_wavenumber`'s `False`) so the
+    `innovation_valid` label itself is computed the same way the ported
+    original computes it (`snr_ok and chi2_ok`), even though that label no
+    longer gates anything when `hard_gate=False`.
+
+    Caller's responsibility, per `STEP5_DESIGN_SCOPING.md` Task 4: pass in
+    the SIGN-CORRECTED observation (`sign(episode lobe) * |omega_obs(t)|`),
+    not the raw signed or `abs()`-ed value directly -- this function tracks
+    whatever series it's given, it does not itself resolve the sign
+    ambiguity (that's `final_estimation.py`'s episode-based lobe
+    disambiguation, a separate, earlier step).
+
+    Parameters
+    ----------
+    omega_obs : ndarray (n_time,)
+        Sign-corrected angular frequency observations (rad/s). NaN/missing
+        where `amp_obs == 0`.
+    amp_obs : ndarray (n_time,)
+        |A_cross(t)| -- SNR proxy.
+    dt : float
+        Timestep, seconds.
+    omega_init : float
+        Initial omega estimate (rad/s), sign-corrected consistent with
+        `omega_obs`.
+    q_omega, q_domega, r_sigma_base, snr_min_amplitude, chi2_gate :
+        Same meaning and defaults as `_kalman_omega_tracker`.
+
+    Returns
+    -------
+    dict with keys:
+        omega_est, omega_std       : (n_time,) -- forward/causal pass.
+        omega_smooth, omega_smooth_std : (n_time,) -- backward/offline pass,
+                                      the new non-causal answer.
+        innovation_valid            : (n_time,) bool, forward-pass chi2/SNR
+                                      QC label (diagnostic only).
+    """
+    n = len(omega_obs)
+    if n < 3:
+        return dict(
+            omega_est=np.full(n, omega_init), omega_std=np.full(n, np.nan),
+            omega_smooth=np.full(n, omega_init), omega_smooth_std=np.full(n, np.nan),
+            innovation_valid=np.zeros(n, dtype=bool),
+        )
+
+    Q = np.diag([q_omega, q_domega])
+    x0 = np.array([omega_init, 0.0])
+    omega_init_scale = max(abs(omega_init), 1e-4)
+    P0 = np.diag([(0.3 * omega_init_scale) ** 2, (1e-6) ** 2])
+
+    def _r_base_over_dt(r_sigma_base=r_sigma_base, dt=dt):
+        # R_t = (r_sigma_base / a_eff / dt)**2 = (r_base_eff / a_eff)**2
+        # with r_base_eff = r_sigma_base / dt -- matches _forward_backward's
+        # own R_t = (r_base / a_eff)**2 convention exactly.
+        return r_sigma_base / dt
+
+    result = _forward_backward(
+        omega_obs, amp_obs, dt, x0, P0, Q, _r_base_over_dt(),
+        snr_min_amplitude=snr_min_amplitude, chi2_gate=chi2_gate,
+        circular=False, ext_valid=None, require_snr_floor=True, hard_gate=False,
+    )
+
+    return dict(
+        omega_est=result["x_filt"][:, 0],
+        omega_std=np.sqrt(np.maximum(result["P_filt"][:, 0, 0], 0.0)),
+        omega_smooth=result["x_smooth"][:, 0],
+        omega_smooth_std=np.sqrt(np.maximum(result["P_smooth"][:, 0, 0], 0.0)),
+        innovation_valid=result["innovation_valid"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression tests -- run with: python smoothing.py
 #
 # 1. Forward-pass equivalence: this module's causal (forward) pass must
@@ -722,7 +860,9 @@ def smooth_wavenumber(
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, "/Users/jmakela/Documents/dagster_dev/airglowrsss/src")
-    from airglow.phase_speed_kalman import _kalman_theta_tracker, _kalman_kh_tracker
+    from airglow.phase_speed_kalman import (
+        _kalman_theta_tracker, _kalman_kh_tracker, _kalman_omega_tracker,
+    )
 
     rng = np.random.default_rng(0)
     print("=" * 60)
@@ -791,6 +931,21 @@ if __name__ == "__main__":
     print("  PASS: smooth_wavenumber's forward pass exactly reproduces "
           "_kalman_kh_tracker (max diff "
           f"{np.max(np.abs(old_kh['kh_est'] - new_kh['kh_est'])):.2e} rad/m).")
+
+    # ── Test 2b: forward-pass equivalence, omega ──
+    omega_obs_synth = 2.0 * np.pi / (600.0) * np.ones(n)  # ~10 min period
+    omega_obs_synth += rng.normal(0, 0.2 * omega_obs_synth[0], n)
+    old_omega = _kalman_omega_tracker(
+        omega_obs_synth, amp_obs, dt, omega_init=omega_obs_synth[0],
+    )
+    new_omega = smooth_omega(
+        omega_obs_synth, amp_obs, dt, omega_init=omega_obs_synth[0],
+    )
+    assert np.allclose(old_omega["omega"], new_omega["omega_est"], atol=1e-12), \
+        "FAIL: smooth_omega's forward pass does not match _kalman_omega_tracker"
+    print("  PASS: smooth_omega's forward pass exactly reproduces "
+          "_kalman_omega_tracker (max diff "
+          f"{np.max(np.abs(old_omega['omega'] - new_omega['omega_est'])):.2e} rad/s).")
 
     # ── Test 3: smoothing benefit -- backward pass RMS error vs. known
     #    synthetic ground truth must be <= forward pass RMS error. ──
