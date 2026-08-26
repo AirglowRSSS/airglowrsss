@@ -75,6 +75,12 @@ from airglow.gabor_reconstruction import (
     build_waves_for_gabor,
     check_duplicate_waves,
 )
+from airglow.final_estimation import estimate_wave_final
+from airglow.output_schema import (
+    build_wave_frame_rows,
+    build_wave_frames_table,
+    build_wave_hourly_table,
+)
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -1521,7 +1527,7 @@ def run_airglow_pipeline(
         _kf_valid_series.append(valid_kf)
 
     with _maybe_quiet(verbose):
-        wave_cubes_kf, composite_kf, _, _, _ = reconstruct_all_waves(
+        wave_cubes_kf, composite_kf, complex_amp_2nd, kx_2nd, ky_2nd = reconstruct_all_waves(
             data_filtered_temporal   = data_arr_full,
             waves                    = waves_kf,
             dx_km                    = dx_km,
@@ -1531,6 +1537,11 @@ def run_airglow_pipeline(
             rms_calibrate            = rms_calibrate,
         )
     _vprint("  Second-pass reconstruction complete.")
+    # complex_amp_2nd/kx_2nd/ky_2nd (per-wave, per-frame second-pass phasor
+    # and spatial phase gradient) used to be discarded here (`_, _, _`) --
+    # kept now, Stage 5's own raw material (`final_estimation.py`,
+    # `STEP5_DESIGN_SCOPING.md` Task 1: "Step 5 needs only to keep what's
+    # already being computed").
 
     # ── Step 8b-ownership-gate: zero wave_cubes_kf for frames a wave doesn't
     #    legitimately own ──────────────────────────────────────────────────
@@ -1595,6 +1606,72 @@ def run_airglow_pipeline(
     _kf_results_path = str(results_dir / f"{stem}_kf_results.csv")
     kf_results.to_csv(_kf_results_path, index=False, float_format="%.4f")
     output_paths["kf_results_csv"] = _kf_results_path
+
+    # ── Step 5: Final estimation (offline, second-pass) ────────────────────────
+    # Connects final_estimation.py (Stage 4) to the live pipeline for the
+    # first time -- REFACTOR_DESIGN.md's staged plan, row 5. Runs per wave,
+    # on the same second-pass kx_2nd/ky_2nd/complex_amp_2nd this Step 8b
+    # call already computed (kept above, not recomputed), the same
+    # per-frame ownership (`_owned_mask`) Step 8b-ownership-gate above
+    # already used, and this pass's own now-finalized collision_primary
+    # (post flag_kf_wave_collisions_by_correlation). Output schema:
+    # wave_frames.csv (per-frame) + wave_hourly.csv (hourly, final_*-only
+    # aggregate) via output_schema.py, per REFACTOR_DESIGN.md Task 3's
+    # clean-break design.
+    _vprint("[8c/9] Final estimation (Stage 5, offline second-pass) ...")
+    dt_sec = dt_min * 60.0
+    _wave_frame_rows = []
+    for wi, wave in enumerate(waves_detected):
+        wdf = kf_results[kf_results["wave_id"] == wi].copy()
+        amp1_full   = np.full(n_time, np.nan)
+        tune_or_full = np.full(n_time, np.nan)
+        tune_lam_full = np.full(n_time, np.nan)
+        tune_spd_full = np.full(n_time, np.nan)
+        cid_full    = np.full(n_time, -1, dtype=int)
+        cp_full     = np.zeros(n_time, dtype=bool)
+
+        if len(wdf) > 0:
+            _t_kf_ns = pd.to_datetime(wdf["time"].values).astype(np.int64)
+            kf_idx   = np.searchsorted(_t_full_ns, _t_kf_ns).clip(0, n_time - 1)
+            match    = np.abs(_t_full_ns[kf_idx] - _t_kf_ns) < int(1e9)
+            kf_idx_m = kf_idx[match]
+
+            amp1_full[kf_idx_m]     = wdf["amplitude"].values[match]
+            tune_or_full[kf_idx_m]  = wdf["kf_orient_deg"].values[match]
+            tune_lam_full[kf_idx_m] = wdf["kf_lambda_km"].values[match]
+            tune_spd_full[kf_idx_m] = wdf["kf_wavespeed_ms"].values[match]
+            cid_full[kf_idx_m]      = wdf["collision_id"].values[match].astype(int)
+            cp_full[kf_idx_m]       = wdf["collision_primary"].values[match].astype(bool)
+
+        owned_mask = wave.get("_owned_mask", np.zeros(n_time, dtype=bool))
+        est_df = estimate_wave_final(
+            wave, kx_2nd[wi], ky_2nd[wi], complex_amp_2nd[wi], time_vals, dt_sec,
+            owned_mask, cp_full,
+        )
+        _wave_frame_rows.append(build_wave_frame_rows(
+            wi, est_df,
+            raw_amplitude_1st=amp1_full,
+            raw_amplitude_2nd=np.abs(complex_amp_2nd[wi]),
+            raw_kx_2nd=kx_2nd[wi], raw_ky_2nd=ky_2nd[wi],
+            tuning_orient_deg=tune_or_full, tuning_wavelength_km=tune_lam_full,
+            tuning_wavespeed_ms=tune_spd_full,
+            collision_id=cid_full, collision_primary=cp_full,
+        ))
+
+    wave_frames = build_wave_frames_table(_wave_frame_rows)
+    _wave_frames_path = str(results_dir / f"{stem}_wave_frames.csv")
+    wave_frames.to_csv(_wave_frames_path, index=False, float_format="%.4f")
+    output_paths["wave_frames_csv"] = _wave_frames_path
+
+    wave_hourly = build_wave_hourly_table(
+        wave_frames, bin_width_min=bin_width_min, min_valid_frames=min_valid_frames,
+    )
+    if len(wave_hourly) > 0:
+        _wave_hourly_path = str(results_dir / f"{stem}_wave_hourly.csv")
+        wave_hourly.to_csv(_wave_hourly_path, index=False, float_format="%.4f")
+        output_paths["wave_hourly_csv"] = _wave_hourly_path
+    _vprint(f"  Final estimation complete: {len(waves_detected)} wave(s), "
+            f"{int(wave_frames['valid'].sum())}/{len(wave_frames)} valid frame-rows.")
 
     # ── Binned wave statistics, computed AFTER dedup ───────────────────────────
     # Must run here (not right after analyze_all_waves_kalman, where it used to
@@ -1780,6 +1857,8 @@ def run_airglow_pipeline(
         "data_omegak":        data_omegak,
         "kf_results":         kf_results,
         "kf_binned":          kf_binned,
+        "wave_frames":        wave_frames,       # Stage 5: final_estimation.py per-frame
+        "wave_hourly":        wave_hourly,        # Stage 5: final_*-only hourly aggregate
         "correlation_stats":  correlation_stats,
         "output_paths":       output_paths,
     }
