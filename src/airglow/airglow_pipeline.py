@@ -62,18 +62,20 @@ from airglow.wave_clustering    import compute_adaptive_gabor_parameters
 from airglow.phase_speed_kalman import (
     analyze_all_waves_kalman,
     compute_binned_wave_stats,
-    flag_kf_wave_collisions_by_correlation,
     build_kf_merge_log,
 )
 from airglow.wave_validation import (
-    build_wave_families,
     families_to_xarray,
     plot_wave_family_timeseries,
 )
 from airglow.gabor_reconstruction import (
     reconstruct_all_waves,
-    build_waves_for_gabor,
     check_duplicate_waves,
+)
+from airglow.wave_identity import (
+    cluster_detections_into_families,
+    resolve_frame_ownership,
+    resolve_collisions,
 )
 from airglow.final_estimation import estimate_wave_final
 from airglow.output_schema import (
@@ -828,6 +830,71 @@ def _write_kf_table(
 
 
 # =============================================================================
+# wave_identity.resolve_collisions -> kf_results merge-back
+# =============================================================================
+
+def _merge_collision_result_into_kf_results(kf_results, collisions, n_waves, time_vals):
+    """
+    Write `wave_identity.resolve_collisions`'s output into `kf_results` as
+    the same four columns `flag_kf_wave_collisions_by_correlation` used to
+    add in place -- `resolve_collisions` returns its own complete
+    DataFrame (one row per wave_id x frame_idx, every frame on the full
+    night grid) rather than annotating the caller's `kf_results` directly
+    (a deliberate structural fix over the ported original, see
+    `resolve_collisions`'s own docstring), so the two have to be merged by
+    timestamp rather than by row position: `kf_results` only covers the
+    edge-trimmed slice `analyze_all_waves_kalman` produces, not the full
+    grid `collisions` is built on. Same timestamp-based `searchsorted`
+    alignment used throughout this module (e.g. Step 8b's own per-wave
+    array construction) -- not a new alignment mechanism.
+
+    Parameters
+    ----------
+    kf_results : pd.DataFrame
+        Output of `analyze_all_waves_kalman`, to annotate.
+    collisions : pd.DataFrame
+        Output of `wave_identity.resolve_collisions`, same `time_vals`.
+    n_waves : int
+        Number of waves (`len(waves_detected)`).
+    time_vals : np.ndarray of datetime64
+        Full night time grid, same length/order `collisions`'s `frame_idx`
+        column uses.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of `kf_results` with `collision_id`/`collision_group_wave_ids`/
+        `collision_primary_wave_id`/`collision_primary` added.
+    """
+    df = kf_results.copy()
+    df["collision_id"] = -1
+    df["collision_group_wave_ids"] = ""
+    df["collision_primary_wave_id"] = -1
+    df["collision_primary"] = True
+
+    n_time = len(time_vals)
+    _t_full_ns = time_vals.astype("datetime64[ns]").astype(np.int64)
+
+    for wid in range(n_waves):
+        wmask = (df["wave_id"] == wid).to_numpy()
+        if not np.any(wmask):
+            continue
+        wtimes_ns = pd.to_datetime(df.loc[wmask, "time"].values).astype(np.int64)
+        kf_idx = np.searchsorted(_t_full_ns, wtimes_ns).clip(0, n_time - 1)
+        match = np.abs(_t_full_ns[kf_idx] - wtimes_ns) < int(1e9)
+
+        c_wid = collisions[collisions["wave_id"] == wid].sort_values("frame_idx").reset_index(drop=True)
+        idx = df.index[wmask][match]
+        c_rows = c_wid.iloc[kf_idx[match]]
+        df.loc[idx, "collision_id"] = c_rows["collision_id"].to_numpy()
+        df.loc[idx, "collision_group_wave_ids"] = c_rows["collision_group_wave_ids"].to_numpy()
+        df.loc[idx, "collision_primary_wave_id"] = c_rows["collision_primary_wave_id"].to_numpy()
+        df.loc[idx, "collision_primary"] = c_rows["collision_primary"].to_numpy()
+
+    return df
+
+
+# =============================================================================
 # Quiet context manager
 # =============================================================================
 
@@ -1190,9 +1257,14 @@ def run_airglow_pipeline(
     )
 
     # ── Step 3: Wave family grouping ──────────────────────────────────────────
+    # wave_identity.py Stage A (`cluster_detections_into_families`), not the
+    # original `build_wave_families` -- confirmed byte-for-byte identical
+    # port (`verify_wave_identity.py`, all 5 reference nights: exact match
+    # on family count, member count, and all three centroid values). Swap
+    # per `commit_and_activate_wave_identity.md` Step 2.
     _vprint("[3/9] Wave family grouping ...")
     with _maybe_quiet(verbose):
-        families = build_wave_families(
+        families = cluster_detections_into_families(
             window_results,
             dir_tol_deg    = dir_tol_deg,
             lambda_tol_km  = lambda_tol_km,
@@ -1265,8 +1337,16 @@ def run_airglow_pipeline(
     gabor_btheta   = gabor_btheta_full / 2.0
     full_time_grid = time_vals.astype("datetime64[ns]")
 
+    # wave_identity.py Stage B (`resolve_frame_ownership`), not the original
+    # `build_waves_for_gabor` -- NOT byte-for-byte identical (its founding
+    # seed values use angles.circular_mean_axis_deg/circular_mean_full_deg
+    # instead of np.median, a deliberate wrap-boundary fix), but the
+    # difference is already measured and bounded (`STAGE1_FINAL_CHECKS.md`
+    # Check 1: DOY173 unaffected, DOY144/150/157 shift a handful of named
+    # waves by a few degrees). Swap per
+    # `commit_and_activate_wave_identity.md` Step 2 -- re-validated below.
     with _maybe_quiet(verbose):
-        waves_detected = build_waves_for_gabor(
+        waves_detected = resolve_frame_ownership(
             families      = families,
             time_grid     = full_time_grid,
             n_stds        = gabor_n_stds,
@@ -1582,16 +1662,27 @@ def run_airglow_pipeline(
 
     # ── Step 8b-collision-check: cross-correlate the second-pass reconstructions ─
     # Must run here, not before Step 8b, since it needs wave_cubes_kf to exist.
-    # See flag_kf_wave_collisions_by_correlation's docstring for why this
-    # replaced the earlier orientation/wavelength-tolerance check.
+    # wave_identity.py Stage C (`resolve_collisions`, `apply_duplicate_gate=False`),
+    # not the original `flag_kf_wave_collisions_by_correlation` -- confirmed
+    # byte-for-byte identical for the second pass (`resolve_collisions`'s own
+    # docstring: exact regression match across all 5 reference nights). Swap
+    # per `commit_and_activate_wave_identity.md` Step 2. Second-pass calls
+    # MUST pass `apply_duplicate_gate=False` -- see `resolve_collisions`'s
+    # own docstring; first-pass `check_duplicate_waves` above is untouched,
+    # deliberately out of scope for this swap.
     with _maybe_quiet(verbose):
-        kf_results = flag_kf_wave_collisions_by_correlation(
-            kf_results, waves_detected, waves_kf, wave_cubes_kf, time_vals,
+        _collisions_2nd = resolve_collisions(
+            waves_kf, wave_cubes_kf, complex_amp_2nd, time_vals,
+            pass_label     = "second-pass",
             corr_threshold = kf_collision_corr_threshold,
             dir_tol_deg    = dir_tol_deg,
             lambda_tol_km  = lambda_tol_km,
+            apply_duplicate_gate = False,
             verbose        = verbose,
         )
+    kf_results = _merge_collision_result_into_kf_results(
+        kf_results, _collisions_2nd, len(waves_detected), time_vals,
+    )
     _kf_coll_path = str(results_dir / f"{stem}_kf_collisions.png")
     _plot_kf_collisions(kf_results, waves_detected, _kf_coll_path, verbose)
     output_paths["kf_collisions"] = _kf_coll_path
