@@ -114,6 +114,20 @@ def build_wave_hourly_table(
     (still keeping `n_frames_total`/`n_frames_valid`/`duty_cycle`), matching
     `compute_binned_wave_stats`'s own `insufficient_data` handling.
 
+    **A real, physically genuine wave can show a large `azimuth_deg_std`,
+    or adjacent hourly bins that differ by ~180 deg, within one `wave_id`**
+    (`implement_per_episode_defer_crossfamily.md`, following the direct
+    per-frame evidence in `doy144_wave7_reversal_investigation.md`):
+    `final_estimation.py`'s lobe resolution keeps each episode's own
+    independently-resolved direction by default now (see
+    `final_estimation.py`'s own module docstring and
+    `SIGN_FRAC_DECISIVE_THRESHOLD`), rather than silently forcing every
+    episode of a wave to agree. A discontinuity here is `final_estimation.py`
+    correctly reporting a genuine mid-life direction reversal (DOY144
+    Family7: ~314 deg in its 07:00 hour, ~132 deg from 07:30 on) -- it is
+    the fix working as intended, not a data-quality problem, and should
+    not be mistaken for one when reading this table.
+
     Returns
     -------
     pd.DataFrame with columns: wave_id, bin_start, bin_end,
