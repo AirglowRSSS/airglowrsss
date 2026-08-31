@@ -77,6 +77,7 @@ from airglow.wave_identity import (
     resolve_frame_ownership,
     resolve_collisions,
 )
+from airglow.kernel_tuning import build_kernel_tuning_signal
 from airglow.final_estimation import estimate_wave_final
 from airglow.output_schema import (
     build_wave_frame_rows,
@@ -1569,42 +1570,51 @@ def run_airglow_pipeline(
     # n_time-edge_frames]; edge frames receive NaN → zero contribution.
     _t_full_ns = time_vals.astype("datetime64[ns]").astype(np.int64)
     waves_kf   = []
-    # Also collect KF arrays (n_time-length) for animation labels
-    _kf_az_series    = []
-    _kf_lam_series   = []
-    _kf_spd_series   = []
-    _kf_valid_series = []
+
+    # wave_identity.py Stage 3 (`kernel_tuning.build_kernel_tuning_signal`),
+    # not the causal `analyze_all_waves_kalman` output, drives the
+    # second-pass Gabor kernel -- per `KERNELTUNING_ACTIVATION_SCOPE.md`.
+    # Reuses the causal KF call's own already-sliced inputs (`cmplx_sl`,
+    # `kx_obs_sl`, `ky_obs_sl`, `time_kf`, `dt_seconds`) -- no new
+    # edge-alignment scheme needed, and matches the exact slice
+    # `STAGE3_KERNEL_TUNING.md`'s own RMS verification used. `kf_results`
+    # (the causal tracker) keeps running unchanged for `kf_results.csv`/
+    # `kf_binned.csv` -- only kernel construction's own input source
+    # changes. The movie's animation labels no longer come from
+    # `kf_results` at all -- see the Step 9 prep block further below,
+    # which sources them from `wave_frames` (final_estimation.py's own
+    # output) instead, per Stage 6's activation.
+    with _maybe_quiet(verbose):
+        tuning_signal = build_kernel_tuning_signal(
+            waves               = waves_detected,
+            kx_obs_list         = kx_obs_sl,
+            ky_obs_list         = ky_obs_sl,
+            complex_amplitudes  = cmplx_sl,
+            time_vals           = time_kf,
+            dt                  = dt_seconds,
+            btheta_rad          = gabor_btheta,
+            snr_min_amplitude   = kf_snr_min,
+            chi2_gate           = kf_chi2_gate,
+            verbose             = verbose,
+        )
 
     for wi, wave in enumerate(waves_detected):
-        wdf = kf_results[kf_results["wave_id"] == wi].copy()
-        orient_kf = np.full(n_time, np.nan)
-        lam_kf    = np.full(n_time, np.nan)
-        az_kf     = np.full(n_time, np.nan)
-        spd_kf    = np.full(n_time, np.nan)
-        valid_kf  = np.zeros(n_time, dtype=bool)
-
-        if len(wdf) > 0:
-            _t_kf_ns = pd.to_datetime(wdf["time"].values).astype(np.int64)
-            kf_idx   = np.searchsorted(_t_full_ns, _t_kf_ns).clip(0, n_time - 1)
-            # Only accept frames whose time matches exactly (within 1 s)
-            match = np.abs(_t_full_ns[kf_idx] - _t_kf_ns) < int(1e9)
-            kf_idx = kf_idx[match]
-
-            orient_kf[kf_idx] = wdf["kf_orient_deg"].values[match] % 180.0
-            lam_kf[kf_idx]    = wdf["kf_lambda_km"].values[match]
-            az_kf[kf_idx]     = wdf["kf_orient_deg"].values[match]       # full-circle
-            spd_kf[kf_idx]    = np.abs(wdf["kf_wavespeed_ms"].values[match])
-            valid_kf[kf_idx]  = wdf["innovation_valid"].values[match].astype(bool)
+        # Second-pass kernel input: offline-smoothed (kernel_tuning.py),
+        # placed onto the full grid by direct slice assignment -- `sl`
+        # (`time_kf = time_vals[sl]`) is an exact positional offset, no
+        # timestamp search needed (unlike the animation-label arrays,
+        # sourced from `wave_frames` further below, which needs no
+        # alignment either -- `wave_identity`'s per-frame grain already
+        # matches the full night grid).
+        orient_kt = np.full(n_time, np.nan)
+        lam_kt    = np.full(n_time, np.nan)
+        orient_kt[sl] = tuning_signal[wi]["orientation_deg_series"]
+        lam_kt[sl]    = tuning_signal[wi]["wavelength_km_series"]
 
         wave_kf = dict(wave)
-        wave_kf["orientation_deg_series"] = orient_kf
-        wave_kf["wavelength_km_series"]   = lam_kf
+        wave_kf["orientation_deg_series"] = orient_kt
+        wave_kf["wavelength_km_series"]   = lam_kt
         waves_kf.append(wave_kf)
-
-        _kf_az_series.append(az_kf)
-        _kf_lam_series.append(lam_kf)
-        _kf_spd_series.append(spd_kf)
-        _kf_valid_series.append(valid_kf)
 
     with _maybe_quiet(verbose):
         wave_cubes_kf, composite_kf, complex_amp_2nd, kx_2nd, ky_2nd = reconstruct_all_waves(
@@ -1832,6 +1842,38 @@ def run_airglow_pipeline(
 
     composite_kf = np.sum(wave_cubes_kf, axis=0)
 
+    # ── Step 9 prep: point the movie's label/arrow at final_estimation.py's
+    #    actual output ────────────────────────────────────────────────────
+    # Per STEP5_DESIGN_SCOPING.md Task 6 / STAGE4_SYNTHETIC_SWEEP_AND_MOVIE_STATUS.md:
+    # replaces the causal kf_orient_deg/kf_lambda_km/kf_wavespeed_ms label
+    # source (_kf_az_series etc., built in Step 8b, now unused past this
+    # point) with wave_frames' final_azimuth_deg/final_wavelength_km/
+    # final_speed_ms -- one row per (wave_id, frame_idx) already on the
+    # full n_time grid, no realignment needed. `wave_frames['valid']` is
+    # `unified_validity_mask` (owned AND collision_primary AND amp>0 AND
+    # SNR floor) -- strictly a superset of the old collision-only
+    # `_kf_suppressed_series` gate, so using `~valid` as the single
+    # suppression signal is the unification Task 6 asked for ("collision-
+    # suppressed vs. simply-not-owned" collapsed into one "not legitimately
+    # present here" state) without needing a separate not-owned check.
+    # This also collapses the old three-way normal/coasting/suppressed
+    # state into two-way present/not-present -- final_estimation.py has no
+    # per-frame confidence gradation analogous to the causal tracker's
+    # `innovation_valid` to carry the "coasting" (grey arrow, "*" flag)
+    # case forward, and none is invented here: `_frame_worker`'s own
+    # rendering logic is unchanged, only its input arrays are.
+    _fe_az_series    = []
+    _fe_lam_series   = []
+    _fe_spd_series   = []
+    _fe_valid_series = []
+    for wi in range(len(waves_detected)):
+        wf = wave_frames[wave_frames["wave_id"] == wi].sort_values("frame_idx")
+        _fe_az_series.append(wf["final_azimuth_deg"].to_numpy())
+        _fe_lam_series.append(wf["final_wavelength_km"].to_numpy())
+        _fe_spd_series.append(wf["final_speed_ms"].to_numpy())
+        _fe_valid_series.append(wf["valid"].to_numpy(dtype=bool))
+    _fe_suppressed_series = [~v for v in _fe_valid_series]
+
     # ── Step 9: Animation ─────────────────────────────────────────────────────
     if make_animation:
         _vprint(
@@ -1871,13 +1913,15 @@ def run_airglow_pipeline(
             "n_time":          n_time,
             "east_km":         east_km,
             "north_km":        north_km,
-            # Per-frame KF label arrays (one (n_time,) array per wave)
+            # Per-frame label arrays (one (n_time,) array per wave), sourced
+            # from final_estimation.py's own output (see Step 9 prep above)
+            # -- not the causal KF's.
             "n_static_panels": N_STATIC,
-            "kf_az_series":    _kf_az_series,
-            "kf_lam_series":   _kf_lam_series,
-            "kf_spd_series":   _kf_spd_series,
-            "kf_valid_series": _kf_valid_series,
-            "kf_suppressed_series": _kf_suppressed_series,
+            "kf_az_series":    _fe_az_series,
+            "kf_lam_series":   _fe_lam_series,
+            "kf_spd_series":   _fe_spd_series,
+            "kf_valid_series": _fe_valid_series,
+            "kf_suppressed_series": _fe_suppressed_series,
             "kf_suppressed_into_series": _kf_suppressed_into_series,
             "wave_labels":     [w["label"] for w in waves_detected],
         }
