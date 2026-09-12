@@ -76,31 +76,6 @@ def convert_angle(angles):
     return 90 - angles
 
 
-def apply_conversion_to_results(results_df, convert=True):
-    """
-    Apply coordinate conversion to Gabor results DataFrame
-    
-    Use this if you want results in Convention B (0 deg = North, 90 deg =
-    East, clockwise) to match your old workflow output format.
-    
-    Parameters:
-    -----------
-    results_df : pd.DataFrame
-        Results from FFTGaborReconstructor.analyze_all_frames()
-    convert : bool
-        If True, convert orientations to Convention B
-        If False, keep in Convention A (no conversion)
-        
-    Returns:
-    --------
-    results_df : pd.DataFrame
-        DataFrame with orientations converted if requested
-    """
-    if convert:
-        results_df['fft_orientation_deg'] = convert_angle(results_df['fft_orientation_deg'])
-        results_df['gabor_orientation_deg'] = convert_angle(results_df['gabor_orientation_deg'])
-    
-    return results_df
 
 
 # Example usage and testing

@@ -1,14 +1,21 @@
 """
 angles.py
 ---------
-The one shared angular-comparison/circular-statistics utility for the wave
+The shared angular-comparison/circular-statistics utility for the wave
 pipeline. Every place two orientations or azimuths get compared or averaged
 should import from here rather than reimplementing the arithmetic inline —
-this consolidates eight independent implementations found scattered across
-`wave_validation.py`, `gabor_reconstruction.py`, `phase_speed_kalman.py`,
-`wave_clustering.py`, `cluster_reconstruction.py`, and `OmegaK_enhanced.py`
-(see `REFACTOR_DESIGN.md` Task 1's survey), three of which used different
-algebraic forms for the same "distance on a mod-180 circle" concept.
+this was written to consolidate eight independent implementations found
+scattered across `wave_validation.py`, `gabor_reconstruction.py`,
+`phase_speed_kalman.py`, `wave_clustering.py`, `cluster_reconstruction.py`,
+and `OmegaK_enhanced.py` (see `REFACTOR_DESIGN.md` Task 1's survey), three
+of which used different algebraic forms for the same "distance on a
+mod-180 circle" concept.
+
+**That consolidation is only partly done** (`PIPELINE_AUDIT_RESULTS.md`):
+`phase_speed_kalman.circular_diff_deg` and `OmegaK_enhanced.circular_mean`/
+`circular_std` were never actually routed through this module and remain
+separate, live implementations still called elsewhere in the pipeline —
+they are correct as they are and this module does not replace them.
 
 Two angular conventions are in play throughout this codebase, and every
 function below is explicit about which one it operates on:

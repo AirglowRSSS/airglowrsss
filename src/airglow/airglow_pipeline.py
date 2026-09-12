@@ -7,8 +7,8 @@ Covers the complete analysis chain from a single HDF5 file to outputs:
 
     1. Data loading & preprocessing       (_load_real_data — fill in your loader)
     2. Sliding-window omega-k analysis    (parallel across windows)
-    3. Wave family grouping               (build_wave_families)
-    4. Per-frame parameter interpolation  (build_waves_for_gabor)
+    3. Wave family grouping               (wave_identity.cluster_detections_into_families)
+    4. Per-frame parameter interpolation  (wave_identity.resolve_frame_ownership)
     5. Adaptive Gabor reconstruction      (reconstruct_all_waves)
     6. Omega-k cross-validation           (Pearson r per frame)
     7. Kalman tracking (speed / orientation / wavelength)
