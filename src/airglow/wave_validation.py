@@ -1,15 +1,17 @@
 """
 wave_validation.py
 ------------------
-Utilities for validating the omega-k pipeline against synthetic wave inputs.
+Validation/diagnostic utilities for the omega-k pipeline, plus the
+`run_airglow_pipeline` Stage 1 output helpers `families_to_xarray`/
+`spatial_resolutions`/`plot_wave_family_timeseries`.
 
 Functions
 ---------
 sampling_properties_table   -- HTML summary of sampling limits and resolutions
 boxcar_expected             -- Expected sliding-window average of a truth signal
 sliding_window_analysis     -- Run the omega-k pipeline over a sliding window
-build_wave_families         -- Cluster per-window detections into coherent wave families
-families_to_xarray          -- Convert family list to xarray Dataset (Gabor/KF handoff)
+families_to_xarray          -- Convert a family list to an xarray Dataset
+spatial_resolutions         -- Wavelength/orientation clustering resolution for one wavelength
 plot_wave_family_timeseries -- 3-panel time series: speed, wavelength, azimuth
 """
 
@@ -279,7 +281,9 @@ def families_to_xarray(
 
     Parameters
     ----------
-    families  : output of build_wave_families()
+    families  : list of family dicts (family_id/direction_center/
+                wavelength_center/members), e.g. from
+                `wave_identity.cluster_detections_into_families`
     ds_truth  : optional synthetic truth Dataset (from build_synthetic_wave).
                 If provided, truth variables are merged in for easy comparison.
 
@@ -448,7 +452,8 @@ def plot_wave_family_timeseries(
 
     Parameters
     ----------
-    families       : output of build_wave_families()
+    families       : list of family dicts, e.g. from
+                     `wave_identity.cluster_detections_into_families`
     ds_truth       : synthetic truth Dataset from build_synthetic_wave()
     win_len_frames : frames per analysis window  -> enables dv speed bars
     dt_min         : temporal sampling (minutes) -> enables dv speed bars

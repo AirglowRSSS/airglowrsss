@@ -1,3 +1,15 @@
+"""
+OmegaKFilter.py
+----------------
+The 3D (time, north, east) omega-k spectral filter: the pipeline's Stage 1
+entry point. Detrends and windows a night's image cube, 3D-FFTs it into
+(omega, ky, kx) space, and builds/applies a passband mask there (temporal
+period, horizontal wavelength, and optionally a gravity-wave dispersion-
+relation band) before inverse-transforming back to physical space.
+Instantiated once per sliding analysis window and once on the full night
+(the latter as an independent cross-validation reference).
+"""
+
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
@@ -6,7 +18,8 @@ from scipy.fft import fftn, ifftn, fftfreq, next_fast_len
 
 class OmegaKFilterXarray:
     """
-    Omega-k filter for atmospheric gravity wave analysis using xarray.
+    Builds and applies a 3D omega-k passband filter to one night's (or one
+    window's) image cube.
     """
     
     def __init__(self, ds, data_var='ImageData', zero_pad_factor=1, spatial_zero_pad_factor=1):
@@ -131,8 +144,13 @@ class OmegaKFilterXarray:
         N : float
             Brunt-Väisälä frequency for dispersion relation
         apply_dispersion : bool
-            If True, apply gravity wave dispersion relation filter
-            
+            If True, apply gravity wave dispersion relation filter. The
+            pipeline's own default is False -- omega measured from the FFT
+            is in the observer frame, while the dispersion relation is a
+            statement about intrinsic frequency (they differ by k.U for a
+            nonzero background wind); this filter stays off for real data
+            until a wind (U) correction is available, not because of a bug.
+
         Returns
         -------
         filter_mask : xarray.DataArray

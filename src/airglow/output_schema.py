@@ -1,41 +1,32 @@
 """
 output_schema.py
 -----------------
-Stage 5 of the five-step architecture (`REFACTOR_DESIGN.md` Task 3, Task 5
-row 5): assembles `final_estimation.py`'s per-wave output into the clean-
-break permanent schema and wires it to disk from `run_airglow_pipeline`.
+Assembles `final_estimation.py`'s per-wave output into the permanent output
+schema and (via `run_airglow_pipeline`) writes it to disk. Two tables:
 
-Two tables, per `REFACTOR_DESIGN.md` Task 3's design (not
-`STEP5_DESIGN_SCOPING.md` Task 7's `kf_final.csv`/additive-`kf_binned.csv`
-proposal -- superseded here, per the refactor's own authorized clean break
-on schema):
-
-    wave_frames.csv  -- one row per (wave_id, time), every frame, whether
+    wave_frames.csv -- one row per (wave_id, time), every frame, whether
         valid or not. `final_estimation.estimate_wave_final`'s own per-frame
-        table (episode_id, valid, final_*, lobe_*) plus this pass's raw and
-        tuning-stage context columns, attached by the caller (see
-        `build_wave_frame_rows`) -- NOT recomputed here. `tuning_*` columns
-        are diagnostic-only (the causal, real-time KF's output, still used
-        to build the second-pass Gabor kernel) and must never be treated as
-        authoritative; `final_*` is the only authoritative column family.
+        table (episode_id, valid, final_*, lobe_*) plus raw and
+        causal-tracker context columns attached by the caller (see
+        `build_wave_frame_rows`) -- not recomputed here. `tuning_*` columns
+        are the causal, real-time Kalman filter's diagnostic output
+        (`phase_speed_kalman.analyze_all_waves_kalman`, kept for legacy
+        comparison) and must never be treated as authoritative; `final_*`
+        is the only authoritative column family.
 
     wave_hourly.csv -- hourly aggregate, built ONLY from `final_*` columns
-        (`build_wave_hourly_table`) -- no mixing first-pass-derived means
-        with amplitude-weighted final columns the way the old `kf_binned.csv`
-        did.
+        (`build_wave_hourly_table`) -- deliberately not mixing any
+        first-pass or causal-tracker-derived values into an otherwise
+        final-estimation-only aggregate.
 
-Deferred, not built here (flagged, not silently dropped): `raw_omega_signed_2nd`
-(`REFACTOR_DESIGN.md` Task 3's column list) -- `_smooth_episode`
-(`final_estimation.py`) computes this internally
+Not built here, by design: a `raw_omega_signed_2nd` column --
+`final_estimation._smooth_episode` computes this quantity internally
 (`episode_sign * np.abs(np.angle(A)) / dt`) but does not currently expose
-it in `estimate_wave_final`'s return; adding it is a `final_estimation.py`
-change, out of scope for this stage's own deliverable (wiring the module
-that already exists, not extending it). `suppressed_waves.csv`
-(`REFACTOR_DESIGN.md` Task 3's proposed `kf_merge_log.csv` successor) is
-also deferred -- `kf_merge_log.csv` (`build_kf_merge_log`,
-`phase_speed_kalman.py`) already covers this ground under the old name and
-is unaffected by this stage; folding it into `wave_identity.py`'s own audit
-output is a `wave_identity.py` change, not an `output_schema.py` one.
+it in `estimate_wave_final`'s return, so there is nothing for this module
+to attach; exposing it would be a `final_estimation.py` change. A
+suppressed-waves table is also not built here -- `kf_merge_log.csv`
+(`phase_speed_kalman.build_kf_merge_log`) already covers equivalent ground
+under a different name and is unaffected by this module.
 """
 
 import numpy as np
@@ -67,10 +58,10 @@ def build_wave_frame_rows(
 
     All keyword arrays must already be aligned to the SAME full night grid
     `est_df` covers (one value per frame, `est_df`'s own row order) --
-    alignment (timestamp-based `searchsorted` against a per-wave, often
-    edge-trimmed KF slice) is the caller's responsibility, matching the
-    pattern `run_airglow_pipeline`'s Step 8b already uses for its own
-    per-wave animation-label arrays. No re-alignment is performed here.
+    alignment is the caller's responsibility (e.g. a timestamp-based
+    `searchsorted` when the source is a per-wave, edge-trimmed causal-KF
+    slice, as `run_airglow_pipeline` does for the `tuning_*` columns). No
+    re-alignment is performed here.
     """
     df = est_df.copy()
     df.insert(0, "wave_id", wave_id)
@@ -99,33 +90,25 @@ def build_wave_hourly_table(
 ) -> pd.DataFrame:
     """
     Hourly aggregate, built ONLY from `wave_frames.csv`'s `final_*` columns
-    -- `REFACTOR_DESIGN.md` Task 3's explicit requirement, the fix for
-    `kf_binned.csv`'s pre-existing mixing of first-pass-derived means with
-    amplitude-weighted final columns. Amplitude weighting uses
-    `raw_amplitude_2nd` (this pass's own signal amplitude), matching
-    `unified_validity_mask`'s established convention of each pass using its
-    own amplitude rather than a first-pass proxy
-    (`wave_identity.resolve_collisions`'s own "CONFIRMED DECISION" note).
+    -- deliberately not mixing in any first-pass or causal-tracker-derived
+    values. Amplitude weighting uses `raw_amplitude_2nd` (this pass's own
+    signal amplitude), matching `unified_validity_mask`'s convention of
+    each pass using its own amplitude rather than a first-pass proxy.
 
-    Bins are whole-hour-aligned (same fixed-epoch construction as the
-    existing `compute_binned_wave_stats`, for consistency), covering
+    Bins are whole-hour-aligned (fixed-epoch construction, matching
+    `phase_speed_kalman.compute_binned_wave_stats`), covering
     `[wave_frames['time'].min(), wave_frames['time'].max()]`. A bin with
     fewer than `min_valid_frames` valid frames reports NaN aggregates
-    (still keeping `n_frames_total`/`n_frames_valid`/`duty_cycle`), matching
-    `compute_binned_wave_stats`'s own `insufficient_data` handling.
+    (still keeping `n_frames_total`/`n_frames_valid`/`duty_cycle`).
 
     **A real, physically genuine wave can show a large `azimuth_deg_std`,
-    or adjacent hourly bins that differ by ~180 deg, within one `wave_id`**
-    (`implement_per_episode_defer_crossfamily.md`, following the direct
-    per-frame evidence in `doy144_wave7_reversal_investigation.md`):
+    or adjacent hourly bins that differ by ~180 deg, within one `wave_id`**:
     `final_estimation.py`'s lobe resolution keeps each episode's own
-    independently-resolved direction by default now (see
-    `final_estimation.py`'s own module docstring and
-    `SIGN_FRAC_DECISIVE_THRESHOLD`), rather than silently forcing every
-    episode of a wave to agree. A discontinuity here is `final_estimation.py`
-    correctly reporting a genuine mid-life direction reversal (DOY144
-    Family7: ~314 deg in its 07:00 hour, ~132 deg from 07:30 on) -- it is
-    the fix working as intended, not a data-quality problem, and should
+    independently-resolved direction by default (see that module's own
+    docstring and `SIGN_FRAC_DECISIVE_THRESHOLD`), rather than forcing
+    every episode of a wave to agree. A discontinuity here can be
+    `final_estimation.py` correctly reporting a genuine mid-life direction
+    reversal -- it is not automatically a data-quality problem and should
     not be mistaken for one when reading this table.
 
     Returns

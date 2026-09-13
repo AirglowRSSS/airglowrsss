@@ -1,127 +1,54 @@
 """
 final_estimation.py
 --------------------
-Step 5 of the five-step architecture (`refactor_foundation.md`): second-pass
-reconstruction -> final estimation. The step that was never actually built
-before this refactor -- "the actual deliverable," per `REFACTOR_DESIGN.md`'s
-own staging table, and the step whose output is the ONLY thing that reaches
-the permanent final schema (`refactor_foundation.md`'s persistence-boundary
-demand; `kernel_tuning.py`'s output stays diagnostic-only, never persisted).
-
-Design source: `STEP5_DESIGN_SCOPING.md` Tasks 2-4, built as specified
-there for the initial version, then revised several times:
-
-    - `stage4_fix_and_revalidate_task.md` Task 2: the initial version's
-      episode-agreement logic (flat per-episode unanimous vote) let a
-      single tiny, low-confidence episode -- as short as 3 frames, split
-      off from a much longer real presence by a 1-frame validity dropout
-      -- flip a whole wave's disagreement flag, diagnosed concretely
-      against DOY173 Family13 and three other cases
-      (`STAGE4_FINAL_ESTIMATION_KICKOFF.md`,
-      `stage4_fix_and_revalidate_task.md`'s own diagnosis). Replaced with
-      episode merging across short gaps (`merge_close_episodes`) plus a
-      frame-count-weighted majority vote (`resolve_wave_lobe`) -- this
-      part stands, see both functions' own docstrings for the full
-      reasoning.
-    - `stage4_reconsider_autoresolve_task.md` Task 1: that same round also
-      changed a wave to ALWAYS resolve to the majority-pooled azimuth
-      regardless of the disagreement flag. Reverted -- `STEP5_DESIGN_SCOPING.md`
-      Task 3 and an earlier explicit decision in this thread were both
-      clear that a genuinely-disagreeing wave gets flagged, not silently
-      resolved to a value presented as equally trustworthy. The actual bug
-      that had motivated the auto-resolve change (a validation script
-      naively averaging per-frame values across genuinely different
-      resolved hemispheres) was fixed in the script instead, where it
-      belonged.
-    - `doy144_wave7_reversal_investigation.md` /
-      `implement_per_episode_defer_crossfamily.md`: the pooled-by-default
-      policy the previous point reverted TO turned out to have its own,
-      more consequential failure mode -- DOY144 Family7, checked with
-      direct per-frame evidence, is a wave whose direction genuinely
-      reverses mid-life (two high-confidence episodes independently
-      resolving to opposite signs, ~132 deg and ~314 deg, not a noisy
-      fragment). Pooling silently forced the whole wave's earlier,
-      100%-confident episode to the OPPOSITE of its own resolved
-      direction, matching whichever episode had more frames -- exactly
-      the failure mode a genuine physical reversal produces, and neither
-      prior revision was built to distinguish it from ordinary noise
-      fragmentation. Each episode NOW keeps its own independently-resolved
-      azimuth/sign by default (see `resolve_wave_lobe`'s own docstring for
-      the confidence-based exception), and `lobe_disagreement`/
-      `lobe_majority_frac` become informational (how much a wave's
-      episodes vary) rather than a gate on whether per-episode truth
-      survives. `resolve_wave_lobe`'s pooled wave-level value is retained
-      as the fallback for an episode whose OWN evidence isn't decisive
-      *and* substantial enough to stand alone (see
-      `SIGN_FRAC_DECISIVE_THRESHOLD`/`SIGN_FRAC_DECISIVE_MIN_FRAMES` --
-      the first version of this fix used a confidence bar alone, found
-      wrong against DOY173 Family13's own 3-frame fragment before being
-      committed, see `SIGN_FRAC_DECISIVE_THRESHOLD`'s own docstring) --
-      not removed, repurposed.
+Produces the pipeline's authoritative final per-wave parameters (azimuth,
+wavelength, speed) from the second-pass reconstruction, after lobe
+disambiguation. This is the only module whose output reaches the permanent
+output schema -- `kernel_tuning.py`'s smoothed series are diagnostic-only
+kernel-construction inputs, never persisted.
 
 Pipeline within this module, per wave:
 
-    1. valid[t] = wave_identity.unified_validity_mask(...)   -- Task 2,
-       already built there, reused as-is.
-    2. episode = maximal contiguous run of valid[t] == True, THEN merged
-       across gaps <= 2 frames (`merge_close_episodes`)       -- Task 3,
-       revised per the fix above.
-    3. Per (merged) episode: averaged-sign lobe resolution (amplitude-
-       weighted mean axis, computed via a mod-180-aware unwrap across the
-       episode's time-ordered frames before averaging, to remove spurious
-       0/180-boundary jumps rather than let them corrupt the mean -- see
-       `_averaged_sign_lobe`'s own docstring for why -- + amplitude-
-       weighted mean sign of the raw, un-abs()-ed cross-correlation phase)
-       -- the exact method validated in SECOND_PASS_INDEPENDENT_ESTIMATION.md
-       against Family 6/13 (DOY173) and recalibrated/reconfirmed against
-       the same two cases in FULL_BATCH_PREVALENCE_BASELINE.md before this
-       module was built.
-    4. Each episode's smoothing fold-reference is its OWN resolved
-       azimuth/sign by default -- UNLESS that episode's own `sign_frac`
-       fails to clear `SIGN_FRAC_DECISIVE_THRESHOLD` OR it has fewer than
-       `SIGN_FRAC_DECISIVE_MIN_FRAMES` frames (both required -- a thin
-       episode's `sign_frac` is too easily pushed above a fixed bar by
-       chance to trust alone), in which case it falls back to the
-       frame-count-weighted pooled wave-level value (still computed
-       unconditionally by `resolve_wave_lobe`, no longer NaN'd out on
-       disagreement). `lobe_disagreement`/`lobe_majority_frac` are still
-       computed and reported per frame, now purely as a QC signal of how
-       much a wave's episodes vary -- not as the gate deciding whose
-       evidence survives into the final trajectory.
-    5. Per episode: offline-smooth orientation (raw per-frame arctan2,
-       folded toward whichever azimuth Step 4 assigned that episode --
-       that episode's own resolution in the normal case, the pooled
-       wave-level one only when that episode's own confidence is
-       indecisive -- never any founding value -- then np.unwrap()'d, then
-       RTS via smoothing.py's _forward_backward with circular=False -- the
-       fold-toward-founding behavior smooth_orientation() carries for
-       kernel_tuning.py's purposes is deliberately NOT reused here, per
-       Task 4's explicit instruction), wavelength (smooth_wavenumber(),
-       reused directly and unchanged -- Task 4: "no sign issue, no
-       episode-level disambiguation needed here"), and speed (the sign-
-       corrected omega -- via the new smooth_omega(), divided by the
-       smoothed k_h).
+    1. `valid[t]` = `wave_identity.unified_validity_mask(...)`.
+    2. Episodes = maximal contiguous runs of `valid[t] == True`, then
+       merged across short (<=2 frame) invalid gaps
+       (`merge_close_episodes`) -- a brief validity dropout should not
+       split one continuous physical presence into separate episodes.
+    3. Per merged episode: lobe (propagation-direction) resolution via
+       `_averaged_sign_lobe` -- an amplitude-weighted mean axis (with a
+       wrap-aware unwrap to avoid a spurious 0/180° boundary artifact; see
+       that function's docstring) plus an amplitude-weighted mean sign of
+       the raw cross-correlation phase.
+    4. Each episode's own resolved azimuth/sign is its default smoothing
+       fold-reference. An episode falls back to the wave-level pooled
+       value only when its OWN evidence isn't decisive on its own terms --
+       see `SIGN_FRAC_DECISIVE_THRESHOLD`/`SIGN_FRAC_DECISIVE_MIN_FRAMES`.
+       `lobe_disagreement`/`lobe_majority_frac` are reported per wave as a
+       QC signal of how much its episodes vary, not as a gate on which
+       episode's evidence is trusted.
+    5. Per episode: offline-smooth orientation (raw per-frame `atan2`,
+       folded toward that episode's own resolved azimuth, unwrapped, then
+       RTS-smoothed via `smoothing._forward_backward` with
+       `circular=False` -- deliberately not `smoothing.smooth_orientation`,
+       whose fold-toward-a-single-founding-value behavior is specific to
+       `kernel_tuning.py`'s needs), wavelength
+       (`smoothing.smooth_wavenumber`, unchanged -- no sign ambiguity, no
+       episode-level disambiguation needed), and speed (the sign-corrected
+       omega, via `smoothing.smooth_omega`, divided by the smoothed `k_h`).
 
-    A real, previously-unaddressed limitation, deliberately NOT tackled
-    here (`implement_per_episode_defer_crossfamily.md`): a genuine
-    physical reversal can apparently also span a temporal gap between TWO
-    separately-clustered family identities (DOY144 Family7/Family8 --
-    matching axis, continuous extrapolated rotation, adjacent-but-
-    non-overlapping ownership windows, no frame ever owned by both). This
-    module only ever sees one wave_id's own episodes; it has no mechanism
-    to connect two different families as one continuous physical wave --
-    that would require revisiting family identity itself (Stage A/B,
-    upstream of this module), a materially larger, separately-scoped
-    question. What's implemented above only fixes the WITHIN-one-wave_id
-    case.
+Known limitation, not addressed here: a genuine physical reversal can span
+a temporal gap between two separately-clustered wave/family identities
+(matching axis, continuous extrapolated rotation, adjacent-but-
+non-overlapping ownership windows). This module only ever sees one wave's
+own episodes and has no mechanism to connect two different wave identities
+as one continuous physical wave -- that would require revisiting family
+identity itself (`wave_identity.py`), a separately-scoped question.
 
-Output is per-frame (one row per wave per frame, valid or not) plus an
-hourly aggregate built from the same per-frame trajectory -- both from one
-underlying computation, per Task 4's own framing. An hourly bin can now
-show a real, accurate discontinuity for a genuinely-reversing wave (e.g.
-DOY144 Family7's ~314 deg early bin, ~132 deg later bins) rather than a
-smoothed-over single value -- this is the fix working as intended, not a
-data-quality problem, and should not be mistaken for one.
+Output is per-frame (one row per wave per frame, valid or not); an hourly
+aggregate is built downstream from the same per-frame trajectory
+(`output_schema.py`). A genuinely reversing wave can produce a real,
+accurate discontinuity between adjacent hourly bins -- see
+`output_schema.build_wave_hourly_table`'s docstring.
 """
 
 import numpy as np
@@ -167,27 +94,16 @@ def merge_close_episodes(episodes: list, max_gap: int = 2) -> list:
     Bridge episodes separated by a short invalid gap (<= max_gap frames)
     into one episode, before lobe resolution runs.
 
-    Added per `stage4_fix_and_revalidate_task.md` Task 2, alongside the
-    frame-weighted vote in `resolve_wave_lobe` below -- diagnosed as
-    genuinely necessary, not redundant with weighting: a single transient
-    1-frame validity dropout (a momentary SNR dip or a collision-check
-    hiccup) splitting one continuous 100+-frame physical presence into
-    fragments looks like a definitional problem with what counts as "one
-    episode," not a voting-weight problem -- weighting a 3-frame fragment
-    down still treats it as a *separate, disagreeing* episode; merging
-    treats it correctly as part of the SAME episode it was always
-    physically part of. Confirmed on DOY173 Family13
-    (`STAGE4_FINAL_ESTIMATION_KICKOFF.md`'s worked example): its 3
-    episodes `(64,107),(109,111),(113,135)` are separated by exactly
-    1-frame gaps (108, 112) and merge into one `(64,135)` episode here,
-    resolving its spurious disagreement flag by construction, without
-    needing the vote-weighting fix at all for this specific case.
+    This is a definitional fix, not a substitute for frame-count-weighted
+    voting (see `resolve_wave_lobe`): a single transient validity dropout
+    (a momentary SNR dip or a collision-check hiccup) splitting one
+    continuous physical presence into fragments is a "what counts as one
+    episode" problem, not a vote-weighting problem -- down-weighting a
+    fragment still treats it as a separate, potentially-disagreeing
+    episode, while merging correctly treats it as part of the episode it
+    was always physically part of.
 
-    `max_gap=2` matches the task's own suggested "1-2 frames" range --
-    not independently re-derived here; a genuine judgment call, not an
-    empirically-fitted threshold (this session's own standing lesson from
-    `FULL_BATCH_PREVALENCE_BASELINE.md`'s `sign_frac` finding: don't dress
-    up a chosen cutoff as more validated than it is).
+    `max_gap=2` is a judgment call (not an empirically-fitted threshold).
 
     A merged episode's returned span still includes the short invalid gap
     frame(s) in its `(t_start, t_end)` range -- downstream lobe resolution
@@ -227,58 +143,21 @@ def merge_close_episodes(episodes: list, max_gap: int = 2) -> list:
 def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
     """
     Averaged-sign lobe resolution over an arbitrary set of frame indices
-    `idx` (an episode's own contiguous range, or the pooled union of all
-    of a wave's episodes when they agree). Method validated in
-    SECOND_PASS_INDEPENDENT_ESTIMATION.md / recalibrated in
-    FULL_BATCH_PREVALENCE_BASELINE.md against DOY173 Family13/Family6.
+    `idx` (an episode's own contiguous range, or the pooled union of all of
+    a wave's episodes).
 
-    **Wrap-boundary fix** (`stage4_synthetic_sweep_and_movie_status.md`
-    Task 1's own synthetic full-circle sweep, az_true=0 case -- caught by
-    the sweep this task exists to run, not by any real-data check). Two
-    earlier fix attempts were tried and rejected, each with direct evidence,
-    not assumption:
-
-    1. "Fold every frame toward the highest-amplitude frame's own axis"
-       failed the identical synthetic case, because the reference frame it
-       folded toward could ITSELF be on the wrong side of the wrap -- the
-       ambiguity just moved, it didn't go away.
-    2. "Never take `% 180` before averaging -- average the RAW arctan2
-       output directly via a full-360-degree circular mean, then reduce to
-       [0,180) once at the end" fixed the synthetic case (44/44 sweep) but
-       broke real data catastrophically: re-validating against DOY173
-       Family6/Family13 (the two independently-established ground-truth
-       cases this whole module was calibrated against) showed the result
-       flipped by ~172/170 degrees from the already-verified-correct
-       values, and the same near-exact 180-degree flip showed up in 43 of
-       46 checked waves across the full named-target validation set. Root
-       cause, confirmed by direct inspection rather than assumed: real
-       per-frame k-vectors genuinely DO straddle the mod-180 axis
-       ambiguity across a episode's frames (that's the whole reason axis
-       values need a mod-180 reduction at all -- a spatial gradient can't
-       tell a wave from its 180-degree opposite). The synthetic test's
-       tight, single-cluster raw theta was an artifact of how the test
-       constructed kx/ky (always from one small perturbation of a fixed
-       true axis, never flipping) -- not representative of real data,
-       where treating raw, un-reduced theta as safe to average directly is
-       simply wrong in general.
-
-    **Actual fix**: keep the mod-180 axis reduction (still necessary and
-    correct for real per-frame data), but eliminate the ARTIFICIAL 0/180
-    boundary jump it manufactures between frames whose true axis sits near
-    that boundary -- via `np.unwrap` on the DOUBLED mod-180 axis, over the
-    frames in their natural time order. Doubling maps the mod-180 (mod-pi)
-    period up to a full mod-360 (2*pi) period, which is what `np.unwrap`'s
-    default discontinuity threshold expects; it then walks the time-ordered
-    sequence and removes any jump close to a full period, exactly the
-    boundary-noise artifact this bug is about, while correctly leaving a
-    genuine large change in axis over time alone (real per-frame data can
-    still have both). Halving back afterward recovers the axis on its
-    true mod-180 scale, free of the spurious jump, safe to average
-    directly. Verified against both the synthetic full-circle sweep (44/44,
-    including the az_true=0 case this was written for) and reproduces the
-    OLD, already-validated values for DOY173 Family6 (208.60 vs 208.70 deg)
-    and Family13 (9.15 vs 9.20 deg) to within 0.1 degree -- unlike the
-    rejected full-circle-average attempt, which put both ~170 degrees off.
+    Averaging a raw mod-180 axis directly can manufacture a spurious ~180°
+    jump for frames whose true axis sits near the 0/180° boundary -- mod-180
+    reduction is still necessary (a spatial gradient can't distinguish a
+    wave from its 180°-opposite), but naively averaging the reduced values
+    treats a wrap-boundary artifact as a real change. The fix: double the
+    mod-180 axis (mapping its 180°-periodic wrap onto a full 360° period),
+    `np.unwrap` that doubled series over the frames in time order (removing
+    only near-full-period jumps, i.e. the wrap artifact, while leaving a
+    genuine gradual change in axis alone), then halve back before
+    averaging. The propagation sign is resolved separately, as the
+    amplitude-weighted mean sign of the raw (not `abs()`-ed) cross-
+    correlation phase.
 
     Returns None if fewer than 1 usable frame.
     """
@@ -313,13 +192,11 @@ def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
     agree = (np.sign(angle_signed) == overall_sign)
     sign_frac = float(np.sum(amp_w[agree]) / np.sum(amp_w))
 
-    # CALIBRATED convention (FULL_BATCH_PREVALENCE_BASELINE.md, confirmed
-    # against both DOY173 sanity cases independently): positive overall
-    # sign -> axis as-is; negative -> axis + 180. Combined using the
-    # UNWRAPPED mean (mean_axis_unwrapped), not the canonical [0,180) one
-    # (mean_axis) -- re-applying %180 first would reintroduce the exact
-    # ambiguity this fix removes, right before the +180 adjustment needs
-    # a stable value to work from.
+    # Sign convention: positive overall sign -> axis as-is; negative ->
+    # axis + 180. Combined using the UNWRAPPED mean (mean_axis_unwrapped),
+    # not the canonical [0,180) one (mean_axis) -- re-applying %180 first
+    # would reintroduce the exact ambiguity the unwrap fix above removes,
+    # right before the +180 adjustment needs a stable value to work from.
     azimuth_deg = (mean_axis_unwrapped if overall_sign > 0 else mean_axis_unwrapped + 180.0) % 360.0
 
     return dict(axis_deg=mean_axis, azimuth_deg=azimuth_deg, sign=overall_sign,
@@ -328,102 +205,50 @@ def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
 
 MINORITY_DISAGREEMENT_FRAC = 0.30
 """
-Disagreement threshold for `resolve_wave_lobe`: flag when the minority
-sign's share of total valid frames exceeds this.
+Governs `resolve_wave_lobe`'s `disagreement` flag: True when the minority
+sign's share of a wave's total valid frames (across all its episodes)
+exceeds this fraction. Empirically positioned at a low-density point in
+the observed distribution of per-wave minority fractions, separating
+confident near-unanimous waves from genuinely near-even splits.
 
-Empirically positioned, not just a small-sample-fitted guess --
-`stage4_reconsider_autoresolve_task.md` Task 2 computed `minority_frac`
-for all 227 waves in the full 2022 LOW batch (DOY143-159) and found a real
-bimodal distribution: 74.4% of waves cluster below 0.05 minority
-(confident, near-unanimous), a second mode (9.7%) sits at 0.35-0.50
-(genuinely near-even splits), and 0.20-0.35 is a real low-density valley
-between them (10 of 227 waves), with the single sparsest bin at exactly
-0.30-0.35 (1 wave) -- a genuine natural separation, unlike `sign_frac`'s
-smooth, non-separating distribution at any cutoff from 0.5-0.9
-(`FULL_BATCH_PREVALENCE_BASELINE.md`). An initial value of 0.20 (chosen
-from 4 diagnosed cases before the full-batch check existed) sat at the
-valley's edge rather than its center; moved to 0.30 here, matching the
-distribution's actual sparsest point
-(`stage4_final_threshold_closeout.md` Task 1) -- affects ~9 of 227 waves
-relative to 0.20, all within the low-density valley itself, not a
-wholesale reclassification.
-
-Checked against the diagnosed cases before either value was adopted:
-cleanly separates DOY150 Family4 (5% minority after merging -> resolves,
-matches its established ~13 deg direction) from DOY144 Family7 (43%),
-DOY154 Family5 (34%), and DOY154 Family14 (45%) (all stay flagged --
-genuinely close splits, not fragmentation artifacts; Family5 additionally
-reproduces FULL_BATCH_PREVALENCE_BASELINE.md's own flagged=True finding
-for that wave).
-
-No longer gates whether a wave-level answer is asserted (see
-`SIGN_FRAC_DECISIVE_THRESHOLD` and `resolve_wave_lobe`'s own docstring,
-`implement_per_episode_defer_crossfamily.md`) -- `disagreement`/
-`majority_frac` are still computed and reported exactly as before, now
-purely as a QC signal of how much a wave's episodes vary.
+Purely informational -- does not gate which episode's own resolved
+azimuth/sign is used in the final trajectory (see
+`SIGN_FRAC_DECISIVE_THRESHOLD` for the condition that actually governs
+that). `disagreement`/`majority_frac` are reported as a QC signal of how
+much a wave's episodes vary.
 """
 
 SIGN_FRAC_DECISIVE_THRESHOLD = 1.0 - MINORITY_DISAGREEMENT_FRAC
 """
 Per-episode confidence bar: an episode's OWN `sign_frac` (from
-`_averaged_sign_lobe`, amplitude-weighted agreement with its own resolved
-sign) must clear this to stand alone as its own smoothing fold-reference
-in `estimate_wave_final`. Below it, the episode falls back to the pooled
-wave-level value instead -- not because it disagrees with the wave's
-majority (that alone is no longer disqualifying, see
-`doy144_wave7_reversal_investigation.md` Task 3), but because ITS OWN
-evidence isn't decisive enough to trust on its own terms, independent of
-what any other episode says.
+`_averaged_sign_lobe` -- amplitude-weighted agreement with its own
+resolved sign) must clear this to stand alone as its own smoothing
+fold-reference in `estimate_wave_final`. Below it, the episode falls back
+to the pooled wave-level value instead -- not because it disagrees with
+the wave's majority (that alone is not disqualifying), but because its
+own evidence isn't decisive enough to trust independent of what any other
+episode says.
 
-Deliberately reuses `1 - MINORITY_DISAGREEMENT_FRAC` (0.70) rather than
-inventing a second, unrelated constant -- both thresholds answer "is this
-evidence decisive," just measured on different populations (frame-count
-share of the whole wave, vs. amplitude-weighted sign agreement within one
-episode); anchoring them to the same number keeps the module's notion of
-"decisive" consistent rather than accidentally introducing two
-independently-tunable, uncalibrated bars.
+Reuses `1 - MINORITY_DISAGREEMENT_FRAC` (0.70) rather than an independent
+constant, since both thresholds answer "is this evidence decisive,"
+just measured on different populations (frame-count share of the whole
+wave vs. amplitude-weighted sign agreement within one episode).
 
-**`sign_frac` alone is not sufficient -- found directly, not assumed,
-exactly the "sanity check against available cases" the design doc called
-for.** The initial single-condition version of this rule was checked
-against DOY173 Family13 -- the same real named wave this whole module's
-lobe-sign convention was calibrated against -- and found wrong: a genuine
-3-frame minority sub-episode (frames 51-53, `sign_frac=0.813`) cleared
-0.70 and asserted its own ~194 deg value against the dominant 70-frame
-episode's ~8 deg, a real, wrong-looking discontinuity for one of the two
-ground-truth anchor cases. `sign_frac` on a 3-frame sample is a fragile
-statistic -- easily pushed above a fixed bar by chance, not because the
-evidence is genuinely strong. See `SIGN_FRAC_DECISIVE_MIN_FRAMES` for the
-fix: this threshold and a frame-count floor are BOTH required.
+`sign_frac` alone is not sufficient to decide this reliably: it's a
+fragile statistic on a short episode (a 3-4 frame episode can clear a
+0.70 bar by chance alone) -- see `SIGN_FRAC_DECISIVE_MIN_FRAMES`, which
+this threshold requires alongside a minimum frame count.
 """
 
 SIGN_FRAC_DECISIVE_MIN_FRAMES = 5
 """
 Companion to `SIGN_FRAC_DECISIVE_THRESHOLD`: an episode must ALSO have at
-least this many frames to stand alone -- `sign_frac` on too few frames is
-too easily pushed above a fixed threshold by chance to trust on its own
-(found directly against DOY173 Family13, see `SIGN_FRAC_DECISIVE_THRESHOLD`'s
-own docstring). Matches this module's own pre-existing precedent for what
-counts as "too small to trust": `resolve_wave_lobe`'s docstring already
-cites DOY173 Family13's original diagnosis -- "purely because a 3-frame
-middle fragment disagreed" -- as the motivating case for frame-count-weighted
-voting in the first place. 5 is chosen to exclude that case and the several
-1-2-frame degenerate episodes found in the same audit (a 1-frame episode's
-`sign_frac` is trivially 1.000, agreeing with itself, and carries no real
-statistical weight at all) while still comfortably including DOY144
-Family7's real motivating case (12 and 50 frames respectively).
-
-Checked against the available named cases (`implement_per_episode_defer_
-crossfamily.md`, re-verified after adding this floor, not assumed correct
-on the first try): DOY144 Family7's both episodes (12, 50 frames) clear
-both bars and correctly preserve their own genuine reversal; DOY173
-Family13's 3-frame fragment now correctly falls back to the pooled value,
-restoring its established ~9 deg behavior. Like `SIGN_FRAC_DECISIVE_THRESHOLD`,
-not independently re-derived from a full-batch sweep the way
-`MINORITY_DISAGREEMENT_FRAC` was -- flagged as the shape of the rule, not a
-finally calibrated threshold; a case with a genuinely short (4-5 frame)
-but real reversal, if one exists in the batch, would be the next thing to
-check this against.
+least this many frames to stand alone. `sign_frac` computed on very few
+frames is too easily pushed above a fixed threshold by chance to trust on
+its own -- a 1-frame episode's `sign_frac` is trivially 1.000 (it agrees
+with itself by construction) and carries no real statistical weight. 5 is
+a judgment call, not a value independently re-derived from a full-batch
+sweep the way `MINORITY_DISAGREEMENT_FRAC` was.
 """
 
 
@@ -431,41 +256,19 @@ def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
                        minority_disagreement_frac: float = MINORITY_DISAGREEMENT_FRAC) -> dict:
     """
     Resolve one wave's propagation lobe across all its episodes, via a
-    frame-count-weighted majority vote -- NOT a flat per-episode unanimous
-    check (`stage4_fix_and_revalidate_task.md` Task 2: the original flat
-    vote let a handful of tiny, low-confidence episodes carry the same
-    weight as one long, confident episode, flagging DOY173 Family13 --
-    two long flanking episodes both landing within ~9 deg of the correct
-    direction -- purely because a 3-frame middle fragment disagreed).
+    frame-count-weighted majority vote across episodes (not a flat
+    per-episode unanimous check, which would let a handful of tiny,
+    low-confidence episodes carry the same weight as one long, confident
+    one).
 
-    **Revised again per `implement_per_episode_defer_crossfamily.md`**: an
-    earlier version of this function asserted the pooled wave-level azimuth
-    only when NOT `disagreement`, reasoning that a genuinely-disagreeing
-    wave should get no wave-level answer at all rather than one "presented
-    as if it were as trustworthy as any other result." That reasoning
-    still holds for what it was built to prevent (silently averaging over
-    a real disagreement) -- but direct evidence
-    (`doy144_wave7_reversal_investigation.md`) found it had its own,
-    larger failure mode: DOY144 Family7's `majority_frac` (0.8065) sat just
-    under the flagging bar, so `disagreement` was `False` and the pooled
-    azimuth WAS asserted and used -- silently overwriting an entire
-    100%-confident, independently-resolved episode with the OPPOSITE of
-    its own evidence, precisely because a genuine physical reversal
-    produces exactly the frame-count pattern (one longer episode
-    outweighing one shorter, oppositely-signed one) this majority vote was
-    built to resolve. The pooled value is no longer used to overwrite an
-    episode's own resolution based on `disagreement` alone -- see
-    `SIGN_FRAC_DECISIVE_THRESHOLD` for the narrower condition
-    `estimate_wave_final` now actually uses it for (an episode whose own
-    evidence isn't decisive on its own terms).
-
-    `wave_azimuth_deg`/`wave_sign_frac` are therefore now computed and
-    returned unconditionally (no longer NaN'd out when `disagreement` is
-    True) -- callers that want "only give me a number when the wave agrees
-    with itself" should check `disagreement` explicitly rather than relying
-    on NaN, since this function no longer makes that decision for them.
-    Each episode still gets its own independently-resolved azimuth/sign
-    (`ep_results`) regardless.
+    `wave_azimuth_deg`/`wave_sign_frac` (the frame-weighted pooled result)
+    are always computed and returned, even when `disagreement` is True --
+    this function does not decide whether the pooled value is trustworthy
+    for a given caller's purpose; see `SIGN_FRAC_DECISIVE_THRESHOLD` for
+    the condition `estimate_wave_final` actually uses to decide, per
+    episode, whether to use its own resolution or fall back to this pooled
+    value. Each episode also gets its own independently-resolved
+    azimuth/sign (`ep_results`) regardless of the pooled outcome.
 
     Returns
     -------
@@ -670,10 +473,10 @@ def estimate_wave_final(
         Stage B's per-frame ownership answer.
     collision_primary_full : ndarray bool (n_time,)
         Stage C's per-frame collision outcome, aligned to the SAME full
-        night grid as everything else (caller's responsibility -- see
-        this module's verification script for the timestamp-based
-        alignment pattern required to build this correctly from
-        kf_results, which uses a different, edge-trimmed grid).
+        night grid as everything else -- alignment is the caller's
+        responsibility (`kf_results`, if used as a source, is on a
+        different, edge-trimmed grid and needs a timestamp-based
+        realignment first).
     snr_min_amplitude : float
         Passed to `unified_validity_mask` and the smoothing calls.
     min_episode_frames : int
@@ -711,20 +514,13 @@ def estimate_wave_final(
 
     for eid, ep in enumerate(lobe["episodes"]):
         t0, t1 = ep["t_start"], ep["t_end"]
-        # Per-episode azimuth/sign for smoothing's fold reference: each
-        # episode's OWN independently-resolved azimuth/sign BY DEFAULT --
-        # not the wave-level pooled value, and not gated on
-        # `lobe["disagreement"]` -- per `implement_per_episode_defer_
-        # crossfamily.md`, replacing the pool-when-agreeing policy that
-        # silently overwrote DOY144 Family7's genuinely-reversing early
-        # episode with the opposite of its own 100%-confident evidence
-        # (see resolve_wave_lobe's own docstring). Falls back to the
-        # pooled wave-level value when this episode's own sign_frac isn't
-        # decisive AND substantial enough to trust on its own terms
-        # (SIGN_FRAC_DECISIVE_THRESHOLD + SIGN_FRAC_DECISIVE_MIN_FRAMES --
-        # both required, see their own docstrings for why a sign_frac bar
-        # alone isn't sufficient) -- a narrower, per-episode condition, not
-        # the old wave-wide disagreement gate.
+        # Each episode's own independently-resolved azimuth/sign is used by
+        # default (not the wave-level pooled value, and not gated on
+        # lobe["disagreement"]). Falls back to the pooled wave-level value
+        # only when this episode's own evidence isn't both decisive and
+        # substantial enough to trust alone -- SIGN_FRAC_DECISIVE_THRESHOLD
+        # + SIGN_FRAC_DECISIVE_MIN_FRAMES, both required (see their own
+        # docstrings for why a confidence bar alone isn't sufficient).
         if (ep["sign_frac"] >= SIGN_FRAC_DECISIVE_THRESHOLD
                 and ep["n_frames"] >= SIGN_FRAC_DECISIVE_MIN_FRAMES):
             ep_azimuth = ep["azimuth_deg"]

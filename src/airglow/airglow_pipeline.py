@@ -5,19 +5,22 @@ airglow_pipeline.py
 
 Covers the complete analysis chain from a single HDF5 file to outputs:
 
-    1. Data loading & preprocessing       (_load_real_data — fill in your loader)
+    1. Data loading & preprocessing       (_load_real_data, MANGO HDF5 loader)
     2. Sliding-window omega-k analysis    (parallel across windows)
     3. Wave family grouping               (wave_identity.cluster_detections_into_families)
     4. Per-frame parameter interpolation  (wave_identity.resolve_frame_ownership)
     5. Adaptive Gabor reconstruction      (reconstruct_all_waves)
     6. Omega-k cross-validation           (Pearson r per frame)
-    7. Kalman tracking (speed / orientation / wavelength)
-    8. Plots: family timeseries, ownership, KF timeseries, correlation, scatter
-    9. Animation (parallel frame rendering → ffmpeg mp4)
+    7. Kalman tracking (speed / orientation / wavelength) -- causal, legacy-comparison only
+    8. Second-pass reconstruction + collision resolution + final estimation
+       (kernel_tuning.py, wave_identity.resolve_collisions, final_estimation.py)
+       -> wave_frames.csv / wave_hourly.csv (output_schema.py), the
+       authoritative output
+    9. Plots and animation (parallel frame rendering -> ffmpeg mp4)
 
 Typical usage — multi-night loop:
 
-    from airglow_pipeline import run_airglow_pipeline
+    from airglow.airglow_pipeline import run_airglow_pipeline
     from datetime import datetime
 
     nights = [
@@ -837,17 +840,14 @@ def _write_kf_table(
 def _merge_collision_result_into_kf_results(kf_results, collisions, n_waves, time_vals):
     """
     Write `wave_identity.resolve_collisions`'s output into `kf_results` as
-    the same four columns `flag_kf_wave_collisions_by_correlation` used to
-    add in place -- `resolve_collisions` returns its own complete
-    DataFrame (one row per wave_id x frame_idx, every frame on the full
-    night grid) rather than annotating the caller's `kf_results` directly
-    (a deliberate structural fix over the ported original, see
-    `resolve_collisions`'s own docstring), so the two have to be merged by
-    timestamp rather than by row position: `kf_results` only covers the
-    edge-trimmed slice `analyze_all_waves_kalman` produces, not the full
-    grid `collisions` is built on. Same timestamp-based `searchsorted`
-    alignment used throughout this module (e.g. Step 8b's own per-wave
-    array construction) -- not a new alignment mechanism.
+    four columns (`collision_id`, `collision_group_wave_ids`,
+    `collision_primary_wave_id`, `collision_primary`). `resolve_collisions`
+    returns its own complete DataFrame (one row per wave_id x frame_idx,
+    every frame on the full night grid) rather than annotating a caller's
+    table directly, so the two have to be merged by timestamp rather than
+    by row position: `kf_results` only covers the edge-trimmed slice
+    `analyze_all_waves_kalman` produces, not the full grid `collisions` is
+    built on.
 
     Parameters
     ----------
@@ -1098,12 +1098,12 @@ def run_airglow_pipeline(
         Smoothed per-frame Pearson r, between two waves' second-pass Gabor
         reconstructions, at or above which they're judged to be
         reconstructing the same physical structure (see
-        flag_kf_wave_collisions_by_correlation). Default 0.7 -- calibrated
-        empirically on real data, not check_duplicate_waves's 0.5 (see
+        `wave_identity.resolve_collisions`). Default 0.7 -- calibrated
+        empirically on real data, not `check_duplicate_waves`'s 0.5 (see
         that function's docstring for why).
     frame_dpi : int
-        DPI for animation frames (72 = fast preview, 100 = matches
-        CaseStudy_RealData_OneNight.ipynb's movie rendering, 150 = publication).
+        DPI for animation frames (72 = fast preview, 100 = standard,
+        150 = publication).
     movie_fps : int
         Output mp4 frame rate.
     make_animation : bool
@@ -1258,11 +1258,6 @@ def run_airglow_pipeline(
     )
 
     # ── Step 3: Wave family grouping ──────────────────────────────────────────
-    # wave_identity.py Stage A (`cluster_detections_into_families`), not the
-    # original `build_wave_families` -- confirmed byte-for-byte identical
-    # port (`verify_wave_identity.py`, all 5 reference nights: exact match
-    # on family count, member count, and all three centroid values). Swap
-    # per `commit_and_activate_wave_identity.md` Step 2.
     _vprint("[3/9] Wave family grouping ...")
     with _maybe_quiet(verbose):
         families = cluster_detections_into_families(
@@ -1338,14 +1333,11 @@ def run_airglow_pipeline(
     gabor_btheta   = gabor_btheta_full / 2.0
     full_time_grid = time_vals.astype("datetime64[ns]")
 
-    # wave_identity.py Stage B (`resolve_frame_ownership`), not the original
-    # `build_waves_for_gabor` -- NOT byte-for-byte identical (its founding
-    # seed values use angles.circular_mean_axis_deg/circular_mean_full_deg
-    # instead of np.median, a deliberate wrap-boundary fix), but the
-    # difference is already measured and bounded (`STAGE1_FINAL_CHECKS.md`
-    # Check 1: DOY173 unaffected, DOY144/150/157 shift a handful of named
-    # waves by a few degrees). Swap per
-    # `commit_and_activate_wave_identity.md` Step 2 -- re-validated below.
+    # Each wave's founding seed values (orientation_deg/azimuth) use
+    # angles.circular_mean_axis_deg/circular_mean_full_deg rather than a
+    # plain median -- see resolve_frame_ownership's own docstring for why
+    # a median can be wrong for a family whose members straddle the
+    # 0/180 or 0/360 wrap boundary.
     with _maybe_quiet(verbose):
         waves_detected = resolve_frame_ownership(
             families      = families,
@@ -1571,19 +1563,17 @@ def run_airglow_pipeline(
     _t_full_ns = time_vals.astype("datetime64[ns]").astype(np.int64)
     waves_kf   = []
 
-    # wave_identity.py Stage 3 (`kernel_tuning.build_kernel_tuning_signal`),
-    # not the causal `analyze_all_waves_kalman` output, drives the
-    # second-pass Gabor kernel -- per `KERNELTUNING_ACTIVATION_SCOPE.md`.
-    # Reuses the causal KF call's own already-sliced inputs (`cmplx_sl`,
-    # `kx_obs_sl`, `ky_obs_sl`, `time_kf`, `dt_seconds`) -- no new
-    # edge-alignment scheme needed, and matches the exact slice
-    # `STAGE3_KERNEL_TUNING.md`'s own RMS verification used. `kf_results`
-    # (the causal tracker) keeps running unchanged for `kf_results.csv`/
-    # `kf_binned.csv` -- only kernel construction's own input source
-    # changes. The movie's animation labels no longer come from
-    # `kf_results` at all -- see the Step 9 prep block further below,
-    # which sources them from `wave_frames` (final_estimation.py's own
-    # output) instead, per Stage 6's activation.
+    # kernel_tuning.build_kernel_tuning_signal's offline-smoothed signal --
+    # not the causal analyze_all_waves_kalman output -- drives the
+    # second-pass Gabor kernel. Reuses the causal KF call's own
+    # already-sliced inputs (`cmplx_sl`, `kx_obs_sl`, `ky_obs_sl`,
+    # `time_kf`, `dt_seconds`), so no separate edge-alignment scheme is
+    # needed. `kf_results` (the causal tracker) keeps running unchanged
+    # for `kf_results.csv`/`kf_binned.csv` -- only kernel construction's
+    # own input source changes. The movie's animation labels no longer
+    # come from `kf_results` at all -- see the Step 9 prep block further
+    # below, which sources them from `wave_frames` (final_estimation.py's
+    # own output) instead.
     with _maybe_quiet(verbose):
         tuning_signal = build_kernel_tuning_signal(
             waves               = waves_detected,
@@ -1628,42 +1618,28 @@ def run_airglow_pipeline(
         )
     _vprint("  Second-pass reconstruction complete.")
     # complex_amp_2nd/kx_2nd/ky_2nd (per-wave, per-frame second-pass phasor
-    # and spatial phase gradient) used to be discarded here (`_, _, _`) --
-    # kept now, Stage 5's own raw material (`final_estimation.py`,
-    # `STEP5_DESIGN_SCOPING.md` Task 1: "Step 5 needs only to keep what's
-    # already being computed").
+    # and spatial phase gradient) are kept -- they're final_estimation.py's
+    # own raw material for Stage 5, not discarded.
 
     # ── Step 8b-ownership-gate: zero wave_cubes_kf for frames a wave doesn't
     #    legitimately own ──────────────────────────────────────────────────
     # Mirrors the first pass's own NaN-orientation-series -> cube[t] = 0.0
     # pattern (gabor_reconstruction.py's _reconstruct_adaptive), which the
-    # second pass never had. waves_kf's orientation_deg_series/
-    # wavelength_km_series come from the causal KF, which COASTS through
-    # frames a wave doesn't own (producing a finite, not NaN, per-frame
-    # value) -- so without this gate the second-pass kernel still gets
-    # built and applied there, reconstructing whatever real signal happens
-    # to fall in a nearby wave's passband under this wave's own
-    # frozen/stale label. This is the root cause FAMILY13_INVESTIGATION.md
-    # traced the borrowed-signal symptom to (Family 13 visually showing
-    # Family 6's real signal during its own unowned early-night span).
+    # second pass doesn't get for free. waves_kf's orientation_deg_series/
+    # wavelength_km_series come from kernel_tuning.py's offline smoother,
+    # which produces a finite (not NaN) value at every frame in its input
+    # slice regardless of ownership -- so without this gate, the
+    # second-pass kernel still gets built and applied on frames this wave
+    # doesn't own, reconstructing whatever real signal happens to fall in
+    # a nearby wave's passband under this wave's own stale label.
     # waves_detected[i]['_owned_mask'] (Stage B's own per-frame ownership
-    # answer, structural and pass-independent, unaffected by which pass is
-    # reconstructing) is the correct gate.
+    # answer, structural and pass-independent) is the correct gate.
     #
-    # Must run HERE, before Step 8b-collision-check below, not after --
-    # confirmed with direct evidence (stage4_kickoff_task.md Task 2), not
-    # assumed: on DOY 173, running collision-check on the UNGATED cubes
-    # flags Family 13 as "in a collision episode" for 41 rows, 28 of which
-    # are on frames it doesn't even own (spurious contamination from its
-    # own borrowed-signal artifact, not a real collision). Gating first
-    # drops this to 13 flagged rows, ALL on legitimately-owned frames --
-    # zero contamination. This isn't just a cleaner kf_results/
-    # kf_merge_log record either: gating order changes the actual
-    # collision-suppression OUTCOME for other waves too (up to 8 waves on
-    # DOY 173 alone showed a materially different final wave_cubes_kf
-    # depending on ordering), because an unowned wave's spurious signal can
-    # otherwise distort which wave "wins" a correlation-based collision
-    # against it.
+    # Must run HERE, before Step 8b-collision-check below, not after: an
+    # unowned wave's borrowed-signal artifact can otherwise get flagged as
+    # a real "collision" with the wave whose signal it borrowed, and can
+    # also distort which wave wins a correlation-based collision it's not
+    # actually part of.
     for _wi, _wave in enumerate(waves_detected):
         _owned = _wave.get("_owned_mask")
         if _owned is not None:
@@ -1672,14 +1648,10 @@ def run_airglow_pipeline(
 
     # ── Step 8b-collision-check: cross-correlate the second-pass reconstructions ─
     # Must run here, not before Step 8b, since it needs wave_cubes_kf to exist.
-    # wave_identity.py Stage C (`resolve_collisions`, `apply_duplicate_gate=False`),
-    # not the original `flag_kf_wave_collisions_by_correlation` -- confirmed
-    # byte-for-byte identical for the second pass (`resolve_collisions`'s own
-    # docstring: exact regression match across all 5 reference nights). Swap
-    # per `commit_and_activate_wave_identity.md` Step 2. Second-pass calls
-    # MUST pass `apply_duplicate_gate=False` -- see `resolve_collisions`'s
-    # own docstring; first-pass `check_duplicate_waves` above is untouched,
-    # deliberately out of scope for this swap.
+    # `apply_duplicate_gate=False` is required for this second-pass call --
+    # see `resolve_collisions`'s own docstring for why. `check_duplicate_waves`
+    # (the first-pass check, above) is a separate, deliberately untouched
+    # mechanism.
     with _maybe_quiet(verbose):
         _collisions_2nd = resolve_collisions(
             waves_kf, wave_cubes_kf, complex_amp_2nd, time_vals,
@@ -1701,7 +1673,7 @@ def run_airglow_pipeline(
     # The only persisted record of which (wave, frame) rows were judged
     # duplicates -- everything else from the collision check (the Gantt plot,
     # the composite_kf suppression below) is either a picture or an in-memory
-    # effect. Written here, after flag_kf_wave_collisions_by_correlation, so
+    # effect. Written here, after the collision merge-back above, so
     # collision_id/collision_group_wave_ids/collision_primary/
     # collision_primary_wave_id are already populated.
     _kf_results_path = str(results_dir / f"{stem}_kf_results.csv")
@@ -1709,16 +1681,14 @@ def run_airglow_pipeline(
     output_paths["kf_results_csv"] = _kf_results_path
 
     # ── Step 5: Final estimation (offline, second-pass) ────────────────────────
-    # Connects final_estimation.py (Stage 4) to the live pipeline for the
-    # first time -- REFACTOR_DESIGN.md's staged plan, row 5. Runs per wave,
-    # on the same second-pass kx_2nd/ky_2nd/complex_amp_2nd this Step 8b
-    # call already computed (kept above, not recomputed), the same
-    # per-frame ownership (`_owned_mask`) Step 8b-ownership-gate above
-    # already used, and this pass's own now-finalized collision_primary
-    # (post flag_kf_wave_collisions_by_correlation). Output schema:
-    # wave_frames.csv (per-frame) + wave_hourly.csv (hourly, final_*-only
-    # aggregate) via output_schema.py, per REFACTOR_DESIGN.md Task 3's
-    # clean-break design.
+    # Runs final_estimation.py per wave, on the same second-pass
+    # kx_2nd/ky_2nd/complex_amp_2nd this Step 8b call already computed
+    # (kept above, not recomputed), the same per-frame ownership
+    # (`_owned_mask`) Step 8b-ownership-gate above already used, and this
+    # pass's own now-finalized collision_primary (merged in from
+    # wave_identity.resolve_collisions above). Output schema: wave_frames.csv
+    # (per-frame) + wave_hourly.csv (hourly, final_*-only aggregate) via
+    # output_schema.py.
     _vprint("[8c/9] Final estimation (Stage 5, offline second-pass) ...")
     dt_sec = dt_min * 60.0
     _wave_frame_rows = []
@@ -1801,7 +1771,7 @@ def run_airglow_pipeline(
     output_paths["kf_merge_log_csv"] = _kfml_path
 
     # ── Step 8b-collision-suppress: drop the losing wave from composite_kf ────
-    # flag_kf_wave_collisions_by_correlation just judged, per episode, which
+    # The collision check above just judged, per episode, which
     # wave is the "real" one. Zero the loser's contribution for exactly the
     # frames it lost, so the two waves' Gabor kernels stop double-counting
     # the same physical wave in composite_kf/wave_cubes_kf -- otherwise the
@@ -1844,18 +1814,16 @@ def run_airglow_pipeline(
 
     # ── Step 9 prep: point the movie's label/arrow at final_estimation.py's
     #    actual output ────────────────────────────────────────────────────
-    # Per STEP5_DESIGN_SCOPING.md Task 6 / STAGE4_SYNTHETIC_SWEEP_AND_MOVIE_STATUS.md:
-    # replaces the causal kf_orient_deg/kf_lambda_km/kf_wavespeed_ms label
-    # source (_kf_az_series etc., built in Step 8b, now unused past this
-    # point) with wave_frames' final_azimuth_deg/final_wavelength_km/
-    # final_speed_ms -- one row per (wave_id, frame_idx) already on the
-    # full n_time grid, no realignment needed. `wave_frames['valid']` is
+    # The animation's per-frame label/arrow arrays are sourced from
+    # wave_frames' final_azimuth_deg/final_wavelength_km/final_speed_ms --
+    # one row per (wave_id, frame_idx) already on the full n_time grid, no
+    # realignment needed -- not from the causal tracker's kf_orient_deg/
+    # kf_lambda_km/kf_wavespeed_ms. `wave_frames['valid']` is
     # `unified_validity_mask` (owned AND collision_primary AND amp>0 AND
-    # SNR floor) -- strictly a superset of the old collision-only
-    # `_kf_suppressed_series` gate, so using `~valid` as the single
-    # suppression signal is the unification Task 6 asked for ("collision-
-    # suppressed vs. simply-not-owned" collapsed into one "not legitimately
-    # present here" state) without needing a separate not-owned check.
+    # SNR floor), a superset of a collision-only suppression check, so
+    # using `~valid` as the single suppression signal collapses
+    # "collision-suppressed" and "simply not owned" into one "not
+    # legitimately present here" state without a separate not-owned check.
     # This also collapses the old three-way normal/coasting/suppressed
     # state into two-way present/not-present -- final_estimation.py has no
     # per-frame confidence gradation analogous to the causal tracker's

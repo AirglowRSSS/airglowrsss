@@ -1,3 +1,15 @@
+"""
+OmegaK_enhanced.py
+--------------------
+Stage 1 peak detection: given one window's omega-k filtered FFT, finds
+distinct spectral peaks, converts each to physical wave parameters
+(wavelength, azimuth, phase speed, period), flags temporal-aliasing
+ambiguity, and scores each candidate's reliability. `analyze_and_plot_waves`
+is the entry point, called once per sliding-window analysis; everything
+else in this file is reached through its own call tree, or (`circular_mean`/
+`circular_std`) imported directly elsewhere in the package.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm

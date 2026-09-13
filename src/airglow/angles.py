@@ -1,21 +1,13 @@
 """
 angles.py
 ---------
-The shared angular-comparison/circular-statistics utility for the wave
-pipeline. Every place two orientations or azimuths get compared or averaged
-should import from here rather than reimplementing the arithmetic inline —
-this was written to consolidate eight independent implementations found
-scattered across `wave_validation.py`, `gabor_reconstruction.py`,
-`phase_speed_kalman.py`, `wave_clustering.py`, `cluster_reconstruction.py`,
-and `OmegaK_enhanced.py` (see `REFACTOR_DESIGN.md` Task 1's survey), three
-of which used different algebraic forms for the same "distance on a
-mod-180 circle" concept.
-
-**That consolidation is only partly done** (`PIPELINE_AUDIT_RESULTS.md`):
-`phase_speed_kalman.circular_diff_deg` and `OmegaK_enhanced.circular_mean`/
-`circular_std` were never actually routed through this module and remain
-separate, live implementations still called elsewhere in the pipeline —
-they are correct as they are and this module does not replace them.
+Shared angular-comparison and circular-statistics utilities used across the
+pipeline. Any code that compares or averages two orientations/azimuths
+should use these rather than reimplementing the arithmetic inline — a
+handful of equivalent-but-textually-different implementations still exist
+elsewhere in this package (`phase_speed_kalman.circular_diff_deg`,
+`OmegaK_enhanced.circular_mean`/`circular_std`); those are correct and
+still the ones actually called at their sites, not routed through here.
 
 Two angular conventions are in play throughout this codebase, and every
 function below is explicit about which one it operates on:
@@ -26,10 +18,10 @@ function below is explicit about which one it operates on:
   are opposite, physically distinct directions.
 
 Mixing these up — comparing a full-circle quantity with an axis-only
-tolerance, or vice versa — is the single most common bug pattern this
-session found (`build_wave_families`'s and `build_waves_for_gabor`'s
-Voronoi grouping both originally checked axis only, silently merging
-counter-propagating waves that shared an axis). Callers are responsible for
+tolerance, or vice versa — is a known recurring failure mode in this
+codebase's wave-clustering/frame-ownership logic: an axis-only tolerance
+can silently treat two counter-propagating waves as the same detection
+because they share a spatial orientation. Callers are responsible for
 knowing which kind of quantity they have; this module does not guess.
 """
 
@@ -42,13 +34,6 @@ def axis_diff_deg(a, b):
 
     0° and 180° are treated as identical (same physical axis). Vectorized —
     `a`/`b` may be scalars or numpy arrays (broadcast together as usual).
-
-    Replaces: `wave_validation.py`'s `_angular_diff`, `gabor_reconstruction.py`'s
-    `_adiff`, `phase_speed_kalman.py`'s `_circ_diff_180`, and the
-    `(x + 90) % 180 - 90` form used inline in `_kalman_theta_tracker`'s
-    kernel-mismatch check and in that file's own regression test
-    (`_half_diff`) — all four are mathematically identical to this function;
-    see this module's `__main__` regression block for the equivalence check.
     """
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
@@ -60,15 +45,10 @@ def full_circle_diff_deg(a, b):
     """
     Unsigned distance between two full-circle (mod-360°) quantities, in [0, 180].
 
-    0° and 180° are physically opposite here — this is the check that was
-    missing from `build_wave_families` and `build_waves_for_gabor`'s Voronoi
-    grouping before this session's fixes let two counter-propagating,
-    same-axis waves merge. Vectorized, same broadcasting as `axis_diff_deg`.
-
-    Replaces: `wave_validation.py`'s `_full_circle_diff`,
-    `gabor_reconstruction.py`'s `_full_circle_diff` (a byte-for-byte copy of
-    the former), and `abs(circular_diff_deg(...))` at every call site that
-    used it that way.
+    0° and 180° are physically opposite here, unlike `axis_diff_deg` — use
+    this whenever propagation direction (not just spatial orientation)
+    matters, e.g. distinguishing two waves that share an axis but travel in
+    opposite directions. Vectorized, same broadcasting as `axis_diff_deg`.
     """
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
@@ -85,8 +65,12 @@ def signed_circular_diff_deg(a, b):
     == full_circle_diff_deg(a, b)` always — this is the more fundamental
     primitive; `full_circle_diff_deg` is the unsigned distance derived from it.
 
-    Replaces: `phase_speed_kalman.py`'s module-level `circular_diff_deg`
-    (identical formula, renamed for consistency with this module's naming).
+    Not currently called anywhere in the pipeline itself — its only caller
+    today is this module's own regression test below, which uses it to
+    cross-check `full_circle_diff_deg`. Kept because a separate, equivalent
+    signed-difference function (`phase_speed_kalman.circular_diff_deg`)
+    remains the one actually in production use; see that function if you
+    need a signed circular difference in a live code path.
     """
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
@@ -102,13 +86,6 @@ def circular_mean_axis_deg(angles_deg, weights=None):
     halves the result back). `weights=None` gives an unweighted mean.
     NaN entries in `angles_deg` are dropped (and their weights with them)
     before averaging; returns NaN if nothing is left.
-
-    Replaces: `cluster_reconstruction.py`'s `circular_mean_0_180` (identical
-    formula — that function already existed, correctly named and already
-    importable, but `wave_clustering.py:249` re-derived the same math inline
-    instead of calling it; this is the canonical version going forward) and
-    the doubled-angle block inside `build_waves_for_gabor`'s median-orientation
-    computation.
     """
     angles_deg = np.asarray(angles_deg, dtype=float)
     if weights is None:
@@ -138,9 +115,6 @@ def circular_mean_full_deg(angles_deg, weights=None):
     azimuth/propagation-direction quantities, where 0° and 180° are distinct.
     `weights=None` gives an unweighted mean. NaN entries are dropped (with
     their weights) before averaging; returns NaN if nothing is left.
-
-    Replaces: the unnamed weighted circular-mean helper in
-    `OmegaK_enhanced.py` (~line 1000, identical formula).
     """
     angles_deg = np.asarray(angles_deg, dtype=float)
     if weights is None:

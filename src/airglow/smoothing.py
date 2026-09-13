@@ -1,49 +1,33 @@
 """
 smoothing.py
 ------------
-The one shared offline (non-causal) smoothing engine for step 3
-(kernel_tuning.py) and step 5 (final_estimation.py), per
-`refactor_foundation.md`'s revised architecture:
+The shared offline (non-causal) smoothing engine used by both Stage 3
+(`kernel_tuning.py`) and Stage 5 (`final_estimation.py`). This module only
+builds the engine; it does not decide what gets persisted where -- that
+boundary is enforced by `kernel_tuning.py`/`final_estimation.py`/
+`output_schema.py` themselves (kernel-tuning output stays internal/
+diagnostic, final-estimation output is what reaches the permanent tables).
 
-    "Since step 3 doesn't need to be causal either ... both steps 3 and 5
-    can reasonably share one underlying offline-smoothing engine ... Demand:
-    kernel-tuning output stays internal/diagnostic ... Final-estimation
-    output is the only thing that reaches the persisted final tables.
-    Enforce this as a persistence/API boundary (what gets written where),
-    not by duplicating the smoothing machinery itself."
+Why offline smoothing rather than the causal (forward-only) trackers in
+`phase_speed_kalman.py`: this pipeline runs fully offline, with every frame
+of a night available before any tracking starts, so there is no reason to
+pay a causal filter's costs -- warm-up lag during weak/low-detection
+founding periods, and a systematic lag whenever the tracked parameter is
+genuinely evolving rather than just noisy. The fix used here is a
+fixed-interval Rauch-Tung-Striebel (RTS) smoother: run the same causal
+(forward) Kalman filter first, then a backward pass that uses every future
+observation to correct each past estimate. The forward pass is
+mathematically identical to `phase_speed_kalman.py`'s causal trackers by
+construction (same state-transition/measurement matrices, same process/
+measurement noise, same gating) -- this module's own regression tests
+confirm exact forward-pass equivalence before trusting the backward
+(smoothed) pass at all.
 
-This module builds that engine. It does NOT decide what's persisted where --
-that's `kernel_tuning.py`/`final_estimation.py`/`output_schema.py`'s job.
-
-Why offline smoothing instead of the causal (forward-only) Kalman trackers
-already in `phase_speed_kalman.py`: the causal framing there
-(`_kalman_theta_tracker`, `_kalman_kh_tracker`) was inherited from Kalman
-filters being the default tool, not from any real-time requirement -- this
-pipeline is fully offline, every frame of every night is available before
-tracking ever starts. A causal filter pays two costs that don't apply here:
-early-episode warm-up lag (this session's recurring finding: weak,
-low-detection-count founding periods are exactly where things go wrong most)
-and a systematic lag whenever the tracked parameter is genuinely evolving,
-not just noisy. The standard fix for "offline access to the whole
-sequence, want the best estimate at every point" is a fixed-interval
-Rauch-Tung-Striebel (RTS) smoother: run the causal (forward) Kalman filter
-first, exactly as before, then run a backward pass that uses every future
-observation to correct each past estimate. The forward pass is mathematically
-identical to the existing causal trackers by construction (same F/H/Q/R,
-same gating) -- this module's own regression tests confirm exact forward-pass
-equivalence with `_kalman_theta_tracker`/`_kalman_kh_tracker` before ever
-trusting the backward (smoothed) pass.
-
-Both trackers below (orientation, wavenumber) are literally the same 2-state
-constant-velocity-model engine (`_forward_backward`), parameterized by
-`circular` -- tracking an angle and tracking a scalar wavenumber differ only
-in how an innovation and a smoother correction wrap onto a circle, not in
-the underlying recursion. Building this as one function, not two, is the
-actual point of this module per the foundation document -- a single engine
-shared by both quantities (and, per its docstring above, by both steps 3
-and 5), rather than the parameter-tuning duplication `_kalman_theta_tracker`/
-`_kalman_kh_tracker` already show (near-identical loops, independently
-written).
+The orientation and wavenumber trackers below are the same 2-state
+constant-velocity engine (`_forward_backward`), parameterized by `circular`
+-- tracking an angle differs from tracking a scalar wavenumber only in how
+an innovation and a smoother correction wrap onto a circle, not in the
+underlying recursion.
 """
 
 import numpy as np
@@ -288,24 +272,19 @@ def smooth_orientation(
     """
     Track instantaneous wave propagation azimuth, offline (RTS-smoothed).
 
-    Observation derivation, 180-degree fold-to-`theta_init_rad`, and
-    `kernel_mismatch` computation are a faithful port of
-    `_kalman_theta_tracker` (`phase_speed_kalman.py:273`) -- unchanged, so
-    this function's `theta_est_deg` (the forward/causal pass) reproduces
-    that function's output exactly; see this module's regression tests.
-    `theta_smooth_deg` is the new backward-pass (offline) answer.
-
-    The fold toward `theta_init_rad` is carried forward as-is: it is a
-    real, known limitation for lobe disambiguation specifically
-    (`REFACTOR_DESIGN.md` Task on the causal/kernel-tuning blurring --
-    `kf_orient_deg` is "actively wrong as an independent check on the
-    founding value itself," `SECOND_PASS_INDEPENDENT_ESTIMATION.md`), which
-    is why `refactor_foundation.md` scopes lobe disambiguation to happen
-    BEFORE `final_estimation.py` calls this function on the second pass
-    ("calls smoothing.py on second-pass observations, after lobe
-    disambiguation") -- not something this offline engine fixes on its own,
-    same as the causal version never did. Fine for step 3's purpose
-    (kernel-tuning signal, never persisted to the final schema).
+    Observations are derived from `(kx, ky)` as `atan2(-kx, -ky)`, then
+    folded by 180° toward whichever half-circle is closer to
+    `theta_init_rad` -- the state space here is a full-circle azimuth, but
+    the underlying wavenumber observation is only known up to a 180°
+    ambiguity (it can't distinguish a wave from its exact opposite). This
+    fold means the tracker's own output should not be treated as an
+    independent check on which of the two lobes is physically correct --
+    it will always agree with whichever lobe `theta_init_rad` picked.
+    Actual lobe disambiguation is a separate, earlier step
+    (`final_estimation.py`'s episode-based resolution); this function
+    tracks whichever azimuth series it's handed and does not resolve the
+    ambiguity itself. `theta_est_deg` is the forward/causal pass;
+    `theta_smooth_deg` is the offline (RTS) pass.
 
     Parameters
     ----------
@@ -322,33 +301,22 @@ def smooth_orientation(
         `kernel_mismatch`'s threshold, not tracking itself.
     q_theta : float
         Process noise on theta per step (rad**2/step). Default 1e-8,
-        unchanged from `_kalman_theta_tracker` -- see `KF_Q_THETA`'s
-        existing derivation (`CLAUDE_original_2026-07-02.md` Section 3):
-        sized to an assumed ~10 deg/hr azimuth drift rate,
-        Q ~ (rate_deg_per_step * pi/180)**2. Carried forward, not
-        re-derived here (already had a stated rationale, unlike q_kh below).
+        governing how fast the tracked azimuth is allowed to drift per
+        step -- sized to an assumed ~10 deg/hr azimuth drift rate.
     q_dtheta : float
         Process noise on dtheta/dt per step ((rad/s)**2/step). Default
-        1e-12, unchanged -- empirically consistent with
-        `q_theta / dt**2 ~ 7e-13` at dt=120s, i.e. the same
-        "rate process noise scales as position process noise over dt
-        squared" relationship this module states explicitly and uses for
-        `q_dkh` below (see `smooth_wavenumber`), not independently derived
-        for theta.
+        1e-12, following the convention used throughout this module that
+        rate process noise scales as position process noise over `dt`
+        squared (see `smooth_wavenumber`'s `q_dkh`).
     r_theta_base_rad : float
-        Measurement noise base at peak SNR (radians). Default 15 deg,
-        unchanged from `_kalman_theta_tracker`. **No physical derivation
-        found for this specific value** (checked alongside `q_kh`/`q_dkh`
-        during this module's construction) -- carried forward as an
-        inherited, unjustified default, same status as `smoothing_window`
-        in `wave_identity.py`'s `resolve_collisions`. Flagged, not silently
-        treated as validated.
+        Measurement noise base at peak SNR (radians). Default 15 deg. No
+        first-principles physical derivation exists for this specific
+        value -- an inherited default, not independently re-derived here.
     chi2_gate : float
-        1-DOF chi-squared outlier gate. Default 9.0 = 3**2 -- a standard
+        1-DOF chi-squared outlier gate. Default 9.0 = 3**2, a standard
         3-sigma statistical convention (reject innovations whose normalized
         squared residual exceeds a 3-sigma threshold for 1 degree of
-        freedom), not a fitted or assumed physical rate. Unchanged from
-        `_kalman_theta_tracker`.
+        freedom), not a fitted or physically-derived rate.
     innov_valid_mask : ndarray bool (n_time,), optional
         External validity (e.g. from an omega-tracker gate). Frames invalid
         here coast on prediction, same as the causal version.
@@ -476,149 +444,36 @@ def smooth_wavenumber(
     """
     Track horizontal wavenumber magnitude, offline (RTS-smoothed).
 
-    Offline counterpart to `_kalman_kh_tracker` (`phase_speed_kalman.py:538`)
-    -- same observable, same bias caveat (see that function's module-level
-    comment: the observable is pulled toward the Gabor kernel's own centre
-    wavelength when the true wavelength drifts outside the kernel's
-    passband; `wavelength_kernel_mismatch` flags exactly when to distrust
-    this).
+    Same observable and bias caveat as `phase_speed_kalman._kalman_kh_tracker`:
+    the Gabor kernel biases wavenumber observations toward the kernel's own
+    center wavelength when the true wavelength drifts outside the kernel's
+    acceptance band. `wavelength_kernel_mismatch` flags per-frame when this
+    is happening, so callers know when to distrust the raw observable.
 
-    `q_kh`/`q_dkh` derivation (this module's answer to
-    `stage1_closeout_task.md`'s "finally derive one for whatever succeeds
-    kf_q_kh/kf_q_dkh, which was found to have none either"):
-
-    The ported originals (`kf_q_kh=1e-12`, `kf_q_dkh=1e-16`) are fixed
-    absolute constants with no stated derivation anywhere in the codebase
-    or its git history (`FAMILY6_WAVELENGTH_JUMP_INVESTIGATION.md` Task 5).
-    A fixed absolute `q_kh` has the same scale-awareness blind spot this
-    session already found and documented for `lambda_tol_km` in
-    `wave_identity.py`'s duplicate-detection gate: `k_h = 2*pi/lambda`, so a
-    fixed absolute uncertainty in `k_h` is a huge relative uncertainty for a
-    long-wavelength (small k_h) wave and a tiny one for a short-wavelength
-    (large k_h) wave -- the exact same blind spot named in
-    `flag_kf_wave_collisions_by_correlation`'s own docstring for a
-    *different* check.
-
-    Instead of a fixed constant, `q_kh` is derived per-call from the wave's
-    own `k_h_init` and `wavelength_drift_frac_per_hr` (default 3%/hr, see
-    empirical derivation below). Since `dk_h/k_h ~= -dlambda/lambda` for
-    small fractional perturbations, this fractional rate applies equally to
-    `k_h`:
+    `q_kh`/`q_dkh` are derived per-call from the wave's own `k_h_init`
+    rather than being fixed constants, because `k_h = 2*pi/lambda` means a
+    fixed absolute process-noise uncertainty in `k_h` is a large relative
+    uncertainty for a long-wavelength (small k_h) wave and a tiny one for a
+    short-wavelength (large k_h) wave. Since `dk_h/k_h ~= -dlambda/lambda`
+    for small fractional perturbations, a single fractional drift rate
+    applies equally to `k_h`:
 
         frac_per_step = wavelength_drift_frac_per_hr * dt / 3600
         q_kh  = (frac_per_step * k_h_init) ** 2   # (rad/m)**2 / step
         q_dkh = q_kh / dt ** 2                    # (rad/m/s)**2 / step
 
-    The `q_dkh = q_kh / dt**2` relationship is stated explicitly as the
-    modeling convention this module uses (rate process noise scales as
-    position process noise over `dt` squared) -- checked against the
-    existing `q_theta`/`q_dtheta` pair (1e-8, 1e-12 at dt=120s) and found
-    empirically consistent (`1e-8 / 120**2 ~= 6.9e-13`, same order of
-    magnitude as `1e-12`), suggesting this was the (undocumented) rule of
-    thumb already implicitly in use -- now applied deliberately and stated,
-    rather than left as an unexplained ratio. This basis is unaffected by
-    the `wavelength_drift_frac_per_hr` value below -- whatever `q_kh` comes
-    out to, `q_dkh` follows it via this same, separately-justified
-    convention.
-
-    `wavelength_drift_frac_per_hr` (default 0.03, i.e. **3%/hr**) --
-    **empirically estimated, not physically derived, exactly like
-    `KF_Q_THETA`'s own ~10 deg/hr number was** (`empirical_wavelength_drift_task.md`;
-    `KF_Q_THETA`'s derivation was itself empirical, not theoretical, so this
-    number is grounded the same honest way, not dressed up as more
-    principled than it is). Measured directly from the second pass's RAW
-    (unsmoothed) `(kx, ky)` observations -- never `kf_lambda_km`, which is
-    already smoothed by the very causal filter this parameter feeds, and
-    would make the estimate circular.
-
-    **Episodes used, and why each was trusted as genuinely wave-not-
-    artifact** (per-episode fractional drift measured as both a ln(lambda)
-    vs. time least-squares slope over the whole episode, and a simple
-    endpoint-to-endpoint rate -- reported together since raw single-frame
-    k_h observations are noisy enough that the two can disagree
-    substantially, itself informative about how much of any one number is
-    real signal vs. frame noise):
-
-    - **DOY173 Family 13 (wave_id 12), frames 50-142 of 142** (the
-      legitimately-owned portion only, per its own `_owned_mask` --
-      `FAMILY13_INVESTIGATION.md` established this family is frozen and
-      unowned for the night's first ~90 minutes, so only the owned tail is
-      real signal). Direction independently confirmed correct
-      (`SECOND_PASS_INDEPENDENT_ESTIMATION.md` Task 2 sanity check). 86
-      valid frames, 2.83 hr: fit -6.33%/hr, endpoint +0.45%/hr.
-    - **DOY150 wave_id 1 (Family 2) and wave_id 10 (Family 11), the
-      confirmed-genuine-duplicate `w1v10` episode** (frames 140-183) --
-      confirmed via a full episode-wide axis/wavelength/correlation check
-      (`DECOUPLE_AND_FIX_SMOOTHING.md` Part 1: axis diff a tight 18.7-19.4
-      deg, corr 0.74-0.88, stable across all 44 frames), the most
-      rigorously validated pair this session has. Each wave's OWN raw
-      trajectory used (not the pair's difference -- the duplicate
-      confirmation just establishes both series are real-wave signal, not
-      that they should agree with each other). wave_id1: 42 valid frames,
-      1.37 hr, fit +1.63%/hr, endpoint +1.13%/hr. wave_id10: 42 frames,
-      1.37 hr, fit -1.92%/hr, endpoint +1.24%/hr.
-    - **DOY150 wave_id 0 (Family 1) and wave_id 7 (Family 8), the
-      confirmed-genuine-duplicate `w0v7` episode** (two contiguous runs,
-      frames 35-92 and 139-183) -- confirmed via near-identical
-      reconstructed fields at r=0.994 (`FIRSTPASS_GATE_ROLLOUT.md`), though
-      without `w1v10`'s full episode-wide numeric check. wave_id7 (the
-      steadier of the pair): run1 58 frames/1.90 hr, fit -0.91%/hr,
-      endpoint +1.85%/hr; run2 43 frames/1.40 hr, fit -2.82%/hr, endpoint
-      +0.65%/hr. wave_id0's run2 is consistent (43 frames, fit -3.76%/hr,
-      endpoint -5.09%/hr) but **its run1 is a clear outlier**: fit
-      +13.12%/hr, endpoint +9.52%/hr -- roughly 5-10x every other episode.
-      Since wave_id0 and wave_id7 are confirmed to be the SAME physical
-      wave over this identical window, and wave_id7's own estimate stays
-      small and stable while wave_id0's spikes, this reads as raw
-      per-frame observation noise in that specific segment (a known,
-      expected property of the unsmoothed observable -- the entire reason
-      this module's offline smoother exists), not a real 13%/hr physical
-      event. Kept in the reported distribution rather than discarded
-      (nothing here proves it isn't real), but not allowed to dominate the
-      choice below -- see why median, not mean, is used.
-
-      **This pair is also direct, demonstrated evidence of this
-      measurement technique's own noise floor, not just general
-      small-sample-spread caution**: two waves, CONFIRMED identical (same
-      physical structure, r=0.994), measured over the SAME episode window,
-      give +13.12%/hr (wave_id0) vs. -0.91%/hr (wave_id7) -- a ~14
-      percentage-point spread on a quantity that, if the raw observable
-      were noise-free, should read identically for both, since they're the
-      same wave. That gap IS the technique's noise floor, measured
-      directly rather than inferred. It's the concrete reason the median
-      (not the mean, and not any single episode's number) is used below --
-      not a hedge against small-sample spread in the abstract, but a
-      response to a specific, paired, same-wave measurement showing how
-      much of any one episode's number can be pure observation noise.
-
-    **Family 6 (DOY173) deliberately excluded**: independently confirmed to
-    have a real, non-physical wavelength jump correlated with a collision
-    episode (`FAMILY6_WAVELENGTH_JUMP_INVESTIGATION.md`) -- exactly the
-    kind of contamination this measurement needs to avoid, so it does not
-    qualify as "confirmed clean" despite its direction being independently
-    validated correct.
-
-    **Distribution across the 7 episodes**: fit-based |rate|: 6.33, 1.63,
-    1.92, 13.12, 3.76, 0.91, 2.82 (%/hr) -- mean 4.36%, **median 2.82%**.
-    Endpoint-based |rate|: 0.45, 1.13, 1.24, 9.52, 5.09, 1.85, 0.65 (%/hr)
-    -- mean 2.85%, median 1.24%. Both medians sit roughly an order of
-    magnitude below the previously-assumed 15%/hr, and the median (not
-    mean) is used deliberately as the summary statistic specifically
-    because it's insensitive to the single wave_id0/run1 outlier discussed
-    above without requiring a judgment call to discard that data point
-    outright.
-
-    **Value used: `wavelength_drift_frac_per_hr = 0.03` (3%/hr)** -- the
-    fit-based median (2.82%/hr), rounded to a clean value slightly above it
-    (matching `KF_Q_THETA`'s own "~10 deg/hr," a rounded representative
-    figure, not a raw unrounded statistic quoted as if it were exact). The
-    fit-based (not endpoint-based) median is used as the reference value
-    since it draws on every frame of each episode rather than just two
-    potentially-noisy endpoints.
+    `wavelength_drift_frac_per_hr` (default 0.03, i.e. 3%/hr) is an
+    empirically-estimated fractional wavelength drift rate, not a
+    physically-derived constant -- measured from the raw (unsmoothed)
+    second-pass `(kx, ky)` observations of several reference episodes
+    independently confirmed to be genuine, uncontaminated wave signal
+    (not collision/duplicate artifacts). `q_dkh = q_kh / dt**2` follows the
+    same "rate process noise scales as position process noise over `dt`
+    squared" convention used for `q_theta`/`q_dtheta` above.
 
     Both `q_kh`/`q_dkh` can still be overridden explicitly (e.g. to
-    reproduce the exact ported defaults for a regression test against
-    `_kalman_kh_tracker` -- see this module's `__main__`).
+    reproduce `_kalman_kh_tracker`'s original fixed defaults for a
+    regression comparison -- see this module's `__main__`).
 
     Parameters
     ----------
@@ -632,10 +487,8 @@ def smooth_wavenumber(
         Initial k_h (rad/m), from the founding omega-k result.
     wavelength_drift_frac_per_hr : float
         Fractional wavelength drift rate per hour, used to derive
-        `q_kh`/`q_dkh` when not given explicitly. Default 0.03 (3%/hr) --
-        empirically estimated (median fit-based rate across 7 confirmed-
-        clean reference episodes), not a physically-derived constant; see
-        the full derivation and named episodes above.
+        `q_kh`/`q_dkh` when not given explicitly. Default 0.03 (3%/hr),
+        empirically estimated (see above) rather than physically derived.
     q_kh, q_dkh : float or None
         Explicit override. None (default) derives both from
         `wavelength_drift_frac_per_hr` and `k_h_init` as above.
@@ -728,15 +581,10 @@ def smooth_wavenumber(
 
 # ---------------------------------------------------------------------------
 # Angular-frequency tracker -- offline counterpart to phase_speed_kalman.py's
-# _kalman_omega_tracker. Added for final_estimation.py (step 5) per
-# STEP5_DESIGN_SCOPING.md Task 4: "Speed: derived per-frame from the smoothed
-# omega ... propose smoothing the unfolded, sign-corrected omega directly,
-# i.e. sign(episode lobe) x |omega_obs(t)|, through the same RTS treatment as
-# orientation." kernel_tuning.py (step 3) deliberately does not use this --
-# omega/phase-speed is out of scope for kernel construction -- but it belongs
-# in this shared engine module regardless, per the module's own stated
-# purpose (the one shared offline engine for both steps 3 and 5, not just
-# whichever pieces step 3 happened to need first).
+# _kalman_omega_tracker. Used by final_estimation.py (Stage 5) to smooth the
+# sign-corrected omega series once lobe disambiguation has already resolved
+# which sign each episode should use. kernel_tuning.py (Stage 3) does not
+# use this tracker -- phase speed is out of scope for kernel construction.
 # ---------------------------------------------------------------------------
 
 def smooth_omega(
@@ -754,38 +602,25 @@ def smooth_omega(
     """
     Track instantaneous angular frequency, offline (RTS-smoothed).
 
-    Offline counterpart to `_kalman_omega_tracker` (`phase_speed_kalman.py:83`)
-    -- identical state-space model (`x = [omega, domega/dt]`, linear/non-
-    circular innovation, same Q/R construction), so the forward pass
-    reproduces that function's output exactly (see this module's regression
-    tests). All defaults (`q_omega=1e-8`, `q_domega=1e-12`,
-    `r_sigma_base=0.3`) are unchanged from the ported original -- these
-    already have stated rationales there (see that function's own
-    docstring), not re-derived here.
+    Same state-space model as `phase_speed_kalman._kalman_omega_tracker`
+    (`x = [omega, domega/dt]`, linear/non-circular innovation), so the
+    forward pass reproduces that function's output exactly.
 
-    Unlike `smooth_orientation`/`smooth_wavenumber`, this tracker uses
-    `_forward_backward`'s `hard_gate=False` -- `_kalman_omega_tracker`'s own
-    default is `hard_chi2_gate=False`, which makes its update condition
-    (`if innov_valid[t] or not hard_chi2_gate:`) unconditionally True: the
-    state always updates whenever `amp_obs[t] > 0` and `omega_obs[t]` is
-    finite, regardless of SNR or chi2 outlier status -- those are computed
-    only as an `innovation_valid` diagnostic label, never used to block the
-    update. This was NOT the assumption this module started with: an
-    earlier version reused the theta/kh trackers' always-hard gate for
-    omega too and failed its own forward-pass-equivalence regression test
-    against real (non-trivial) synthetic noise -- exact equivalence testing
-    is what caught this, not code inspection alone. `require_snr_floor=True`
-    is still passed (unlike `smooth_wavenumber`'s `False`) so the
-    `innovation_valid` label itself is computed the same way the ported
-    original computes it (`snr_ok and chi2_ok`), even though that label no
-    longer gates anything when `hard_gate=False`.
+    Unlike `smooth_orientation`/`smooth_wavenumber`, this tracker calls
+    `_forward_backward` with `hard_gate=False`: the state always updates
+    whenever `amp_obs[t] > 0` and `omega_obs[t]` is finite, regardless of
+    SNR or chi-squared outlier status -- those are still computed and
+    returned as the `innovation_valid` diagnostic label, but they no longer
+    block the update itself. `require_snr_floor=True` is still passed so
+    that diagnostic label is computed the same way as the other trackers'
+    (`snr_ok and chi2_ok`), even though it no longer gates anything here.
 
-    Caller's responsibility, per `STEP5_DESIGN_SCOPING.md` Task 4: pass in
-    the SIGN-CORRECTED observation (`sign(episode lobe) * |omega_obs(t)|`),
-    not the raw signed or `abs()`-ed value directly -- this function tracks
-    whatever series it's given, it does not itself resolve the sign
-    ambiguity (that's `final_estimation.py`'s episode-based lobe
-    disambiguation, a separate, earlier step).
+    Caller's responsibility: pass in the SIGN-CORRECTED observation
+    (`sign(episode lobe) * |omega_obs(t)|`), not the raw signed or
+    `abs()`-ed value directly -- this function tracks whatever series it's
+    given and does not itself resolve the sign ambiguity (that's
+    `final_estimation.py`'s episode-based lobe disambiguation, a separate,
+    earlier step).
 
     Parameters
     ----------
@@ -850,11 +685,11 @@ def smooth_omega(
 #
 # 1. Forward-pass equivalence: this module's causal (forward) pass must
 #    exactly reproduce phase_speed_kalman.py's _kalman_theta_tracker/
-#    _kalman_kh_tracker on identical synthetic input, using identical Q/R.
+#    _kalman_kh_tracker/_kalman_omega_tracker on identical synthetic input,
+#    using identical Q/R.
 # 2. Smoothing benefit: on synthetic data with known ground truth, the
 #    backward (offline) pass must have equal-or-lower RMS error than the
-#    forward pass -- REFACTOR_DESIGN.md's stated Stage 2 acceptance bar
-#    ("should never track worse, only equal-or-better").
+#    forward pass -- it should never track worse, only equal-or-better.
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -991,13 +826,10 @@ if __name__ == "__main__":
         "FAIL: smoothing did not help (or hurt) during the warm-up period"
     print("  PASS: smoothed pass does not track worse during warm-up.")
 
-    # ── Test 4b: smoothing benefit with the actual DEFAULT
-    #    wavelength_drift_frac_per_hr=0.03 (empirically-derived q_kh/q_dkh,
-    #    not the explicit 1e-12/1e-16 values Test 2/3 used to match the
-    #    ported original exactly) -- empirical_wavelength_drift_task.md's
-    #    explicit re-verification requirement: confirm the smoothing
-    #    benefit still holds with the new empirically-grounded value, not
-    #    just with the old ported constants. ──
+    # ── Test 4b: smoothing benefit with the actual default
+    #    wavelength_drift_frac_per_hr=0.03 (empirically-derived q_kh/q_dkh),
+    #    not the explicit 1e-12/1e-16 values Test 2/3 used above to match
+    #    _kalman_kh_tracker's own fixed defaults exactly. ──
     new_kh_default = smooth_wavenumber(
         kh_obs, amp_obs, dt, k_h_init, k_h_min=k_h_min, k_h_max=k_h_max,
     )

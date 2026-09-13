@@ -1,8 +1,12 @@
 """
-Wave Clustering for refined_df
-
-Clusters similar waves based on wavelength and orientation proximity.
-Automatically adjusts Gabor filter bandwidths to match clustering resolution.
+wave_clustering.py
+-------------------
+Derives Gabor kernel bandwidth parameters (Bf, Btheta) from the
+wavelength/orientation clustering resolution actually in use, so the
+reconstruction kernel neither over- nor under-resolves relative to how
+detections are grouped into families. `compute_bf_for_wavelength`/
+`compute_adaptive_gabor_parameters` are the two functions used by
+`gabor_reconstruction.py`'s kernel construction.
 """
 
 import numpy as np

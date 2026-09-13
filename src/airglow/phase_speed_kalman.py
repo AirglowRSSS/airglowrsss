@@ -1484,10 +1484,10 @@ def build_kf_merge_log(kf_results: pd.DataFrame, night) -> pd.DataFrame:
     Parameters
     ----------
     kf_results : pd.DataFrame
-        The FULL (unfiltered) output of ``analyze_all_waves_kalman`` +
-        ``flag_kf_wave_collisions_by_correlation``. Do not pre-filter to
-        ``collision_primary == True`` before calling this -- every fully
-        suppressed wave would already be invisible.
+        The FULL (unfiltered) output of ``analyze_all_waves_kalman``, with
+        collision columns (``collision_primary`` etc.) merged in. Do not
+        pre-filter to ``collision_primary == True`` before calling this --
+        every fully suppressed wave would already be invisible.
     night : any
         Night/run identifier to stamp on every row (e.g. ``stem`` or a date).
         Not derived from ``kf_results`` itself, which carries no such column.

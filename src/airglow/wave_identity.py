@@ -1,52 +1,44 @@
 """
 wave_identity.py
 -----------------
-The unified wave-identity / frame-ownership module — one place that answers
-"is this the same physical wave" and "who owns this frame," replacing three
-previously-uncoordinated mechanisms that each answered a related but distinct
-version of that question independently (`REFACTOR_DESIGN.md` Task 1/2):
+The wave-identity / frame-ownership module: answers "is this the same
+physical wave" and "who owns this frame" at three successive points in the
+pipeline, using three different kinds of evidence:
 
   Stage A — cluster_detections_into_families()
-      Sparse per-window ω-k detections -> discrete families. Ports
-      wave_validation.py's build_wave_families(). Operates before any Gabor
-      reconstruction exists.
+      Groups sparse per-window omega-k detections into discrete wave
+      families, before any Gabor reconstruction exists.
 
   Stage B — resolve_frame_ownership()
-      Discrete families -> dense per-frame ownership on the full night grid.
-      Ports gabor_reconstruction.py's build_waves_for_gabor() (Option 1
-      half-window extension + Option 2 Voronoi tie-break).
+      Expands each family's discrete detections into dense per-frame
+      ownership on the full night's time grid, resolving any frame where
+      more than one family is simultaneously active.
 
   Stage C — resolve_collisions()
-      Actual reconstructed fields -> episode-resolved duplicate/collision
-      decisions via direct cross-correlation. Ports and generalizes
-      phase_speed_kalman.py's flag_kf_wave_collisions_by_correlation() to be
-      pass-agnostic: it used to run only on the second-pass reconstruction,
-      with gabor_reconstruction.py's check_duplicate_waves() providing a
-      separate, weaker (whole-night-averaged, informational-only) answer for
-      the first pass. Per the refactor kickoff decision, check_duplicate_waves
-      folds into this stage -- the same per-frame/episode mechanism now runs,
-      operationally, on both passes. This is a real behavior change on the
-      first pass, not a pure port -- see this module's own verification
-      script for what it found on the reference nights.
+      Given actual reconstructed fields, flags episodes where two or more
+      waves' reconstructions are essentially the same physical structure
+      (via direct field cross-correlation) and picks one primary per
+      episode. Designed to be pass-agnostic (usable on either the first or
+      second Gabor pass), but `run_airglow_pipeline` currently only calls it
+      for the second pass, with `apply_duplicate_gate=False`; the first pass
+      still uses `gabor_reconstruction.check_duplicate_waves`, a separate,
+      coarser (whole-night-averaged) check.
 
   unified_validity_mask()
       Combines Stage B's ownership with Stage C's collision outcome and a
-      fresh signal-presence check into ONE authoritative per-frame validity
-      array -- the single answer both kernel_tuning.py and
-      final_estimation.py should consume, rather than each stage combining
-      masks itself (STEP5_DESIGN_SCOPING.md had final_estimation.py do this
-      ad hoc; that combining logic now lives here instead).
+      fresh signal-presence check into one authoritative per-frame validity
+      array — the single answer `kernel_tuning.py` and `final_estimation.py`
+      both consume.
 
-These three stages are NOT collapsed into one function -- they operate on
-three different kinds of evidence (sparse discrete detections, dense
-per-frame kinematic continuity, dense per-frame field similarity),
-available at three genuinely different points in the pipeline, in an
-unavoidable sequential dependency. See REFACTOR_DESIGN.md Task 2 for the
-full reasoning.
+These three stages are kept separate rather than collapsed into one
+function because they operate on three different kinds of evidence (sparse
+discrete detections, dense per-frame kinematic continuity, dense per-frame
+field similarity) available at three different points in the pipeline, in
+an unavoidable sequential dependency.
 
-Every angular comparison below imports from angles.py rather than
-reimplementing the arithmetic -- this module is itself the primary
-consolidation point the angles.py module was built for.
+Angular comparisons throughout this module use `angles.py`'s
+`axis_diff_deg`/`full_circle_diff_deg`/`circular_mean_axis_deg`/
+`circular_mean_full_deg` rather than reimplementing the arithmetic inline.
 """
 
 import numpy as np
@@ -72,29 +64,29 @@ def cluster_detections_into_families(
     """
     Cluster per-window detections into temporally coherent wave families.
 
-    Faithful port of wave_validation.py's build_wave_families(), using
-    angles.py's axis_diff_deg/full_circle_diff_deg in place of that
-    function's local _angular_diff/_full_circle_diff (identical formulas --
-    see angles.py's own regression tests for the equivalence check). No
-    behavior change from the current, already-fixed mechanism: this is a
-    consolidation port, not a redesign.
-
     Grouping is based only on direction and wavelength (not speed), so a
-    family can track a wave whose speed evolves over time. Requires BOTH
-    axis (mod-180) AND full-circle azimuth proximity to merge a detection
-    into an existing group -- the full-circle check is what stops two
-    counter-propagating, same-axis detections from silently merging (the
-    bug this mechanism already had fixed this session).
+    family can track a wave whose speed evolves over time. Merging a
+    detection into an existing group requires BOTH axis (mod-180°) AND
+    full-circle azimuth proximity — the full-circle check is what stops two
+    counter-propagating detections that happen to share an axis from being
+    merged into one family.
+
+    Grouping is greedy and order-dependent: each family's centroid
+    (`direction_center`/`azimuth_full_center`/`wavelength_center`) is fixed
+    at its founding (first-seen) detection, not updated to a running mean,
+    so a family's total member spread stays bounded by `dir_tol_deg`/
+    `lambda_tol_km` regardless of how many detections it accumulates.
 
     Parameters
     ----------
-    window_results  : output of sliding_window_analysis()
+    window_results  : list of per-window detection dicts (each with a
+        `"physical_waves"` list and a `"center_time"`), one per sliding
+        analysis window.
     dir_tol_deg     : max azimuth difference (degrees) to merge into same family
     lambda_tol_km   : max wavelength difference (km) to merge into same family
     min_detections  : minimum number of windows a family must appear in to be kept
     verbose : bool
-        Print per-family summary (matches the original's unconditional prints,
-        now gateable).
+        Print a per-family summary.
 
     Returns
     -------
@@ -125,12 +117,10 @@ def cluster_detections_into_families(
     if verbose:
         print(f"Total detections across all windows: {len(all_waves)}")
 
-    # Greedy grouping -- centroid is FIXED at the founding detection (not
-    # updated to a running mean) so total parameter spread per family stays
-    # bounded to <= dir_tol_deg / <= lambda_tol_km, rather than letting slow
-    # drift chain detections arbitrarily far via many small incremental
-    # steps. See wave_validation.py:318-341 for the full original reasoning,
-    # including why axis-only proximity is not sufficient on its own.
+    # Fixed-centroid greedy grouping: comparing every new detection against
+    # each group's founding member (not a running mean) prevents slow drift
+    # from chaining detections arbitrarily far from where a family started,
+    # one small step at a time.
     groups = []
     for w in all_waves:
         matched = False
@@ -197,14 +187,37 @@ def interpolate_family_to_time_grid(
     win_half_ns=0.0,
 ):
     """
-    Map family member parameters onto the full dataset time grid, Option 1
-    (half-window extension) coverage semantics.
+    Interpolate one family's discrete member detections onto the full
+    dataset time grid, and mark which grid frames fall within reach of an
+    actual detection.
 
-    Faithful port of gabor_reconstruction.py's function of the same name --
-    no behavior change. Kept as its own function (not merged into
-    resolve_frame_ownership) since it's genuinely a per-family operation,
-    called once per family before the cross-family Voronoi tie-break in
-    resolve_frame_ownership needs all families' results at once.
+    A grid frame counts as "covered" (`_valid_mask`) only if its nearest
+    member detection is within `win_half_ns` — this is the half-window
+    extension: each detection is trusted to represent conditions for half
+    a window's duration on either side of it, not the whole night. Kept as
+    a standalone, per-family function (rather than inlined into
+    `resolve_frame_ownership`) because it has no cross-family knowledge —
+    the Voronoi tie-break that needs all families' results at once happens
+    one level up, after every family has been interpolated independently.
+
+    Parameters
+    ----------
+    family : dict
+        One family from `cluster_detections_into_families`.
+    time_grid : np.ndarray of datetime64
+        Full night time grid to interpolate onto.
+    parameter_keys : tuple of str
+        Which member fields to interpolate; `"direction"` gets circular
+        interpolation (see below), everything else gets linear `np.interp`.
+    win_half_ns : float
+        Coverage half-window, in nanoseconds.
+
+    Returns
+    -------
+    dict with `_valid_mask` (bool, per grid frame), `_nearest_dist`
+    (nanoseconds to the nearest member detection, per grid frame), and one
+    interpolated array per requested parameter (`direction` is renamed to
+    `orientation_deg` in the output).
     """
     members = sorted(family["members"], key=lambda m: m["time"])
     t_mem = np.array(
@@ -256,29 +269,29 @@ def resolve_frame_ownership(
     voronoi_dir_tol=None, voronoi_lam_tol=None,
 ):
     """
-    Build the per-frame-owned wave list from discrete families, using
-    Option 1 (half-window extension) + Option 2 (Voronoi) to give every
-    frame an unambiguous owner.
+    Build the per-frame-owned wave list from discrete families: interpolate
+    each family onto the full time grid (`interpolate_family_to_time_grid`),
+    then resolve any frame where more than one family from the same
+    proximity group is simultaneously covered, by giving it to whichever
+    family's nearest detection is closest in time (a Voronoi-style
+    nearest-neighbor tie-break).
 
-    Faithful port of gabor_reconstruction.py's build_waves_for_gabor(),
-    using angles.py's axis_diff_deg/full_circle_diff_deg in place of that
-    function's local _adiff/_full_circle_diff (identical formulas). No
-    ownership/coverage behavior change from the current, already-fixed
-    mechanism -- ownership itself (valid_stack/dist_stack/owned_mask) never
-    depended on the scalar seed values below, so this is unaffected by the
-    one deliberate change from the ported original:
+    Two families are considered part of the same proximity group — and
+    therefore compete for ownership when both cover a frame — if their
+    founding centroids are within `voronoi_dir_tol` (axis AND full-circle
+    azimuth) and `voronoi_lam_tol` of each other; group membership is
+    transitive (union-find), so these default to the same tolerances used
+    to build the families in the first place, rather than a looser value
+    that could chain together families that were never meant to compete.
 
-    CONFIRMED DEVIATION FROM THE PORTED ORIGINAL (explicit decision, not a
-    silent fix): the scalar seed values (median_orient, median_azimuth) use
-    angles.py's circular_mean_axis_deg/circular_mean_full_deg instead of a
-    plain np.median over each family's raw member values. The original's
-    np.median could get a wrong answer for a family whose members straddle
-    the 0/180 (orientation) or 0/360 (azimuth) wrap boundary -- e.g.
-    np.median([350, 10]) = 180, not ~0. wavelength and speed are not
-    circular quantities and still use np.median, unchanged. This changes
-    each affected wave's founding 'orientation_deg'/'azimuth' seed, which
-    also feeds resolve_collisions' tie-break distance metric -- re-verified
-    against the reference nights after this change, not assumed safe.
+    Each wave's scalar seed values (`orientation_deg`, `azimuth`) are the
+    circular mean (`angles.circular_mean_axis_deg`/`circular_mean_full_deg`)
+    over the family's member detections, not a plain median — a median can
+    give a wrong answer for a family whose members straddle the 0/180° or
+    0/360° wrap boundary (e.g. `median([350, 10]) == 180`, not ~0°).
+    Wavelength and speed are not circular quantities and use a plain
+    median. These seed values feed `resolve_collisions`'s own tie-break
+    distance metric downstream.
 
     Returns
     -------
@@ -303,12 +316,6 @@ def resolve_frame_ownership(
         valid_stack[fi] = interp["_valid_mask"]
         dist_stack[fi] = interp["_nearest_dist"]
 
-    # Two families belong to the same physical wave (subject to Voronoi
-    # tie-break) if their founding centroids are within voronoi_dir_tol
-    # (axis AND full-circle azimuth) and voronoi_lam_tol of each other.
-    # Default: 1x the family-building tolerances (transitive union-find, so
-    # a looser multiplier risks chaining unrelated families -- see
-    # gabor_reconstruction.py:647-654 for the full original reasoning).
     if voronoi_dir_tol is None:
         voronoi_dir_tol = dir_tol_deg
     if voronoi_lam_tol is None:
@@ -416,130 +423,65 @@ def resolve_collisions(
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
-    Flag periods where two or more waves' reconstructions are essentially
+    Flag episodes where two or more waves' reconstructions are essentially
     the same physical structure, via direct field cross-correlation, and
     resolve one primary per episode.
 
-    Generalizes phase_speed_kalman.py's flag_kf_wave_collisions_by_correlation
-    (algorithm unchanged: per-pair smoothed correlation -> per-frame
-    connected components -> episode detection -> eligibility-gated
-    founding-parameter-distance tie-break) to run on EITHER reconstruction
-    pass, not just the second. Per the refactor kickoff decision, this
-    replaces gabor_reconstruction.py's check_duplicate_waves() entirely --
-    that function's weaker, whole-night-averaged, informational-only check
-    is superseded by this same per-frame/episode mechanism now running
-    operationally on the first pass too. `pass_label` is used only for
-    logging (e.g. "first-pass" / "second-pass"), so callers can tell which
-    pass a given result came from.
+    Algorithm: per-pair correlation (smoothed with a `smoothing_window`
+    rolling mean) → per-frame connected components (any pair whose smoothed
+    correlation clears `corr_threshold` is linked) → contiguous-frame
+    episode detection per component → an eligibility-gated,
+    founding-parameter-distance tie-break picks one primary member per
+    episode. `pass_label` is a logging-only string ("first-pass" /
+    "second-pass" or similar); this function does not branch on it.
 
-    Structural fix over the ported original, not just a port: the original
-    wrote results into a copy of an existing kf_results DataFrame, using
-    kf_results' own "frame_idx" column for one alignment step and a
-    timestamp-based searchsorted for another -- two different index spaces
-    that a later stage (the tiebreak fix) found could silently disagree by
-    a fixed offset (kf_results' frame_idx is relative to an edge-trimmed
-    slice, not the full night grid). This version builds its output
-    DataFrame directly from `waves`/`time_vals` -- the same grid
-    `wave_cubes`/`complex_amplitudes` already use -- so there is no second,
-    independently-indexed space to accidentally conflate. No kf_results-
-    shaped input required, which is also what makes this usable on the
-    first pass, before any KF-stage output exists.
+    Designed to be pass-agnostic — usable on the first-pass or second-pass
+    reconstruction — but **callers must decide `apply_duplicate_gate`
+    correctly for the pass they're calling on**: the second-pass call in
+    `run_airglow_pipeline` passes `apply_duplicate_gate=False`. Passing
+    `True` on a call this function wasn't validated for is not caught
+    automatically.
 
-    Eligibility gate (already-fixed tiebreak behavior, extended here -- see
-    FIRSTPASS_DUPLICATE_GATE_DESIGN.md / firstpass_gate_rollout_task.md): a
-    wave with amplitude effectively zero for every frame of an episode
-    doesn't enter the comparison AT ALL now, not just lose the tie-break --
-    it's dropped from the episode's group entirely and left untouched
-    (collision_primary stays True), rather than being markable as "lost to
-    a duplicate" when it had no real signal to duplicate in the first place
-    (this was the exact w1v18 moot case STAGE1_FINAL_CHECKS.md's Check 2
-    found). If every member of an episode is signal-free, falls back to the
-    original distance-only choice over the full group (outcome is moot
-    either way) -- this fallback is carried forward unchanged.
+    Eligibility gate: a wave with amplitude effectively zero for an
+    episode's entire span is excluded from the episode's comparison group
+    when `apply_duplicate_gate=True` (it can't meaningfully "lose" a
+    collision to a duplicate it never had real signal to duplicate), and
+    left with `collision_primary=True` untouched. If every member of an
+    episode is signal-free, falls back to a distance-only choice over the
+    full group. With `apply_duplicate_gate=False`, zero-amplitude waves stay
+    in the full comparison group; eligibility only preferences which member
+    is picked primary, never excludes group membership.
 
-    Duplicate-detection gate, `apply_duplicate_gate` (added
-    `firstpass_gate_rollout_task.md`, scoped
-    `decouple_and_fix_smoothing_task.md`, accepted as-is with documented
-    limitations `stage1_closeout_task.md`): when True (the default),
-    correlation alone is not sufficient for two waves to be treated as
-    colliding at a frame -- FIRSTPASS_DUPLICATE_GATE_DESIGN.md found several
-    cases (first-pass reconstructions specifically) where correlation
-    crossed threshold (0.876, 0.705) for waves with visibly different axis
-    or wavelength. Edge formation also requires
-    axis_diff_deg(orientation) < dir_tol_deg AND
-    abs(wavelength diff) < lambda_tol_km -- both evaluated on the SAME
-    smoothing_window rolling mean already applied to correlation
-    (`decouple_and_fix_smoothing_task.md`'s Task 3). The zero-amplitude
-    eligibility rule also gates group MEMBERSHIP under this mode (see
-    above), not just tie-break preference.
+    Duplicate-detection gate, `apply_duplicate_gate`: when True (the
+    default), correlation alone is not sufficient for two waves to be
+    treated as colliding at a frame — an edge also requires
+    `axis_diff_deg(orientation) < dir_tol_deg` AND
+    `abs(wavelength diff) < lambda_tol_km`, both evaluated on the same
+    smoothed rolling window as correlation. This exists because correlation
+    alone can cross `corr_threshold` for two waves with visibly different
+    orientation or wavelength.
 
-    Scoping is an explicit parameter, not implicit pass-detection --
-    `pass_label` is a logging string only and this function does not
-    inspect it. **Callers decide per call: the default (True) is for
-    first-pass calls only. Second-pass calls MUST explicitly pass
-    `apply_duplicate_gate=False`** -- second pass stays on its original,
-    extensively-validated correlation-only mechanism (byte-for-byte match
-    to phase_speed_kalman.py's flag_kf_wave_collisions_by_correlation, exact
-    regression match confirmed across all 5 reference nights). Do not
-    assume this gate is pass-agnostic just because the function accepts
-    both passes -- it structurally can run on either, but it is only
-    validated, and only intended, for the first pass. With
-    `apply_duplicate_gate=False`, zero-amplitude waves stay in the full
-    group (eligible only preferences primary selection, original "fall back
-    to the full group if nobody's eligible" semantics, not a group-
-    membership exclusion).
+    Known limitation: `lambda_tol_km`/`dir_tol_deg` here reuse the same
+    tolerances Stage A/B use for a different question (whether one wave's
+    own tracked parameters have drifted too far from where it started, a
+    temporal-continuity check) — they haven't been separately validated for
+    "are these two simultaneously-reconstructed waves the same physical
+    wave." A fixed absolute-km wavelength tolerance in particular can admit
+    a real, non-noisy relative wavelength gap between two visibly different
+    fields. Accepted for now because this gate's output feeds an
+    intermediate kernel-tuning signal, not final output, so an occasional
+    false-negative here is lower-cost than the same failure would be in
+    final parameter estimation.
 
-    **Known, accepted limitation of the axis/wavelength proximity check
-    (not fixed, documented per `stage1_closeout_task.md`)**: `lambda_tol_km`
-    was designed for a different physical question -- Stage A/B use it to
-    ask "has this one wave's own tracked wavelength drifted too far from
-    where it started," a temporal-continuity question -- and was reused here
-    unvalidated for "are these two simultaneously-reconstructed waves the
-    same physical wave," a completely different question, without checking
-    whether a fixed absolute km tolerance is appropriate for it.
-    `FIRSTPASS_GATE_ROLLOUT.md`/`DECOUPLE_AND_FIX_SMOOTHING.md` found two
-    concrete cases where it lets through a real, non-noisy relative
-    wavelength gap: `w4v2` (DOY150, ~92.8 vs ~78.9 km, 13.9 km / ~17%
-    relative) and `w6v15` (DOY150, ~126.2 vs ~145.8 km, 19.5 km / ~14%
-    relative) -- both pairs whose reconstructed fields visibly differ in
-    fringe spacing yet pass `lambda_tol_km=20.0` comfortably, stably across
-    many frames (confirmed not a smoothing artifact -- Task 3's fix changed
-    almost nothing for either). Accepted for Stage 1 because this gate's
-    actual purpose is an intermediate kernel-tuning signal (deciding which
-    detections feed second-pass kernel construction), not final output --
-    the cost of an occasional false-negative duplicate here is different
-    from, and lower than, the cost of the same failure in final estimation.
-    If this needs revisiting -- including if second-pass duplicate-gating is
-    ever reconsidered -- the natural next step is a purpose-specific,
-    possibly relative/scale-aware tolerance for duplicate-detection
-    specifically, not a first-pass-specific override of the existing one
-    (dir_tol_deg/lambda_tol_km stay the same values Stage A/B use; no
-    first-pass-specific override was introduced).
+    Known limitation: `smoothing_window=5` has no documented physical
+    rationale (unlike `corr_threshold`, which was set just above the
+    observed p99 of pairwise correlation on real data) — inherited as-is,
+    not re-derived here.
 
-    **Known, accepted limitation of `smoothing_window=5`**: no documented
-    physical rationale exists for this value anywhere in the codebase or its
-    history (`decouple_and_fix_smoothing_task.md` Task 2: `corr_threshold`
-    has a detailed empirical justification -- "just above the observed p99
-    of ~0.68" -- `smoothing_window` has never had one; one commit, `63f5b4d`,
-    has ever touched it, and never explained the number). Per
-    `refactor_foundation.md`'s standing requirement that every tunable
-    parameter carry a physically-derived rationale, this is flagged as a
-    known gap rather than silently treated as fine -- inherited, not
-    validated, not changed here.
-
-    CONFIRMED DECISION on `complex_amplitudes`: always pass the SAME pass's
-    own amplitude (first-pass amplitude for a first-pass call, second-pass
-    for a second-pass call), not always first-pass regardless of pass. The
-    original `flag_kf_wave_collisions_by_correlation` always used
-    `kf_results['amplitude']` (first-pass-derived) for this gate even when
-    resolving second-pass collisions -- almost certainly because second-pass
-    amplitude was never retained anywhere before this session's fixes, not a
-    deliberate choice. Verified on all 5 reference nights: feeding this
-    function first-pass amplitude for a second-pass call reproduces the old
-    function's primary/loser decisions exactly (0 mismatches everywhere);
-    each pass using its own amplitude (this function's actual behavior)
-    differs from that old behavior by 26-482 primary-flag disagreements per
-    night -- expected and intended, not a bug.
+    `complex_amplitudes` should be the SAME pass's own amplitude series as
+    `wave_cubes` (first-pass amplitude for a first-pass call, second-pass
+    for a second-pass call) — this is what the eligibility gate and
+    tie-break both key off of.
 
     Parameters
     ----------
@@ -553,9 +495,8 @@ def resolve_collisions(
         This pass's reconstructed fields, one per wave, same order as `waves`.
     complex_amplitudes : list of np.ndarray, each (n_time,) complex
         This pass's cross-correlation phasor per wave (from
-        reconstruct_all_waves' own return value) -- used for the
-        eligibility gate via |A|. Decoupled from any kf_results-shaped
-        input specifically so this works before Step 3 exists.
+        `reconstruct_all_waves`' own return value) -- used for the
+        eligibility gate via |A|.
     time_vals : np.ndarray of datetime64
         Full night time grid, same length/order as wave_cubes[i].
     pass_label : str
@@ -604,18 +545,13 @@ def resolve_collisions(
             smoothed[(i, j)] = (
                 pd.Series(raw).rolling(window=smoothing_window, min_periods=1).mean().to_numpy()
             )
-            # Per-frame axis/wavelength proximity, from each wave's own
-            # per-frame series -- the duplicate-detection gate (see
-            # docstring): correlation alone is not sufficient to call two
-            # waves the same physical structure. Smoothed with the SAME
-            # rolling window as correlation (Task 3, decouple_and_fix_
-            # smoothing_task.md) -- comparing a smoothed correlation series
-            # against instantaneous axis/wl values let genuinely-different
-            # pairs slip through when their correlation dipped below
-            # threshold on the sampled frame but stayed elevated nearby
-            # (the smoothed series), while axis/wl (unsmoothed) still
-            # happened to read close on that same frame; see
-            # FIRSTPASS_GATE_ROLLOUT.md's w4v2/w6v15 findings.
+            # Per-frame axis/wavelength proximity for the duplicate-
+            # detection gate (see docstring). Smoothed with the SAME
+            # rolling window as correlation, not compared instantaneous --
+            # comparing a smoothed correlation series against instantaneous
+            # axis/wavelength values lets genuinely-different pairs slip
+            # through on frames where correlation dipped momentarily but
+            # axis/wavelength still happened to read close.
             if apply_duplicate_gate:
                 oi = np.asarray(waves[i]["orientation_deg_series"], dtype=float) % 180.0
                 oj = np.asarray(waves[j]["orientation_deg_series"], dtype=float) % 180.0
@@ -710,16 +646,13 @@ def resolve_collisions(
             if not np.all(amp_i < 1e-9):
                 eligible.add(wid)
 
-        # Zero-amplitude ineligibility: under the duplicate gate (see
-        # docstring), this excludes signal-free members from GROUP
-        # MEMBERSHIP entirely, not just primary-preference -- a signal-free
-        # member can't be marked collision_primary=False for "losing" to a
-        # duplicate it had no real presence to lose to. With the gate off,
-        # this reverts exactly to the original semantics: `eligible` only
+        # Zero-amplitude ineligibility: under the duplicate gate, this
+        # excludes signal-free members from group membership entirely, not
+        # just primary-preference -- a signal-free member can't be marked
+        # collision_primary=False for "losing" to a duplicate it had no
+        # real presence to lose to. With the gate off, `eligible` only
         # preferences which member is picked primary; every member of
-        # `group` still gets a row (this is the byte-for-byte
-        # flag_kf_wave_collisions_by_correlation match apply_duplicate_gate
-        # =False requires).
+        # `group` still gets a row.
         if apply_duplicate_gate:
             comparison_group = eligible if eligible else set(group)
         else:
@@ -775,10 +708,8 @@ def unified_validity_mask(owned_mask, collision_primary, amplitude, snr_min_ampl
     """
     The single authoritative per-frame validity answer, combining Stage B's
     ownership with Stage C's collision outcome and a fresh signal-presence
-    check -- replaces the ad hoc combination STEP5_DESIGN_SCOPING.md had
-    final_estimation.py build for itself (owned_mask AND collision_primary
-    AND fresh-SNR); that combining logic now lives here, computed once,
-    for kernel_tuning.py and final_estimation.py to both consume identically.
+    check -- computed once here so `kernel_tuning.py` and
+    `final_estimation.py` both consume the same definition.
 
     Closes a real gap `collision_primary` has on its own: it defaults True
     for any frame that never triggered the correlation check at all --

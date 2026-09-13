@@ -1,46 +1,30 @@
 """
 kernel_tuning.py
 -----------------
-Step 3 of the five-step architecture (`refactor_foundation.md`): first-pass
-reconstruction -> smoothing. Purpose: produce a *good tuning signal* for
-step 4's second-pass Gabor kernel, nothing more. Calls `smoothing.py`'s
-offline (non-causal) engine on first-pass per-wave observations, replacing
-`phase_speed_kalman.py`'s causal `analyze_all_waves_kalman` for exactly
-this purpose (kernel construction) -- not for anything downstream of it.
+Builds the offline-smoothed orientation/wavelength signal that drives the
+second-pass Gabor kernel. Runs `smoothing.py`'s offline RTS engine on
+first-pass per-wave observations, in place of `phase_speed_kalman.py`'s
+causal `analyze_all_waves_kalman`, for this one purpose only.
 
-**Explicitly internal/diagnostic output, never written to the permanent
-final schema** (`refactor_foundation.md`'s persistence-boundary demand):
-everything this module returns is a kernel-tuning INPUT for step 4, not a
-reportable final quantity. `final_estimation.py` (step 5, on the
-SECOND-pass reconstruction, after lobe disambiguation) is the only module
-whose output reaches persisted tables -- a separate, not-yet-built stage.
+Everything this module returns is an internal/diagnostic tuning INPUT --
+never written to the permanent output schema. `final_estimation.py` (run on
+the second-pass reconstruction, after lobe disambiguation) is what actually
+produces the persisted final tables.
 
-Scope, deliberately narrower than `analyze_all_waves_kalman`: only
-orientation and wavelength are smoothed here, since those are the only two
-quantities that shape a Gabor kernel (orientation + passband center
-wavelength). Phase speed/omega tracking is a separate concern (feeds final
-per-frame speed estimates, not kernel shape) and stays entirely out of
-scope for a kernel-tuning signal -- this module does not run an omega
-tracker, causal or offline, and does not compute `is_dominant`/dwell-time
-multi-wave selection (also orthogonal to kernel shape).
+Deliberately narrower than `analyze_all_waves_kalman`: only orientation and
+wavelength are smoothed here, since those are the only two quantities that
+shape a Gabor kernel (orientation + passband center wavelength). Phase
+speed/omega tracking feeds final per-frame speed estimates, not kernel
+shape, and is entirely out of scope here -- this module runs no omega
+tracker and does no dominant-wave/dwell-time selection.
 
-**FLAGGED DESIGN DECISION (not silently made):** the ported causal
-trackers gate orientation/wavenumber innovation validity partly on the
-OMEGA tracker's own `innov_valid` mask (`phase_speed_kalman.py:1039,1119`)
--- `_kalman_theta_tracker`'s effective mask there is
-`innov_valid_w & snr_ok_w`. Since this module intentionally does not run
-an omega tracker (see above), that cross-dependency is NOT replicated
-here. Each wave's per-frame validity is self-contained: `amp > 0` and the
-SNR floor, exactly matching `smooth_orientation`/`smooth_wavenumber`'s own
-built-in gating -- no coupling to a filter this module doesn't run. This
-is a real, deliberate simplification versus the ported original's
-behavior, not an oversight: it can admit some frames the old omega-gate
-would have excluded (or, less likely, exclude none it didn't already).
-Judged acceptable given this stage's diagnostic-only status and the
-verification below (which checks the resulting reconstruction quality
-directly, not just whether the validity mask matches bit-for-bit) -- but
-flagged explicitly, per the standing practice, rather than assumed
-equivalent.
+Each wave's per-frame validity here is self-contained (`amp > 0` and the
+SNR floor, matching `smooth_orientation`/`smooth_wavenumber`'s own built-in
+gating) -- it does not additionally gate on an omega tracker's own validity
+mask the way the causal trackers in `phase_speed_kalman.py` cross-gate
+orientation/wavenumber against omega. This is a deliberate simplification,
+acceptable because this module's output is diagnostic-only (feeding the
+second-pass kernel, not a persisted quantity), not an oversight.
 """
 
 import numpy as np
@@ -75,15 +59,13 @@ def build_kernel_tuning_signal(
     Parameters
     ----------
     waves : list of dict
-        First-pass wave list (Stage B's `resolve_frame_ownership()` output,
-        or the current `waves_detected`/`build_waves_for_gabor()` output --
-        same shape either way). Must have `'azimuth'`, `'wavelength_km'`;
-        may optionally have `'orientation_deg_series'`/
-        `'wavelength_km_series'` (Stage B's own per-frame series, used ONLY
-        as the adaptive-kernel-center reference for `kernel_mismatch`, same
-        role they already play in `analyze_all_waves_kalman` -- not
-        overwritten, and not the same thing as this function's own
-        smoothed output of the same key names).
+        First-pass wave list (`wave_identity.resolve_frame_ownership`'s
+        output). Must have `'azimuth'`, `'wavelength_km'`; may optionally
+        have `'orientation_deg_series'`/`'wavelength_km_series'` (the
+        per-frame series from frame-ownership resolution), used ONLY as the
+        adaptive-kernel-center reference for `kernel_mismatch` -- not
+        overwritten, and not the same thing as this function's own smoothed
+        output under the same key names.
     kx_obs_list, ky_obs_list : list of ndarray (n_time,)
         First-pass amplitude-weighted spatial phase gradient, one per wave
         -- `reconstruct_all_waves`'s own `kx_obs_arrays`/`ky_obs_arrays`
@@ -107,17 +89,14 @@ def build_kernel_tuning_signal(
         Physical wavelength bounds, unchanged from `analyze_all_waves_kalman`'s
         defaults (5-150 km) -- converted to `k_h_min`/`k_h_max` clamp bounds.
     kf_q_theta, kf_q_dtheta, kf_r_theta_deg : float
-        Passed straight through to `smooth_orientation` -- same values,
-        same rationale (`KF_Q_THETA`'s ~10 deg/hr derivation), unchanged.
+        Passed straight through to `smooth_orientation` (see its docstring
+        for what each governs).
     wavelength_drift_frac_per_hr : float
         Passed straight through to `smooth_wavenumber`. Default 0.03
-        (3%/hr) -- the empirically-derived value from
-        `empirical_wavelength_drift_task.md`; see that module's own
-        docstring for the full derivation and named reference episodes.
+        (3%/hr), empirically derived -- see that function's docstring.
     kf_r_kh_frac : float
-        Measurement-noise fraction for the wavenumber tracker, and reused
-        (unchanged from the ported original) as
-        `wavelength_mismatch_frac` for `wavelength_kernel_mismatch`.
+        Measurement-noise fraction for the wavenumber tracker, also reused
+        as `wavelength_mismatch_frac` for `wavelength_kernel_mismatch`.
     snr_min_amplitude, chi2_gate : float
         Passed straight through to both trackers.
 

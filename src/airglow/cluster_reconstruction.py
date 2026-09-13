@@ -1,8 +1,11 @@
 """
-Cluster-Based Wavefield Reconstruction
-
-Reconstructs wavefields using cluster centroids rather than individual detections.
-Each cluster gets a single Gabor filter based on its representative parameters.
+cluster_reconstruction.py
+---------------------------
+`create_gabor_kernel`: builds the complex Gabor kernel used everywhere a
+wave is reconstructed in this pipeline (first pass, second pass, fixed and
+adaptive kernel modes) -- the single most-used low-level function in the
+whole reconstruction chain, called from `gabor_reconstruction.py`'s
+`_reconstruct_fixed`/`_reconstruct_adaptive`.
 """
 
 import numpy as np
@@ -22,23 +25,34 @@ def create_gabor_kernel(wavelength_km: float, orientation_deg: float,
                        resolution_km: float, n_stds: float = 3.0,
                        Bf: float = 1.0, Btheta: float = np.pi/4):
     """
-    Create Gabor kernel for specific wave parameters
-    
+    Build a complex Gabor kernel tuned to one wave's wavelength/orientation.
+
+    `Bf`/`Btheta` set the kernel's spatial-frequency/angular selectivity --
+    too narrow and a genuinely-drifting wave's true wavelength or
+    orientation falls outside the kernel's passband, biasing the
+    reconstructed wavenumber back toward this kernel's own center
+    wavelength/orientation rather than the wave's actual value; too wide
+    and nearby distinct waves are not separated. See
+    `wave_clustering.compute_bf_for_wavelength`/
+    `compute_adaptive_gabor_parameters` for how these are actually chosen.
+
     Parameters:
     -----------
     wavelength_km : float
         Wavelength in km
     orientation_deg : float
-        Orientation in degrees
+        Orientation in degrees, compass-bearing convention (0=North,
+        90=East) -- converted internally via `convert_angle` to the
+        math-angle rotation this kernel's construction needs.
     resolution_km : float
         Spatial resolution (km/pixel)
     n_stds : float
         Number of standard deviations for kernel size
     Bf : float
-        Frequency bandwidth parameter
+        Frequency bandwidth parameter (octaves)
     Btheta : float
         Angular bandwidth parameter (radians)
-        
+
     Returns:
     --------
     kernel : np.ndarray (complex)
@@ -66,7 +80,6 @@ def create_gabor_kernel(wavelength_km: float, orientation_deg: float,
     X, Y = np.meshgrid(x, y)
     
     # Rotate coordinates
-#    logging.info('cluster_reconstructor convert_angle')
     theta_rad = np.radians(convert_angle(orientation_deg))
     X_rot = X * np.cos(theta_rad) + Y * np.sin(theta_rad)
     Y_rot = -X * np.sin(theta_rad) + Y * np.cos(theta_rad)

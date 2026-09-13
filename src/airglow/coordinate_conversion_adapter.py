@@ -1,46 +1,22 @@
 """
-Coordinate Conversion Adapter
+coordinate_conversion_adapter.py
+----------------------------------
+`convert_angle` translates between the two angle conventions in play
+around Gabor kernel construction: standard math angle (0deg=East, 90deg=North,
+counterclockwise) and compass bearing (0deg=North, 90deg=East, clockwise -- the
+convention used for orientation_deg/azimuth throughout the rest of this
+codebase, e.g. `phase_speed_kalman.py`). `cluster_reconstruction.create_gabor_kernel`
+is this function's one live caller, converting a wave's compass-bearing
+orientation into the math-angle rotation its kernel construction needs.
 
-This module provides compatibility with your existing convert_angle() function
-and explains when/how to use it with the new Gabor code.
-
-KEY INSIGHT:
------------
-convert_angle() does: theta_new = 90 - theta_old
-
-This swaps between two conventions:
-- Convention A: 0 deg = East, 90 deg = North, counterclockwise (standard math angle)
-- Convention B: 0 deg = North, 90 deg = East, clockwise (geographic compass bearing --
-  matches the k-vector/propagation-direction convention used throughout the rest of
-  this codebase, e.g. phase_speed_kalman.py's orientation_deg/azimuth)
-
-In your current workflow:
-- FFT uses Convention A (0° = East)
-- Your Gabor code uses Convention B (0° = North)
-- You call convert_angle() to translate between them
-
-In the NEW code:
-- Both FFT and Gabor use Convention A (0° = East)
-- NO conversion needed between them!
-- Results are directly comparable
-
-However, if you want results in Convention B (to match your old outputs):
-- Apply convert_angle() to ALL output orientations
-
-BUG FIX (see CaseStudy_RealData_OneNight.ipynb history): the previous
-implementation wrapped negative results back into [0, 180) via
-`np.where(result < 0, 180 + result, result)`. That wrap is mathematically
-unnecessary (theta_new = 90 - theta_old is already its own inverse without
-it) and actively harmful for create_gabor_kernel's use of this function's
-output as a raw angle fed to cos/sin: the wrap introduces a genuine
-discontinuity exactly at theta_old = 90 deg (convert_angle(89.99) ~ 0 vs
-convert_angle(90.01) ~ 180 -- a ~180 deg jump for two inputs that should
-give nearly-identical kernels), which flips the kernel to its complex
-conjugate and inverts the sign of every downstream omega/direction estimate
-for any wave whose orientation_deg (axis) exceeds 90 deg. Verified fixed
-against a synthetic wave with known ground-truth direction across all four
-quadrants (0-360 deg) -- see the investigation in that notebook's history
-for the empirical before/after comparison.
+Deliberately NOT wrapped into [0, 180): an earlier version wrapped negative
+results back with `np.where(result < 0, 180 + result, result)`, which is
+mathematically unnecessary (`theta_new = 90 - theta_old` is already its own
+inverse without it) and was actively harmful -- the wrap introduced a
+genuine discontinuity exactly at `theta_old = 90` (a ~180 deg jump for two
+inputs that should give nearly-identical kernels), flipping the kernel to
+its complex conjugate and inverting the sign of every downstream
+omega/direction estimate for any wave whose orientation exceeds 90 deg.
 """
 
 import numpy as np

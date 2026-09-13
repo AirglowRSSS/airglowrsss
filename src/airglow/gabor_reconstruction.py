@@ -6,10 +6,9 @@ Gabor wave reconstruction for the airglow pipeline.
 Provides a unified entry point ``reconstruct_all_waves()`` that works in two
 modes depending on whether per-frame parameter arrays are supplied:
 
-Fixed-kernel mode (single omega-k → Gabor, same as realdata_validate.ipynb):
+Fixed-kernel mode (single omega-k → Gabor):
     Each wave uses one kernel built from a fixed orientation_deg and
-    wavelength_km (the omega-k detection values).  Identical to the
-    existing realdata pipeline.
+    wavelength_km (the omega-k detection values) for the whole night.
 
 Adaptive-kernel mode (sliding-window omega-k → Gabor):
     Each wave receives per-frame orientation_deg_series and
@@ -129,7 +128,7 @@ def reconstruct_all_waves(
 
 
 # ---------------------------------------------------------------------------
-# Fixed-kernel reconstruction  (identical to realdata_validate.ipynb)
+# Fixed-kernel reconstruction
 # ---------------------------------------------------------------------------
 
 def _reconstruct_fixed(
@@ -387,8 +386,9 @@ def check_duplicate_waves(wave_cubes, waves, threshold=0.5):
     other, suggesting they may be the same physical wave split into two
     families by detection noise rather than genuinely distinct waves.
 
-    Family grouping (build_wave_families) and the Gabor kernel bandwidth
-    both reduce this risk, but neither guarantees it away -- two families
+    Family grouping (`wave_identity.cluster_detections_into_families`) and
+    the Gabor kernel bandwidth both reduce this risk, but neither
+    guarantees it away -- two families
     can still survive as separate detections while their Gabor
     reconstructions end up highly correlated with each other. For a
     climatology this matters directly: counting the same physical wave as
@@ -416,8 +416,8 @@ def check_duplicate_waves(wave_cubes, waves, threshold=0.5):
     corr_matrix : np.ndarray, shape (n_waves, n_waves)
         Symmetric matrix of mean frame-by-frame Pearson r between every
         pair (diagonal is 1.0). Frames where either cube is all-zero
-        (unowned/inactive, see build_waves_for_gabor) are skipped rather
-        than counted as trivially agreeing.
+        (unowned/inactive, see `wave_identity.resolve_frame_ownership`)
+        are skipped rather than counted as trivially agreeing.
     """
     n = len(wave_cubes)
     corr_matrix = np.eye(n)
