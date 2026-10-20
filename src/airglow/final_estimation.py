@@ -17,12 +17,13 @@ Pipeline within this module, per wave:
     3. Per merged episode: lobe (propagation-direction) resolution via
        `_averaged_sign_lobe` -- an amplitude-weighted mean axis (with a
        wrap-aware unwrap to avoid a spurious 0/180° boundary artifact; see
-       that function's docstring) plus an amplitude-weighted mean sign of
-       the raw cross-correlation phase.
-    4. Each episode's own resolved azimuth/sign is its default smoothing
-       fold-reference. An episode falls back to the wave-level pooled
-       value only when its OWN evidence isn't decisive on its own terms --
-       see `SIGN_FRAC_DECISIVE_THRESHOLD`/`SIGN_FRAC_DECISIVE_MIN_FRAMES`.
+       that function's docstring) plus the sign of the amplitude-weighted
+       mean cross-correlation phase step, each frame's step referred to
+       the axis (`_aligned_phase_step`), with its significance `sign_z`.
+    4. Each episode's own resolved azimuth/sign is its smoothing
+       fold-reference when its evidence is significant (`SIGN_Z_DECISIVE`);
+       otherwise the wave-level pooled value if that is significant, else
+       the Stage-1 omega-k direction.
        `lobe_disagreement`/`lobe_majority_frac` are reported per wave as a
        QC signal of how much its episodes vary, not as a gate on which
        episode's evidence is trusted.
@@ -140,6 +141,24 @@ def merge_close_episodes(episodes: list, max_gap: int = 2) -> list:
 # Lobe disambiguation (Task 3's second half)
 # ---------------------------------------------------------------------------
 
+def _aligned_phase_step(kx, ky, complex_amp, ref_deg):
+    """
+    Per-frame cross-correlation phase step, signed relative to `ref_deg`:
+    positive when the frame says the wave travels toward `ref_deg`.
+
+    A frame's phase step is relative to its own phase-gradient direction
+    (lobe = atan2(-kx, -ky)), not to any fixed axis: a positive step means
+    travel toward lobe + 180. The second-pass kernel's lobe can flip by 180
+    deg between frames (its orientation is an axis, tuned per frame), most
+    often when the axis is near 0/180, so steps from different frames are
+    comparable only after referring each to a common direction. `ref_deg`
+    may be a scalar or per-frame array.
+    """
+    lobe = np.arctan2(-kx, -ky)
+    toward = np.cos(lobe - np.deg2rad(ref_deg)) < 0.0      # lobe ~ ref + 180
+    return np.where(toward, 1.0, -1.0) * np.angle(complex_amp)
+
+
 def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
     """
     Averaged-sign lobe resolution over an arbitrary set of frame indices
@@ -156,8 +175,9 @@ def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
     only near-full-period jumps, i.e. the wrap artifact, while leaving a
     genuine gradual change in axis alone), then halve back before
     averaging. The propagation sign is resolved separately, as the
-    amplitude-weighted mean sign of the raw (not `abs()`-ed) cross-
-    correlation phase.
+    amplitude-weighted mean of the cross-correlation phase step, each
+    frame's step referred to the unwrapped axis (`_aligned_phase_step`);
+    `sign_z` is that mean over its standard error.
 
     Returns None if fewer than 1 usable frame.
     """
@@ -186,11 +206,21 @@ def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
     mean_axis_unwrapped = np.average(axis_deg_unwrapped, weights=amp_w)
     mean_axis = mean_axis_unwrapped % 180.0   # canonical [0,180) label, for reporting only
 
-    angle_signed = np.angle(A_m)
-    overall_sign_val = np.average(angle_signed, weights=amp_w)
+    # Phase steps referred to each frame's position on the unwrapped axis
+    # (positive = travel toward that axis value, negative = toward +180).
+    step = _aligned_phase_step(kx_m, ky_m, A_m, axis_deg_unwrapped)
+    overall_sign_val = np.average(step, weights=amp_w)
     overall_sign = 1 if overall_sign_val >= 0 else -1
-    agree = (np.sign(angle_signed) == overall_sign)
+    agree = (np.sign(step) == overall_sign)
     sign_frac = float(np.sum(amp_w[agree]) / np.sum(amp_w))
+    # Significance of the mean step (amplitude-weighted mean / its standard
+    # error): per-frame steps are noisy (std ~1 rad at low SNR) while the
+    # true step is omega*dt (0.25 rad for a 50-min period at 2-min cadence),
+    # so many frames can carry a clear mean with sign_frac barely above 0.5.
+    var = np.average((step - overall_sign_val) ** 2, weights=amp_w)
+    se = np.sqrt(var * np.sum(amp_w ** 2)) / np.sum(amp_w)
+    sign_z = (float(abs(overall_sign_val) / se) if se > 0
+              else (np.inf if overall_sign_val != 0 else 0.0))
 
     # Sign convention: positive overall sign -> axis as-is; negative ->
     # axis + 180. Combined using the UNWRAPPED mean (mean_axis_unwrapped),
@@ -200,7 +230,7 @@ def _averaged_sign_lobe(kx, ky, complex_amp, idx) -> dict:
     azimuth_deg = (mean_axis_unwrapped if overall_sign > 0 else mean_axis_unwrapped + 180.0) % 360.0
 
     return dict(axis_deg=mean_axis, azimuth_deg=azimuth_deg, sign=overall_sign,
-                sign_frac=sign_frac, n_frames=int(m.sum()))
+                sign_frac=sign_frac, sign_z=sign_z, n_frames=int(m.sum()))
 
 
 MINORITY_DISAGREEMENT_FRAC = 0.30
@@ -212,43 +242,23 @@ the observed distribution of per-wave minority fractions, separating
 confident near-unanimous waves from genuinely near-even splits.
 
 Purely informational -- does not gate which episode's own resolved
-azimuth/sign is used in the final trajectory (see
-`SIGN_FRAC_DECISIVE_THRESHOLD` for the condition that actually governs
-that). `disagreement`/`majority_frac` are reported as a QC signal of how
+azimuth/sign is used in the final trajectory (see `SIGN_Z_DECISIVE` for
+the condition that actually governs that). `disagreement`/`majority_frac` are reported as a QC signal of how
 much a wave's episodes vary.
 """
 
-SIGN_FRAC_DECISIVE_THRESHOLD = 1.0 - MINORITY_DISAGREEMENT_FRAC
+SIGN_Z_DECISIVE = 3.0
 """
-Per-episode confidence bar: an episode's OWN `sign_frac` (from
-`_averaged_sign_lobe` -- amplitude-weighted agreement with its own
-resolved sign) must clear this to stand alone as its own smoothing
-fold-reference in `estimate_wave_final`. Below it, the episode falls back
-to the pooled wave-level value instead -- not because it disagrees with
-the wave's majority (that alone is not disqualifying), but because its
-own evidence isn't decisive enough to trust independent of what any other
-episode says.
-
-Reuses `1 - MINORITY_DISAGREEMENT_FRAC` (0.70) rather than an independent
-constant, since both thresholds answer "is this evidence decisive,"
-just measured on different populations (frame-count share of the whole
-wave vs. amplitude-weighted sign agreement within one episode).
-
-`sign_frac` alone is not sufficient to decide this reliably: it's a
-fragile statistic on a short episode (a 3-4 frame episode can clear a
-0.70 bar by chance alone) -- see `SIGN_FRAC_DECISIVE_MIN_FRAMES`, which
-this threshold requires alongside a minimum frame count.
-"""
-
-SIGN_FRAC_DECISIVE_MIN_FRAMES = 5
-"""
-Companion to `SIGN_FRAC_DECISIVE_THRESHOLD`: an episode must ALSO have at
-least this many frames to stand alone. `sign_frac` computed on very few
-frames is too easily pushed above a fixed threshold by chance to trust on
-its own -- a 1-frame episode's `sign_frac` is trivially 1.000 (it agrees
-with itself by construction) and carries no real statistical weight. 5 is
-a judgment call, not a value independently re-derived from a full-batch
-sweep the way `MINORITY_DISAGREEMENT_FRAC` was.
+Sign evidence bar: a set of frames (one episode, or a wave's pooled
+episodes) decides the propagation sign only when its mean aligned phase
+step is at least this many standard errors from zero (`sign_z`). Below it,
+`estimate_wave_final` uses the next level up: episode -> pooled wave ->
+the Stage-1 (omega-k) direction, which is unambiguous because omega > 0
+fixes the sign. On the single-wave Monte Carlo the omega-k direction was
+never flipped at any period or SNR, while the phase-step sign alone was
+near a coin flip for periods >= 40 min at SNR <= 0.1. A genuine reversal
+(e.g. DOY144 Family 7, episode sign_frac 1.0 over 12 frames) clears 3
+easily.
 """
 
 
@@ -261,13 +271,12 @@ def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
     low-confidence episodes carry the same weight as one long, confident
     one).
 
-    `wave_azimuth_deg`/`wave_sign_frac` (the frame-weighted pooled result)
+    `wave_azimuth_deg`/`wave_sign_frac`/`wave_sign_z` (the pooled result)
     are always computed and returned, even when `disagreement` is True --
     this function does not decide whether the pooled value is trustworthy
-    for a given caller's purpose; see `SIGN_FRAC_DECISIVE_THRESHOLD` for
-    the condition `estimate_wave_final` actually uses to decide, per
-    episode, whether to use its own resolution or fall back to this pooled
-    value. Each episode also gets its own independently-resolved
+    for a given caller's purpose; see `SIGN_Z_DECISIVE` for the condition
+    `estimate_wave_final` uses to decide, per episode, between its own
+    resolution, this pooled value and the Stage-1 direction. Each episode also gets its own independently-resolved
     azimuth/sign (`ep_results`) regardless of the pooled outcome.
 
     Returns
@@ -276,7 +285,10 @@ def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
         episodes       : list of per-episode dicts (t_start, t_end, plus
                          `_averaged_sign_lobe`'s own keys), one per input
                          episode with >=1 usable frame.
-        majority_sign  : int, +1 or -1 -- the frame-weighted majority.
+        majority_sign  : int, +1 or -1 -- the frame-weighted majority of
+                         episode signs (QC only).
+        pooled_sign    : int -- the sign of the pooled (all-episodes) mean
+                         aligned step, the sign of `wave_azimuth_deg`.
         majority_frac  : float -- majority sign's share of total valid
                          frames across all episodes ([0.5, 1.0]).
         disagreement   : bool -- True when the minority sign's share
@@ -285,9 +297,9 @@ def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
         wave_azimuth_deg : float -- the pooled, majority-consistent
                          life-of-the-wave azimuth, computed unconditionally.
                          NaN only when no usable frames exist anywhere.
-        wave_sign_frac : float -- `_averaged_sign_lobe`'s own sign_frac
-                         for the pooled (all-episodes) frame set, same NaN
-                         condition as `wave_azimuth_deg`.
+        wave_sign_frac, wave_sign_z : float -- `_averaged_sign_lobe`'s
+                         sign_frac / sign_z for the pooled (all-episodes)
+                         frame set, same NaN condition as `wave_azimuth_deg`.
     """
     ep_results = []
     for (t0, t1) in episodes:
@@ -300,7 +312,8 @@ def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
 
     if not ep_results:
         return dict(episodes=[], majority_sign=None, majority_frac=np.nan,
-                     disagreement=False, wave_azimuth_deg=np.nan, wave_sign_frac=np.nan)
+                     disagreement=False, wave_azimuth_deg=np.nan, wave_sign_frac=np.nan,
+                     wave_sign_z=np.nan)
 
     frames_by_sign = {1: 0, -1: 0}
     for r in ep_results:
@@ -311,20 +324,20 @@ def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
     minority_frac = 1.0 - majority_frac
     disagreement = minority_frac > minority_disagreement_frac
 
-    # Computed unconditionally now -- used by estimate_wave_final as the
-    # fallback for an episode whose own sign_frac isn't decisive, not
+    # Computed unconditionally -- used by estimate_wave_final as the
+    # fallback for an episode whose own sign evidence isn't decisive, not
     # gated on `disagreement` (see docstring).
     all_idx = np.concatenate([np.arange(r["t_start"], r["t_end"] + 1) for r in ep_results])
     pooled = _averaged_sign_lobe(kx, ky, complex_amp, all_idx)
-    # Pooled resolution's own sign should always match the frame-weighted
-    # majority by construction (same underlying frames, same weighting
-    # logic) -- not re-derived independently here, used directly.
+    # The pooled sign is the amplitude-weighted mean step over all frames;
+    # it can differ from the frame-count majority of episode signs.
     wave_azimuth_deg = pooled["azimuth_deg"]
     wave_sign_frac = pooled["sign_frac"]
 
     return dict(episodes=ep_results, majority_sign=majority_sign, majority_frac=majority_frac,
                 disagreement=disagreement, wave_azimuth_deg=wave_azimuth_deg,
-                wave_sign_frac=wave_sign_frac)
+                wave_sign_frac=wave_sign_frac, wave_sign_z=pooled["sign_z"],
+                pooled_sign=pooled["sign"])
 
 
 # ---------------------------------------------------------------------------
@@ -411,9 +424,15 @@ def _smooth_episode(
     wavelength_smooth_std_km = np.abs(2.0 * np.pi / kh_result["kh_smooth"] ** 2 * kh_smooth_std) / 1000.0
 
     # --- Speed: sign-corrected omega through smooth_omega, / smoothed k_h. ---
+    # Each frame's phase step referred to the episode's direction (positive
+    # = travel toward it), times episode_sign for smooth_omega's convention.
+    # Signed, not abs(): folding noisy steps of the wrong sign back positive
+    # biased speed high wherever omega*dt is small against the phase noise
+    # (long periods, low SNR).
     omega_obs_raw = np.full(n_ep, np.nan)
-    nz = amp_s > 0
-    omega_obs_raw[nz] = episode_sign * np.abs(np.angle(A_s[nz])) / dt
+    nz = (amp_s > 0) & valid_kxky
+    omega_obs_raw[nz] = episode_sign * _aligned_phase_step(
+        kx_s[nz], ky_s[nz], A_s[nz], episode_azimuth_deg) / dt
 
     omega_init = episode_sign * (2.0 * np.pi * 0.0) if not np.any(nz) else float(omega_obs_raw[nz][0])
     omega_result = smooth_omega(
@@ -461,7 +480,10 @@ def estimate_wave_final(
     Parameters
     ----------
     wave : dict
-        Must have 'label' (for diagnostics/logging).
+        Must have 'label' (for diagnostics/logging). 'azimuth' (the
+        Stage-1 omega-k direction, deg) decides the propagation sign when
+        neither the episode's nor the pooled phase-step evidence is
+        significant (`SIGN_Z_DECISIVE`).
     kx, ky : ndarray (n_time,)
         Second-pass raw amplitude-weighted spatial phase gradient.
     complex_amp : ndarray (n_time,) complex
@@ -512,24 +534,23 @@ def estimate_wave_final(
     out["lobe_disagreement"] = bool(lobe["disagreement"])
     out["lobe_majority_frac"] = lobe["majority_frac"]
 
+    stage1_az = wave.get("azimuth", np.nan)
     for eid, ep in enumerate(lobe["episodes"]):
         t0, t1 = ep["t_start"], ep["t_end"]
-        # Each episode's own independently-resolved azimuth/sign is used by
-        # default (not the wave-level pooled value, and not gated on
-        # lobe["disagreement"]). Falls back to the pooled wave-level value
-        # only when this episode's own evidence isn't both decisive and
-        # substantial enough to trust alone -- SIGN_FRAC_DECISIVE_THRESHOLD
-        # + SIGN_FRAC_DECISIVE_MIN_FRAMES, both required (see their own
-        # docstrings for why a confidence bar alone isn't sufficient).
-        if (ep["sign_frac"] >= SIGN_FRAC_DECISIVE_THRESHOLD
-                and ep["n_frames"] >= SIGN_FRAC_DECISIVE_MIN_FRAMES):
-            ep_azimuth = ep["azimuth_deg"]
-            ep_sign_frac = ep["sign_frac"]
-            ep_sign = ep["sign"]
-        else:
+        # Sign: the episode's own evidence when significant (SIGN_Z_DECISIVE),
+        # else the pooled wave's, else the Stage-1 omega-k direction (keeping
+        # the episode's own axis, choosing the end nearer Stage 1).
+        if ep["sign_z"] >= SIGN_Z_DECISIVE:
+            ep_azimuth, ep_sign, ep_sign_frac = ep["azimuth_deg"], ep["sign"], ep["sign_frac"]
+        elif lobe["wave_sign_z"] >= SIGN_Z_DECISIVE or not np.isfinite(stage1_az):
             ep_azimuth = lobe["wave_azimuth_deg"]
             ep_sign_frac = lobe["wave_sign_frac"]
-            ep_sign = lobe["majority_sign"]
+            ep_sign = lobe["pooled_sign"]
+        else:
+            flip = abs(full_circle_diff_deg(ep["azimuth_deg"], stage1_az)) > 90.0
+            ep_azimuth = (ep["azimuth_deg"] + 180.0) % 360.0 if flip else ep["azimuth_deg"]
+            ep_sign = -ep["sign"] if flip else ep["sign"]
+            ep_sign_frac = 1.0 - ep["sign_frac"] if flip else ep["sign_frac"]
 
         sm = _smooth_episode(
             kx, ky, complex_amp, dt, t0, t1, ep_azimuth, ep_sign,

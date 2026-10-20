@@ -110,7 +110,7 @@ def build_wave_hourly_table(
     or adjacent hourly bins that differ by ~180 deg, within one `wave_id`**:
     `final_estimation.py`'s lobe resolution keeps each episode's own
     independently-resolved direction by default (see that module's own
-    docstring and `SIGN_FRAC_DECISIVE_THRESHOLD`), rather than forcing
+    docstring and `SIGN_Z_DECISIVE`), rather than forcing
     every episode of a wave to agree. A discontinuity here can be
     `final_estimation.py` correctly reporting a genuine mid-life direction
     reversal -- it is not automatically a data-quality problem and should
