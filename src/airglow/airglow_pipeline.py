@@ -61,7 +61,7 @@ from scipy.stats import pearsonr
 from airglow.OmegaKFilter       import OmegaKFilterXarray
 from airglow.OmegaK_enhanced    import analyze_and_plot_waves
 from airglow.OmegaK_enhanced    import circular_mean as _cmean, circular_std as _cstd
-from airglow.wave_clustering    import compute_adaptive_gabor_parameters
+from airglow.resolution         import ResolutionSpec
 from airglow.phase_speed_kalman import (
     analyze_all_waves_kalman,
     compute_binned_wave_stats,
@@ -74,6 +74,7 @@ from airglow.wave_validation import (
 from airglow.gabor_reconstruction import (
     reconstruct_all_waves,
     check_duplicate_waves,
+    reconstruction_correlation,
 )
 from airglow.wave_identity import (
     cluster_detections_into_families,
@@ -942,16 +943,17 @@ def run_airglow_pipeline(
     max_slowness: float = 50.0,
     max_wavelength_plot: float = 150.0,
     use_peak_finding: bool = True,
-    peak_min_distance: int = 7,
-    min_power_ratio: float = 0.10,
+    # ── Resolution (one shared definition, see airglow.resolution) ───────────
+    res_dlam_frac: float = 0.20,
+    res_dtheta_deg: float = 22.5,
+    res_native_c: float = 1.5,
+    res_detection_snr: float = 30.0,
+    res_leakage_ratio: float = 0.05,
+    res_mirror_ratio: float = 0.2,
     # ── Wave family grouping ──────────────────────────────────────────────────
-    dir_tol_deg: float = 22.5,
-    lambda_tol_km: float = 20.0,
     min_detections: int = 2,
     # ── Gabor reconstruction ──────────────────────────────────────────────────
     gabor_n_stds: float = 3.0,
-    wavelength_resolution_km: float = 20.0,
-    orientation_resolution_deg: float = 22.5,
     rms_calibrate: bool = True,
     # ── Kalman: phase-speed (omega) filter ───────────────────────────────────
     kf_q_omega: float = 1e-8,
@@ -1037,27 +1039,32 @@ def run_airglow_pipeline(
         Wavelength-space plot axis limit (km).
     use_peak_finding : bool
         Use peak-finding for wave detection (recommended).
-    peak_min_distance : int
-        Minimum bin separation between detected peaks.
-    min_power_ratio : float
-        Minimum power ratio for secondary detections relative to the dominant.
-    dir_tol_deg : float
-        Direction spread tolerance within a wave family (degrees), and (via
-        orientation_resolution_deg, kept equal to this) the Gabor kernel's
-        angular bandwidth. Default 22.5 deg -- half of a 45 deg (8-point
-        compass) climatology orientation bin, chosen so waves that would
-        land in the same climatology bin get merged into one family instead
-        of surviving as separate, mutually-contaminating detections.
-    lambda_tol_km : float
-        Wavelength spread tolerance within a wave family (km).
+    res_dlam_frac, res_dtheta_deg, res_native_c : float
+        The shared resolution spec (airglow.resolution.ResolutionSpec):
+        fractional wavelength resolution, azimuth resolution (deg), and the
+        native-floor coefficient c in c*lambda/L (L = image aperture, set
+        from the data). Two components are the same wave when both their
+        fractional wavelength difference and azimuth difference are within
+        max(spec, c*lambda/L). This one definition sets every resolution
+        gate -- Stage-1 peak suppression (native cell) and peak grouping,
+        family clustering, frame-ownership groups, the collision gate --
+        and every Gabor kernel's FWHM. Default 20 % / 22.5 deg (half of a
+        45-deg, 8-point compass climatology bin).
+    res_detection_snr, res_leakage_ratio : float
+        The spec's detection gates: a Stage-1 peak counts only if its power
+        is >= res_detection_snr x the noise floor (the larger of the local
+        (kx, ky, omega) and |k|-ring median power / ln 2 -- sets the
+        false-alarm rate) and
+        >= res_leakage_ratio x the window's strongest peak (rejects window
+        sidelobes; sets the dynamic range, sqrt(ratio) in amplitude).
+    res_mirror_ratio : float
+        A wave at the opposite k (same wavelength, azimuth + 180) of a
+        stronger wave in the same window, with < res_mirror_ratio of its
+        power, is dropped as that wave's conjugate-image sidelobe.
     min_detections : int
         Minimum window appearances for a family to be retained.
     gabor_n_stds : float
         Gabor kernel spatial half-width in sigma units.
-    wavelength_resolution_km : float
-        Target wavelength resolution — sets Bf.
-    orientation_resolution_deg : float
-        Target orientation resolution — sets Btheta.
     rms_calibrate : bool
         Normalise Gabor output RMS to match omega-k.
     kf_q_omega : float
@@ -1178,6 +1185,12 @@ def run_airglow_pipeline(
     dt_min    = float(
         (time_vals[1] - time_vals[0]) / np.timedelta64(1, "m")
     )
+    resolution = ResolutionSpec(
+        dlam_frac=res_dlam_frac, dtheta_deg=res_dtheta_deg, native_c=res_native_c,
+        detection_snr=res_detection_snr, leakage_ratio=res_leakage_ratio,
+        mirror_ratio=res_mirror_ratio,
+    ).with_aperture(east_km, north_km)
+    _vprint(f"  {resolution.describe()}")
     edge_frames    = ntaps // 2
     win_len_frames = int(round(win_len_min / dt_min))
     hop_frames     = int(round(hop_min     / dt_min))
@@ -1201,8 +1214,7 @@ def run_airglow_pipeline(
         max_slowness      = max_slowness,
         max_wavelength    = max_wavelength_plot,
         use_peak_finding  = use_peak_finding,
-        peak_min_distance = peak_min_distance,
-        min_power_ratio   = min_power_ratio,
+        resolution        = resolution,
     )
 
     # ── Spatial-mean removal ──────────────────────────────────────────────────
@@ -1262,8 +1274,7 @@ def run_airglow_pipeline(
     with _maybe_quiet(verbose):
         families = cluster_detections_into_families(
             window_results,
-            dir_tol_deg    = dir_tol_deg,
-            lambda_tol_km  = lambda_tol_km,
+            resolution     = resolution,
             min_detections = min_detections,
         )
     _vprint(f"  {len(families)} family/families retained.")
@@ -1319,18 +1330,6 @@ def run_airglow_pipeline(
 
     # ── Step 4: Gabor parameters & per-frame interpolation ────────────────────
     _vprint("[4/9] Gabor parameters & per-frame interpolation ...")
-    with _maybe_quiet(verbose):
-        # wavelength_km here is only for the diagnostic printout below (the
-        # dominant family, by detection count) -- the actual Bf used for each
-        # wave's kernel is computed per-wave inside reconstruct_all_waves from
-        # wavelength_resolution_km directly, not from this call's return value.
-        _gabor_bf_repr, gabor_btheta_full = compute_adaptive_gabor_parameters(
-            wavelength_resolution_km   = wavelength_resolution_km,
-            orientation_resolution_deg = orientation_resolution_deg,
-            wavelength_km              = families[0]["wavelength_center"],
-            verbose=verbose,
-        )
-    gabor_btheta   = gabor_btheta_full / 2.0
     full_time_grid = time_vals.astype("datetime64[ns]")
 
     # Each wave's founding seed values (orientation_deg/azimuth) use
@@ -1344,8 +1343,7 @@ def run_airglow_pipeline(
             time_grid     = full_time_grid,
             n_stds        = gabor_n_stds,
             win_half_min  = win_len_min / 2.0,
-            dir_tol_deg   = dir_tol_deg,
-            lambda_tol_km = lambda_tol_km,
+            resolution    = resolution,
         )
     _vprint(f"  {len(waves_detected)} wave(s) prepared for Gabor.")
 
@@ -1361,8 +1359,7 @@ def run_airglow_pipeline(
                 data_filtered_temporal   = data_arr_full,
                 waves                    = waves_detected,
                 dx_km                    = dx_km,
-                wavelength_resolution_km = wavelength_resolution_km,
-                Btheta                   = gabor_btheta,
+                resolution               = resolution,
                 n_stds                   = gabor_n_stds,
                 rms_calibrate            = rms_calibrate,
             )
@@ -1526,7 +1523,7 @@ def run_airglow_pipeline(
                 verbose            = verbose,
                 kx_obs_list        = kx_obs_sl,
                 ky_obs_list        = ky_obs_sl,
-                btheta_rad         = gabor_btheta,
+                resolution         = resolution,
                 kf_q_theta         = kf_q_theta,
                 kf_q_dtheta        = kf_q_dtheta,
                 kf_r_theta_deg     = kf_r_theta_deg,
@@ -1582,7 +1579,7 @@ def run_airglow_pipeline(
             complex_amplitudes  = cmplx_sl,
             time_vals           = time_kf,
             dt                  = dt_seconds,
-            btheta_rad          = gabor_btheta,
+            resolution          = resolution,
             snr_min_amplitude   = kf_snr_min,
             chi2_gate           = kf_chi2_gate,
             verbose             = verbose,
@@ -1611,8 +1608,7 @@ def run_airglow_pipeline(
             data_filtered_temporal   = data_arr_full,
             waves                    = waves_kf,
             dx_km                    = dx_km,
-            wavelength_resolution_km = wavelength_resolution_km,
-            Btheta                   = gabor_btheta,
+            resolution               = resolution,
             n_stds                   = gabor_n_stds,
             rms_calibrate            = rms_calibrate,
         )
@@ -1657,8 +1653,7 @@ def run_airglow_pipeline(
             waves_kf, wave_cubes_kf, complex_amp_2nd, time_vals,
             pass_label     = "second-pass",
             corr_threshold = kf_collision_corr_threshold,
-            dir_tol_deg    = dir_tol_deg,
-            lambda_tol_km  = lambda_tol_km,
+            resolution     = resolution,
             apply_duplicate_gate = False,
             verbose        = verbose,
         )
@@ -1727,6 +1722,7 @@ def run_airglow_pipeline(
             tuning_orient_deg=tune_or_full, tuning_wavelength_km=tune_lam_full,
             tuning_wavespeed_ms=tune_spd_full,
             collision_id=cid_full, collision_primary=cp_full,
+            recon_corr=reconstruction_correlation(data_arr_full, wave_cubes_kf[wi])[0],
         ))
 
     wave_frames = build_wave_frames_table(_wave_frame_rows)

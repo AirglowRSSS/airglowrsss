@@ -16,16 +16,15 @@ from matplotlib.colors import LogNorm
 from scipy.ndimage import maximum_filter
 from sklearn.cluster import DBSCAN
 
+from airglow.resolution import ResolutionSpec
+
 def analyze_and_plot_waves(ok_filter, filtered_ds, filter_mask,
                            power_threshold=90,
                            max_slowness=50,
                            max_wavelength=200,
                            save_prefix='wave_analysis',
                            use_peak_finding=True,
-                           peak_min_distance=3,
-                           azimuth_tolerance=25,
-                           wavelength_tolerance=0.15,
-                           min_power_ratio=0.01):
+                           resolution: ResolutionSpec = None):
     """
     Complete workflow with improved statistics using circular mean and cluster detection.
     
@@ -34,8 +33,12 @@ def analyze_and_plot_waves(ok_filter, filtered_ds, filter_mask,
     use_peak_finding : bool
         If True, use peak finding instead of thresholding all bins.
         Recommended for discrete wave analysis.
-    peak_min_distance : int
-        Minimum distance between peaks (in bins). Higher = fewer, more distinct peaks.
+    resolution : ResolutionSpec
+        Shared resolvability definition (see airglow.resolution). Sets the
+        peak-suppression footprint (native cell) and the same-wave grouping
+        of peaks, and the detection gates (detection_snr, leakage_ratio).
+        Default ResolutionSpec(); its aperture is taken from ok_filter if
+        not already set.
         
     Returns
     -------
@@ -68,7 +71,7 @@ def analyze_and_plot_waves(ok_filter, filtered_ds, filter_mask,
         max_wavelength=max_wavelength,
         show_aliasing_limits=True,
         use_peak_finding=use_peak_finding,
-        peak_min_distance=peak_min_distance
+        resolution=resolution
     )
     
     # Save figure
@@ -147,9 +150,7 @@ def analyze_and_plot_waves(ok_filter, filtered_ds, filter_mask,
     
     # Identify physical waves by clustering harmonics
     physical_waves = identify_physical_waves(wave_params,
-                                             azimuth_tolerance=azimuth_tolerance,
-                                             wavelength_tolerance=wavelength_tolerance,
-                                             min_power_ratio=min_power_ratio)
+                                             resolution=wave_params['resolution'])
     print_physical_wave_summary(physical_waves)
     
     plt.show()
@@ -164,7 +165,7 @@ def plot_wave_slowness_wavelength_summary(ok_filter, filtered_fft,
                                          max_wavelength=200,
                                          show_aliasing_limits=True,
                                          use_peak_finding=True,
-                                         peak_min_distance=3):
+                                         resolution: ResolutionSpec = None):
     """
     Create a two-panel figure showing slowness and wavelength polar plots.
     
@@ -188,15 +189,15 @@ def plot_wave_slowness_wavelength_summary(ok_filter, filtered_fft,
         Whether to show aliasing boundaries
     use_peak_finding : bool
         If True, use peak finding instead of thresholding
-    peak_min_distance : int
-        Minimum distance between peaks (in bins)
+    resolution : ResolutionSpec
+        Passed to analyze_wave_parameters_with_aliasing.
     """
     
     # Extract wave parameters with aliasing classification
     wave_params = analyze_wave_parameters_with_aliasing(
         ok_filter, filtered_fft, power_threshold_percentile,
         use_peak_finding=use_peak_finding,
-        peak_min_distance=peak_min_distance
+        resolution=resolution
     )
     
     boundaries = wave_params['boundaries']
@@ -363,7 +364,7 @@ def analyze_wave_parameters_with_aliasing(ok_filter, filtered_fft,
                                          power_threshold_percentile=90,
                                          include_aliased=True,
                                          use_peak_finding=True,
-                                         peak_min_distance=3):
+                                         resolution: ResolutionSpec = None):
     """
     Extract wave parameters and classify by aliasing reliability.
     
@@ -371,9 +372,16 @@ def analyze_wave_parameters_with_aliasing(ok_filter, filtered_fft,
     ----------
     use_peak_finding : bool
         If True, find local maxima in power spectrum instead of thresholding all bins
-    peak_min_distance : int
-        Minimum distance between peaks (in bins). Higher = fewer peaks.
+    resolution : ResolutionSpec
+        Peaks are local maxima over the spec's native resolution cell
+        (ResolutionSpec.peak_footprint). Default ResolutionSpec(); the
+        aperture is set from ok_filter's grid if missing. The spec used is
+        returned as wave_params['resolution'].
     """
+    if resolution is None:
+        resolution = ResolutionSpec()
+    if resolution.aperture_km is None:
+        resolution = resolution.with_aperture(np.asarray(ok_filter.east), np.asarray(ok_filter.north))
     
     # Get aliasing boundaries
     boundaries = calculate_aliasing_boundaries(ok_filter)
@@ -386,23 +394,45 @@ def analyze_wave_parameters_with_aliasing(ok_filter, filtered_fft,
     power_positive = power[:n_omega_half, :, :]
     omega_positive = ok_filter.omega[:n_omega_half]
     
+    footprint = resolution.peak_footprint(
+        ok_filter.nx_padded, ok_filter.dx / 1000.0,
+        ok_filter.ny_padded, ok_filter.dy / 1000.0,
+        ok_filter.nt, ok_filter.nt_padded)
     if use_peak_finding:
         print("\n=== Using PEAK FINDING method ===")
-        significant_points = find_spectral_peaks(power_positive, 
+        significant_points = find_spectral_peaks(power,
                                                  power_threshold_percentile,
-                                                 min_distance=peak_min_distance)
+                                                 footprint=footprint,
+                                                 n_omega_half=n_omega_half)
     else:
         print("\n=== Using THRESHOLDING method ===")
         threshold = np.percentile(power_positive[power_positive > 0], power_threshold_percentile)
         significant_points = power_positive > threshold
     
+    # Noise floor at each candidate peak: peak_snr = power / floor is the
+    # significance used to tell waves from noise, independent of the
+    # scene's overall brightness or contrast. A peak must stand out both
+    # locally (_local_noise_floor: follows anisotropic noise, e.g. the
+    # axis-aligned sidelobes the 7x7 median filter leaves at lambda ~6 km)
+    # and against its whole |k| ring (_ring_noise_floor: treats image-scale
+    # background -- flat-field/vignetting residuals and sky gradients that
+    # land on the aperture's lowest harmonics, e.g. 2 cycles across the
+    # image at exactly 90 deg -- as background, which the local block,
+    # mostly out of the passband there, does not). Taking the larger floor
+    # can only lower false alarms, so the white-noise calibration of
+    # detection_snr still bounds them.
+    floor = np.fmax(_local_noise_floor(power_positive, significant_points, footprint),
+                    _ring_noise_floor(power_positive, significant_points, ok_filter.kx, ok_filter.ky,
+                                      2 * np.pi * resolution.native_dk_cyc_per_km() / 1000.0))
+
     azimuths = []
     phase_speeds = []
     wavelengths = []
     periods = []
     weights = []
+    peak_snr = []
     reliability = []
-    
+
     for i in range(n_omega_half):
         if omega_positive[i] <= 0:
             continue
@@ -436,6 +466,7 @@ def analyze_wave_parameters_with_aliasing(ok_filter, filtered_fft,
                             wavelengths.append(wavelength_km)
                             periods.append(period_min)
                             weights.append(power_positive[i, j, k])
+                            peak_snr.append(power_positive[i, j, k] / floor[i, j, k])
                             reliability.append(rel)
     
     # Convert to arrays
@@ -445,8 +476,10 @@ def analyze_wave_parameters_with_aliasing(ok_filter, filtered_fft,
         'wavelengths': np.array(wavelengths),
         'periods': np.array(periods),
         'weights': np.array(weights),
+        'peak_snr': np.array(peak_snr),
         'reliability': np.array(reliability),
-        'boundaries': boundaries
+        'boundaries': boundaries,
+        'resolution': resolution,
     }
     
     # Print summary
@@ -496,7 +529,113 @@ def analyze_wave_parameters_with_aliasing(ok_filter, filtered_fft,
     
     return wave_params
 
-def find_spectral_peaks(power, power_threshold_percentile, min_distance=3):
+def _local_noise_floor(power, points, footprint, train=(2, 3, 3)):
+    """
+    Local noise floor (mean noise power) at each True bin of `points` --
+    a cell-averaging CFAR estimate.
+
+    For each peak, the training region is the block of bins within
+    `train` x the guard footprint's half-width on each axis (omega, ky, kx)
+    around it, minus the guard footprint itself (the peak's own native
+    resolution cell) and any zero (out-of-passband) bins. The floor is the
+    training bins' median / ln 2: noise power per periodogram bin is
+    exponential, so that is its mean, and the median ignores a minority of
+    bins occupied by other waves. Being local in all three axes, it follows
+    red and anisotropic backgrounds (e.g. the axis-aligned sidelobes the
+    7x7 median filter leaves in the noise spectrum), which a floor averaged
+    over a whole |k| ring does not.
+
+    Returns an array shaped like `power`, filled only where `points` is
+    True (NaN elsewhere, or where no training bins remain).
+    """
+    half = np.array(footprint.shape) // 2
+    reach = np.maximum(np.ceil(half * np.asarray(train)).astype(int), half + 1)
+    # Training mask on the full block, guard footprint removed
+    block = np.ones(tuple(2 * reach + 1), dtype=bool)
+    g0 = reach - half
+    block[g0[0]:g0[0] + footprint.shape[0],
+          g0[1]:g0[1] + footprint.shape[1],
+          g0[2]:g0[2] + footprint.shape[2]] &= ~footprint
+
+    floor = np.full(power.shape, np.nan)
+    shape = np.array(power.shape)
+    for p in np.argwhere(points):
+        lo = p - reach
+        hi = p + reach + 1
+        clo = np.maximum(lo, 0)
+        chi = np.minimum(hi, shape)
+        sub = power[clo[0]:chi[0], clo[1]:chi[1], clo[2]:chi[2]]
+        m = block[clo[0] - lo[0]:block.shape[0] - (hi[0] - chi[0]),
+                  clo[1] - lo[1]:block.shape[1] - (hi[1] - chi[1]),
+                  clo[2] - lo[2]:block.shape[2] - (hi[2] - chi[2])]
+        v = sub[m]
+        v = v[v > 0]
+        if len(v):
+            floor[tuple(p)] = np.median(v) / np.log(2)
+    return floor
+
+
+def _ring_noise_floor(power, points, kx, ky, ring_width):
+    """
+    Local noise floor (mean noise power) at each True bin of `points`.
+
+    For a peak at (omega_i, |k|), the floor is the median power of the
+    in-passband (non-zero) bins in the same omega row whose |k| falls in
+    the same ring of width `ring_width` (the native resolution cell, in
+    the units of kx/ky), divided by ln 2. Noise power in a periodogram bin
+    is exponentially distributed, so median / ln 2 is its mean; the median
+    ignores the few bins a wave itself occupies on the ring. Using |k| and
+    omega locally follows a red (non-white) background.
+
+    Returns an array shaped like `power`, filled only where `points` is
+    True (NaN elsewhere, and where a ring has no in-passband bins).
+    """
+    kh = np.hypot(*np.meshgrid(kx, ky))                       # (ny, nx)
+    ring = np.floor(kh / ring_width).astype(int).ravel()
+    order = np.argsort(ring, kind='stable')
+    bounds = np.searchsorted(ring[order], np.arange(ring.max() + 2))
+    members = {r: order[bounds[r]:bounds[r + 1]] for r in range(ring.max() + 1)}
+
+    floor = np.full(power.shape, np.nan)
+    cache = {}
+    for i, j, k in np.argwhere(points):
+        key = (i, ring[j * len(kx) + k])
+        if key not in cache:
+            v = power[i].ravel()[members[key[1]]]
+            v = v[v > 0]
+            cache[key] = np.median(v) / np.log(2) if len(v) else np.nan
+        floor[i, j, k] = cache[key]
+    return floor
+
+
+def _footprint_local_maxima(power, candidates, footprint):
+    """
+    Boolean mask of candidate bins that are >= every neighbour within
+    `footprint` (centred). Neighbours wrap around every axis: `power` is a
+    full, unshifted DFT power spectrum, which is periodic, so the bins
+    across omega = 0 and across the kx = 0 / ky = 0 lines are true
+    neighbours (equivalent to maximum_filter(..., mode='wrap')).
+    """
+    centre = np.array(footprint.shape) // 2
+    offsets = np.argwhere(footprint) - centre
+    offsets = offsets[np.any(offsets != 0, axis=1)]
+    offsets = offsets[np.argsort(np.sum(offsets.astype(float) ** 2, axis=1), kind='stable')]
+
+    idx = np.argwhere(candidates)
+    val = power[tuple(idx.T)]
+    shape = np.array(power.shape)
+    for off in offsets:
+        if len(idx) == 0:
+            break
+        keep = val >= power[tuple(((idx + off) % shape).T)]
+        idx, val = idx[keep], val[keep]
+
+    peaks = np.zeros(power.shape, dtype=bool)
+    peaks[tuple(idx.T)] = True
+    return peaks
+
+
+def find_spectral_peaks(power, power_threshold_percentile, footprint, n_omega_half):
     """
     Find local maxima in the power spectrum.
     
@@ -506,35 +645,45 @@ def find_spectral_peaks(power, power_threshold_percentile, min_distance=3):
     Parameters
     ----------
     power : 3D array
-        Power spectrum (omega, ky, kx)
+        Full (both omega signs), unshifted power spectrum (omega, ky, kx)
     power_threshold_percentile : float
         Only consider peaks above this percentile
-    min_distance : int
-        Minimum distance between peaks (in bins). Higher = fewer, more distinct peaks.
+    footprint : 3D boolean array
+        Neighbourhood (omega, ky, kx) over which a peak must be the maximum
+        -- ResolutionSpec.peak_footprint, the native resolution cell.
+    n_omega_half : int
+        Peaks are returned for omega rows [0, n_omega_half) only, but are
+        tested against neighbours in the whole periodic spectrum. A wave at
+        (k, omega) has its conjugate image at (-k, -omega); when omega is
+        within the native cell of zero (less than ~c cycles per window) that
+        image leaks across omega = 0 to (-k, +small omega), where it would
+        otherwise pass as a wave travelling the opposite way.
         
     Returns
     -------
-    peaks : 3D boolean array
+    peaks : 3D boolean array, shape power[:n_omega_half].shape
         True at peak locations
     """
+    half = power[:n_omega_half]
     # Apply threshold first to reduce computation
     # Safe threshold calculation
-    if len(power[power > 0]) > 0:
-        threshold = np.percentile(power[power > 0], power_threshold_percentile)
+    if len(half[half > 0]) > 0:
+        threshold = np.percentile(half[half > 0], power_threshold_percentile)
     else:
         print("Warning: No non-zero power in spectrum")
-        return np.zeros_like(power, dtype=bool)  # Return empty mask
+        return np.zeros_like(half, dtype=bool)  # Return empty mask
         
-    above_threshold = power > threshold
-    
-    # Find local maxima using maximum filter
-    # A point is a local maximum if it equals the max in its neighborhood
-    footprint_size = 2 * min_distance + 1
-    local_max = maximum_filter(power, size=footprint_size, mode='constant', cval=0.0)
-    
-    # Peak is where: (1) power equals local max AND (2) above threshold
-    peaks = (power == local_max) & above_threshold
-    
+    above_threshold = np.zeros(power.shape, dtype=bool)
+    above_threshold[:n_omega_half] = half > threshold
+
+    # Peak = above threshold AND >= every value in its footprint neighbourhood
+    # (identical to power == maximum_filter(power, footprint, mode='wrap')
+    # & above_threshold). maximum_filter with a non-box footprint is
+    # not separable and costs O(n_bins * footprint) -- seconds per window --
+    # so test only the above-threshold candidates, nearest offsets first,
+    # dropping a candidate as soon as a neighbour exceeds it.
+    peaks = _footprint_local_maxima(power, above_threshold, footprint)[:n_omega_half]
+
     n_peaks = np.sum(peaks)
     n_threshold = np.sum(above_threshold)
     print(f"Peak finding: {n_peaks} peaks found (vs {n_threshold} bins above threshold)")
@@ -688,9 +837,7 @@ def create_aliasing_report(wave_params, output_file='aliasing_report.txt'):
     print(f"Aliasing report saved to: {output_file}")
 
 def identify_physical_waves(wave_params,
-                           azimuth_tolerance=25,
-                           wavelength_tolerance=0.15,
-                           min_power_ratio=0.01):
+                           resolution: ResolutionSpec = None):
     """
     Cluster detected peaks into physical waves by grouping harmonics and artifacts.
     
@@ -701,12 +848,15 @@ def identify_physical_waves(wave_params,
     ----------
     wave_params : dict
         Output from analyze_wave_parameters_with_aliasing
-    azimuth_tolerance : float
-        Maximum azimuth difference (degrees) to consider peaks as same wave
-    wavelength_tolerance : float
-        Maximum fractional wavelength difference (0.25 = 25%) to consider peaks as same wave
-    min_power_ratio : float
-        Minimum power ratio (relative to strongest peak) to include in analysis
+    resolution : ResolutionSpec
+        Shared resolvability definition; peaks are grouped when
+        resolution.same_wave() holds (box rule on fractional wavelength and
+        full-circle azimuth, with the native floor). Defaults to
+        wave_params['resolution'] (set by analyze_wave_parameters_with_aliasing).
+        Its detection gates select the peaks: peak_snr >= detection_snr
+        (local noise floor) and power >= leakage_ratio x the strongest
+        significant peak; then waves at the opposite k of a stronger wave
+        with < mirror_ratio of its power are dropped.
         
     Returns
     -------
@@ -732,16 +882,27 @@ def identify_physical_waves(wave_params,
     speeds = wave_params['phase_speeds'][reliable_mask]
     periods = wave_params['periods'][reliable_mask]
     weights = wave_params['weights'][reliable_mask]
+    snrs = (wave_params['peak_snr'][reliable_mask] if 'peak_snr' in wave_params
+            else np.full(len(weights), np.nan))
            
-    # Filter by minimum power
-    max_power = weights.max()
-    power_mask = weights > min_power_ratio * max_power
+    if resolution is None:
+        resolution = wave_params.get('resolution') or ResolutionSpec()
+
+    # Detection gates (ResolutionSpec): significant above the local noise
+    # floor, and not a sidelobe of a much stronger peak.
+    significant = snrs >= resolution.detection_snr
+    if not np.any(significant):
+        print(f"No peaks at >= {resolution.detection_snr:g}x the local noise floor")
+        return []
+    max_power = weights[significant].max()
+    power_mask = significant & (weights >= resolution.leakage_ratio * max_power)
     
     azimuths = azimuths[power_mask]
     wavelengths = wavelengths[power_mask]
     speeds = speeds[power_mask]
     periods = periods[power_mask]
     weights = weights[power_mask]
+    snrs = snrs[power_mask]
     original_indices = np.where(reliable_mask)[0][power_mask]
     
     if len(azimuths) == 0:
@@ -749,29 +910,16 @@ def identify_physical_waves(wave_params,
         return []
 
     print(f"\n=== PHYSICAL WAVE IDENTIFICATION ===")
-    print(f"Analyzing {len(azimuths)} peaks above {min_power_ratio*100:.1f}% of max power")
+    print(f"Analyzing {len(azimuths)} peaks at >= {resolution.detection_snr:g}x noise floor and "
+          f">= {resolution.leakage_ratio*100:.1f}% of max power")
     
-    # Cluster by k-space (wavelength and direction)
-    # Convert to features: need to handle circular azimuth properly
-    az_rad = np.deg2rad(azimuths)
-    
-    # Create feature matrix: [cos(az), sin(az), wavelength]
-    # Normalize wavelength to similar scale as trig functions
-    wl_normalized = wavelengths / wavelengths.max()
-    wl_weight = 1.0 / wavelength_tolerance  # Scale wavelength importance
-    
-    features = np.column_stack([
-        np.cos(az_rad),
-        np.sin(az_rad), 
-        wl_normalized * wl_weight
-    ])
-    
-    # DBSCAN clustering
-    # eps controls the neighborhood size
-    eps = np.sqrt(2 * (1 - np.cos(np.deg2rad(azimuth_tolerance)))**2 + 
-                  (wavelength_tolerance * wl_weight)**2)
-    
-    clustering = DBSCAN(eps=eps, min_samples=1).fit(features)
+    # Cluster by k-vector (wavelength and direction) with the shared
+    # same-wave test: DBSCAN on its normalised box distance, eps = 1.
+    # min_samples=1 makes this single linkage, so harmonics (same k,
+    # different omega) and neighbouring k-bins of one wave chain into one
+    # cluster.
+    dist = resolution.pairwise_distance(wavelengths, azimuths)
+    clustering = DBSCAN(eps=1.0, min_samples=1, metric='precomputed').fit(dist)
     labels = clustering.labels_
     
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
@@ -793,6 +941,7 @@ def identify_physical_waves(wave_params,
         c_speeds = speeds[cluster_mask]
         c_periods = periods[cluster_mask]
         c_weights = weights[cluster_mask]
+        c_snrs = snrs[cluster_mask]
         
         # Identify fundamental: usually highest power OR lowest frequency
         # For gravity waves, lowest frequency (longest period) is typically fundamental
@@ -819,6 +968,7 @@ def identify_physical_waves(wave_params,
             'period': c_periods[fundamental_idx],
             'power': c_weights[fundamental_idx],
             'total_power': np.sum(c_weights),  # Include harmonics
+            'peak_snr': c_snrs[fundamental_idx],   # power / local noise floor
             'confidence': confidence,
             'n_peaks': len(c_azimuths),
             'peak_indices': cluster_indices,
@@ -832,6 +982,25 @@ def identify_physical_waves(wave_params,
     
     # Sort by power (descending)
     physical_waves = sorted(physical_waves, key=lambda x: x['power'], reverse=True)
+
+    # Mirror gate: a weaker wave at the opposite k (same wavelength, azimuth
+    # + 180, within one resolution element) of a stronger one is the
+    # sidelobe of the stronger wave's conjugate image (-k, -omega), not a
+    # wave travelling the other way, when it carries < mirror_ratio of the
+    # power. Strongest first, so a dropped mirror never removes another wave.
+    kept = []
+    for w in physical_waves:
+        mirror_of = next((s for s in kept
+                          if w['power'] < resolution.mirror_ratio * s['power']
+                          and resolution.same_wave(w['wavelength'], (w['azimuth'] + 180.0) % 360.0,
+                                                   s['wavelength'], s['azimuth'])), None)
+        if mirror_of is None:
+            kept.append(w)
+        else:
+            print(f"Dropped mirror: {w['wavelength']:.1f} km at {w['azimuth']:.1f}° "
+                  f"({w['power'] / mirror_of['power']:.1%} of {mirror_of['wavelength']:.1f} km at "
+                  f"{mirror_of['azimuth']:.1f}°)")
+    physical_waves = kept
     
     # Print summary
     print(f"\n{'='*70}")

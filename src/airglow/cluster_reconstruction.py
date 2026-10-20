@@ -33,8 +33,8 @@ def create_gabor_kernel(wavelength_km: float, orientation_deg: float,
     reconstructed wavenumber back toward this kernel's own center
     wavelength/orientation rather than the wave's actual value; too wide
     and nearby distinct waves are not separated. See
-    `wave_clustering.compute_bf_for_wavelength`/
-    `compute_adaptive_gabor_parameters` for how these are actually chosen.
+    `resolution.ResolutionSpec.gabor_bandwidths` for how the pipeline
+    chooses them (kernel FWHM = the shared effective resolution).
 
     Parameters:
     -----------

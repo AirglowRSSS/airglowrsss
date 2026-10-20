@@ -30,6 +30,7 @@ second-pass kernel, not a persisted quantity), not an oversight.
 import numpy as np
 
 from airglow.smoothing import smooth_orientation, smooth_wavenumber
+from airglow.resolution import ResolutionSpec
 
 
 def build_kernel_tuning_signal(
@@ -39,7 +40,7 @@ def build_kernel_tuning_signal(
     complex_amplitudes: list,
     time_vals: np.ndarray,
     dt: float,
-    btheta_rad: float,
+    resolution: ResolutionSpec,
     *,
     lambda_h_min_km: float = 5.0,
     lambda_h_max_km: float = 150.0,
@@ -82,9 +83,11 @@ def build_kernel_tuning_signal(
         calling `analyze_all_waves_kalman`).
     dt : float
         Timestep, seconds.
-    btheta_rad : float
-        Gabor kernel full bandwidth (radians) -- used only for
-        `kernel_mismatch`'s threshold.
+    resolution : ResolutionSpec
+        Shared resolvability definition (aperture set) -- used only for the
+        `kernel_mismatch`/`wavelength_kernel_mismatch` thresholds (half the
+        kernel's FWHM, i.e. half the effective resolution, at each wave's
+        wavelength).
     lambda_h_min_km, lambda_h_max_km : float
         Physical wavelength bounds, unchanged from `analyze_all_waves_kalman`'s
         defaults (5-150 km) -- converted to `k_h_min`/`k_h_max` clamp bounds.
@@ -95,8 +98,7 @@ def build_kernel_tuning_signal(
         Passed straight through to `smooth_wavenumber`. Default 0.03
         (3%/hr), empirically derived -- see that function's docstring.
     kf_r_kh_frac : float
-        Measurement-noise fraction for the wavenumber tracker, also reused
-        as `wavelength_mismatch_frac` for `wavelength_kernel_mismatch`.
+        Measurement-noise fraction for the wavenumber tracker.
     snr_min_amplitude, chi2_gate : float
         Passed straight through to both trackers.
 
@@ -167,7 +169,8 @@ def build_kernel_tuning_signal(
                    if _wl_series is not None else None)
 
         th = smooth_orientation(
-            kx, ky, amp_obs, dt, theta_init_rad, btheta_rad,
+            kx, ky, amp_obs, dt, theta_init_rad,
+            np.deg2rad(float(resolution.dtheta_deg_eff(float(wave["wavelength_km"])))),
             q_theta=kf_q_theta, q_dtheta=kf_q_dtheta,
             r_theta_base_rad=r_theta_base_rad,
             snr_min_amplitude=snr_min_amplitude, chi2_gate=chi2_gate,
@@ -193,7 +196,7 @@ def build_kernel_tuning_signal(
                 wavelength_drift_frac_per_hr=wavelength_drift_frac_per_hr,
                 r_kh_base=r_kh_base, k_h_min=k_h_min, k_h_max=k_h_max,
                 valid_mask=None, kernel_wavelength_series_km=_kwl_km,
-                wavelength_mismatch_frac=kf_r_kh_frac,
+                wavelength_mismatch_frac=resolution.kernel_mismatch_limits(float(wave["wavelength_km"]))[1],
             )
             kh_smooth = kh["kh_smooth"]
             kh_est = kh["kh_est"]

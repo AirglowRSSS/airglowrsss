@@ -62,6 +62,7 @@ import warnings
 from scipy.stats import pearsonr
 
 from airglow.OmegaK_enhanced import circular_mean, circular_std
+from airglow.resolution import ResolutionSpec
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -840,7 +841,7 @@ def analyze_all_waves_kalman(
     # --- Feature A: orientation tracker ---
     kx_obs_list: list = None,
     ky_obs_list: list = None,
-    btheta_rad: float = None,
+    resolution: ResolutionSpec = None,
     kf_q_theta: float = 1e-8,
     kf_q_dtheta: float = 1e-12,
     kf_r_theta_deg: float = 15.0,
@@ -1031,7 +1032,8 @@ def analyze_all_waves_kalman(
 
     # --- Run orientation Kalman filter per wave (Feature A) ---
     have_gradient = (kx_obs_list is not None and ky_obs_list is not None)
-    _btheta = btheta_rad if btheta_rad is not None else np.deg2rad(15.0)
+    if resolution is None:
+        raise ValueError("analyze_all_waves_kalman needs a ResolutionSpec (aperture set)")
     r_theta_base = np.deg2rad(kf_r_theta_deg)
 
     kf_theta_all = []
@@ -1066,7 +1068,9 @@ def analyze_all_waves_kalman(
             amp_obs=amp_obs,
             dt=dt,
             theta_init_rad=theta_init,
-            btheta_rad=_btheta,
+            # kernel_mismatch flags estimates beyond half the kernel's
+            # angular FWHM, i.e. half the effective azimuth resolution
+            btheta_rad=np.deg2rad(float(resolution.dtheta_deg_eff(float(wave['wavelength_km'])))),
             q_theta=kf_q_theta,
             q_dtheta=kf_q_dtheta,
             r_theta_base_rad=r_theta_base,
@@ -1140,7 +1144,7 @@ def analyze_all_waves_kalman(
             k_h_max=k_h_max,
             innovation_valid=innov_valid_w,
             kernel_wavelength_series_km=_kwl_km,
-            wavelength_mismatch_frac=kf_r_kh_frac,
+            wavelength_mismatch_frac=resolution.kernel_mismatch_limits(float(wave['wavelength_km']))[1],
         )
         kf_kh_all.append(kh_out)
 

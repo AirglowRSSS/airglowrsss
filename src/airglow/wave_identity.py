@@ -48,6 +48,7 @@ from scipy.stats import pearsonr
 from airglow.angles import (
     axis_diff_deg, full_circle_diff_deg, circular_mean_axis_deg, circular_mean_full_deg,
 )
+from airglow.resolution import ResolutionSpec
 
 
 # ---------------------------------------------------------------------------
@@ -56,8 +57,7 @@ from airglow.angles import (
 
 def cluster_detections_into_families(
     window_results: list,
-    dir_tol_deg: float = 15.0,
-    lambda_tol_km: float = 20.0,
+    resolution: ResolutionSpec,
     min_detections: int = 1,
     verbose: bool = True,
 ) -> list:
@@ -65,25 +65,24 @@ def cluster_detections_into_families(
     Cluster per-window detections into temporally coherent wave families.
 
     Grouping is based only on direction and wavelength (not speed), so a
-    family can track a wave whose speed evolves over time. Merging a
-    detection into an existing group requires BOTH axis (mod-180°) AND
-    full-circle azimuth proximity — the full-circle check is what stops two
-    counter-propagating detections that happen to share an axis from being
-    merged into one family.
+    family can track a wave whose speed evolves over time. A detection
+    joins an existing group when `resolution.same_wave` holds against the
+    group's founding detection (box rule on fractional wavelength and
+    full-circle azimuth, with the native floor) — full-circle, so two
+    counter-propagating detections that share an axis are never merged.
 
     Grouping is greedy and order-dependent: each family's centroid
     (`direction_center`/`azimuth_full_center`/`wavelength_center`) is fixed
     at its founding (first-seen) detection, not updated to a running mean,
-    so a family's total member spread stays bounded by `dir_tol_deg`/
-    `lambda_tol_km` regardless of how many detections it accumulates.
+    so a family's total member spread stays bounded by one resolution
+    element regardless of how many detections it accumulates.
 
     Parameters
     ----------
     window_results  : list of per-window detection dicts (each with a
         `"physical_waves"` list and a `"center_time"`), one per sliding
         analysis window.
-    dir_tol_deg     : max azimuth difference (degrees) to merge into same family
-    lambda_tol_km   : max wavelength difference (km) to merge into same family
+    resolution      : ResolutionSpec (aperture set) -- the shared same-wave test
     min_detections  : minimum number of windows a family must appear in to be kept
     verbose : bool
         Print a per-family summary.
@@ -111,6 +110,7 @@ def cluster_detections_into_families(
                 "speed":        float(w["phase_speed"]),
                 "period":       float(w["period"]),
                 "power":        float(w.get("power",      np.nan)),
+                "peak_snr":     float(w.get("peak_snr",   np.nan)),
                 "confidence":   float(w.get("confidence", np.nan)),
             })
 
@@ -125,11 +125,8 @@ def cluster_detections_into_families(
     for w in all_waves:
         matched = False
         for g in groups:
-            if (
-                axis_diff_deg(w["direction"], g["direction_center"]) < dir_tol_deg
-                and full_circle_diff_deg(w["azimuth_full"], g["azimuth_full_center"]) < dir_tol_deg
-                and abs(w["wavelength"] - g["wavelength_center"]) < lambda_tol_km
-            ):
+            if resolution.same_wave(w["wavelength"], w["azimuth_full"],
+                                    g["wavelength_center"], g["azimuth_full_center"]):
                 g["members"].append(w)
                 matched = True
                 break
@@ -263,10 +260,8 @@ def interpolate_family_to_time_grid(
 
 
 def resolve_frame_ownership(
-    families, time_grid, n_stds=3.0,
+    families, time_grid, resolution: ResolutionSpec, n_stds=3.0,
     win_half_min=45.0,
-    dir_tol_deg=15.0, lambda_tol_km=20.0,
-    voronoi_dir_tol=None, voronoi_lam_tol=None,
 ):
     """
     Build the per-frame-owned wave list from discrete families: interpolate
@@ -278,11 +273,8 @@ def resolve_frame_ownership(
 
     Two families are considered part of the same proximity group — and
     therefore compete for ownership when both cover a frame — if their
-    founding centroids are within `voronoi_dir_tol` (axis AND full-circle
-    azimuth) and `voronoi_lam_tol` of each other; group membership is
-    transitive (union-find), so these default to the same tolerances used
-    to build the families in the first place, rather than a looser value
-    that could chain together families that were never meant to compete.
+    founding centroids satisfy `resolution.same_wave` (the same test used
+    to build the families); group membership is transitive (union-find).
 
     Each wave's scalar seed values (`orientation_deg`, `azimuth`) are the
     circular mean (`angles.circular_mean_axis_deg`/`circular_mean_full_deg`)
@@ -316,27 +308,18 @@ def resolve_frame_ownership(
         valid_stack[fi] = interp["_valid_mask"]
         dist_stack[fi] = interp["_nearest_dist"]
 
-    if voronoi_dir_tol is None:
-        voronoi_dir_tol = dir_tol_deg
-    if voronoi_lam_tol is None:
-        voronoi_lam_tol = lambda_tol_km
-
     group_id = list(range(n_fam))
     for i in range(n_fam):
         for j in range(i + 1, n_fam):
-            if (axis_diff_deg(families[i]["direction_center"],
-                               families[j]["direction_center"]) < voronoi_dir_tol
-                    and full_circle_diff_deg(families[i]["azimuth_full_center"],
-                                              families[j]["azimuth_full_center"]) < voronoi_dir_tol
-                    and abs(families[i]["wavelength_center"]
-                            - families[j]["wavelength_center"]) < voronoi_lam_tol):
+            if resolution.same_wave(families[i]["wavelength_center"],
+                                    families[i]["azimuth_full_center"],
+                                    families[j]["wavelength_center"],
+                                    families[j]["azimuth_full_center"]):
                 old_g = group_id[j]; new_g = group_id[i]
                 group_id = [new_g if g == old_g else g for g in group_id]
 
     unique_groups = sorted(set(group_id))
-    print(f"\nWave group assignment "
-          f"(voronoi_dir_tol={voronoi_dir_tol:.0f} deg, "
-          f"voronoi_lam_tol={voronoi_lam_tol:.0f} km):")
+    print(f"\nWave group assignment ({resolution.describe()}):")
     for g in unique_groups:
         mig = [fi for fi, gid in enumerate(group_id) if gid == g]
         labels = ", ".join(
@@ -417,8 +400,7 @@ def resolve_collisions(
     corr_threshold: float = 0.7,
     smoothing_window: int = 5,
     min_episode_frames: int = 3,
-    dir_tol_deg: float = 22.5,
-    lambda_tol_km: float = 20.0,
+    resolution: ResolutionSpec = None,
     apply_duplicate_gate: bool = True,
     verbose: bool = True,
 ) -> pd.DataFrame:
@@ -454,24 +436,13 @@ def resolve_collisions(
 
     Duplicate-detection gate, `apply_duplicate_gate`: when True (the
     default), correlation alone is not sufficient for two waves to be
-    treated as colliding at a frame — an edge also requires
-    `axis_diff_deg(orientation) < dir_tol_deg` AND
-    `abs(wavelength diff) < lambda_tol_km`, both evaluated on the same
-    smoothed rolling window as correlation. This exists because correlation
-    alone can cross `corr_threshold` for two waves with visibly different
-    orientation or wavelength.
-
-    Known limitation: `lambda_tol_km`/`dir_tol_deg` here reuse the same
-    tolerances Stage A/B use for a different question (whether one wave's
-    own tracked parameters have drifted too far from where it started, a
-    temporal-continuity check) — they haven't been separately validated for
-    "are these two simultaneously-reconstructed waves the same physical
-    wave." A fixed absolute-km wavelength tolerance in particular can admit
-    a real, non-noisy relative wavelength gap between two visibly different
-    fields. Accepted for now because this gate's output feeds an
-    intermediate kernel-tuning signal, not final output, so an occasional
-    false-negative here is lower-cost than the same failure would be in
-    final parameter estimation.
+    treated as colliding at a frame — an edge also requires the two waves'
+    orientations (axial) and wavelengths to be within one resolution element
+    on both axes (`resolution.components`, each smoothed on the same rolling
+    window as correlation). This exists because correlation alone can cross
+    `corr_threshold` for two waves with visibly different orientation or
+    wavelength. `resolution` is required (aperture set); it also normalises
+    the primary tie-break distance.
 
     Known limitation: `smoothing_window=5` has no documented physical
     rationale (unlike `corr_threshold`, which was set just above the
@@ -526,6 +497,8 @@ def resolve_collisions(
             print(f"No collision check ({pass_label}): fewer than 2 waves.")
         return base_rows
 
+    if resolution is None:
+        raise ValueError("resolve_collisions needs a ResolutionSpec (aperture set)")
     smoothed = {}
     axis_diff_by_pair = {}
     wl_diff_by_pair = {}
@@ -557,12 +530,13 @@ def resolve_collisions(
                 oj = np.asarray(waves[j]["orientation_deg_series"], dtype=float) % 180.0
                 li = np.asarray(waves[i]["wavelength_km_series"], dtype=float)
                 lj = np.asarray(waves[j]["wavelength_km_series"], dtype=float)
+                d_lam, d_az = resolution.components(li, oi, lj, oj, axial=True)
                 axis_diff_by_pair[(i, j)] = (
-                    pd.Series(axis_diff_deg(oi, oj))
+                    pd.Series(d_az)
                     .rolling(window=smoothing_window, min_periods=1).mean().to_numpy()
                 )
                 wl_diff_by_pair[(i, j)] = (
-                    pd.Series(np.abs(li - lj))
+                    pd.Series(d_lam)
                     .rolling(window=smoothing_window, min_periods=1).mean().to_numpy()
                 )
 
@@ -598,9 +572,9 @@ def resolve_collisions(
             if apply_duplicate_gate:
                 ad = axis_diff_by_pair[pair][t]
                 wld = wl_diff_by_pair[pair][t]
-                if not (np.isfinite(ad) and ad < dir_tol_deg):
+                if not (np.isfinite(ad) and ad <= 1.0):
                     continue
-                if not (np.isfinite(wld) and wld < lambda_tol_km):
+                if not (np.isfinite(wld) and wld <= 1.0):
                     continue
             edges.append(pair)
         frame_groups.append(set(_components(edges)))
@@ -664,8 +638,8 @@ def resolve_collisions(
             gli = float(waves[wid]["wavelength_km"])
             oi = waves[wid]["orientation_deg_series"][seg]
             li = waves[wid]["wavelength_km_series"][seg]
-            d = np.nanmean(axis_diff_deg(oi % 180.0, gi) / dir_tol_deg
-                            + np.abs(li - gli) / lambda_tol_km)
+            d_lam, d_az = resolution.components(li, oi % 180.0, gli, gi, axial=True)
+            d = np.nanmean(d_az + d_lam)
             dists[wid] = d if np.isfinite(d) else np.inf
 
         if apply_duplicate_gate:

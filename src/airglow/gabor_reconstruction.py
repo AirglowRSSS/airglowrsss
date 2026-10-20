@@ -21,12 +21,11 @@ steps (cross-validation, Kalman tracker) work unchanged.
 
 Public API
 ----------
-reconstruct_all_waves(data, waves, dx_km, wavelength_resolution_km, Btheta, ...)
-    Unified dispatcher — use this in notebooks. Bf (the Gabor frequency
-    bandwidth) is derived per wave from wavelength_resolution_km and that
-    wave's own wavelength_km, not passed in directly — see
-    compute_bf_for_wavelength() in wave_clustering.py for why a single Bf
-    can't be correct across all wavelengths at once.
+reconstruct_all_waves(data, waves, dx_km, resolution, ...)
+    Unified dispatcher — use this in notebooks. Each kernel's bandwidths
+    (Bf, Btheta) come from resolution.gabor_bandwidths(wavelength) at that
+    kernel's own wavelength, so its amplitude FWHM equals the shared
+    effective resolution on both axes (see airglow.resolution).
 """
 
 import numpy as np
@@ -35,7 +34,7 @@ from scipy.stats import pearsonr
 
 # The existing Gabor implementation — imported, never reimplemented here.
 from airglow.cluster_reconstruction import create_gabor_kernel
-from airglow.wave_clustering import compute_bf_for_wavelength
+from airglow.resolution import ResolutionSpec
 
 
 # ---------------------------------------------------------------------------
@@ -46,8 +45,7 @@ def reconstruct_all_waves(
     data_filtered_temporal,
     waves,
     dx_km,
-    wavelength_resolution_km,
-    Btheta=np.pi / 4,
+    resolution: ResolutionSpec,
     n_stds=3.0,
     rms_calibrate=True,
 ):
@@ -74,17 +72,11 @@ def reconstruct_all_waves(
     dx_km : float
         Pixel spacing in km (east = north assumed).
 
-    wavelength_resolution_km : float
-        Target wavelength bandwidth (km) for each wave's Gabor kernel.  Bf is
-        computed per wave (fixed mode) / per kernel rebuild (adaptive mode)
-        from this wave's own wavelength_km via compute_bf_for_wavelength, so
-        the kernel's absolute km-wide selectivity matches this value at every
-        wave's own scale, instead of one Bf computed at a fixed reference
-        wavelength and reused everywhere (correct only near that reference).
-
-    Btheta : float
-        Gabor angular bandwidth (radians).  Wavelength-independent, so this
-        stays a single value shared across all waves.
+    resolution : ResolutionSpec
+        Shared resolvability definition (aperture set). Each kernel is
+        built with resolution.gabor_bandwidths(wavelength) -- amplitude
+        FWHM = effective resolution in wavelength and azimuth at that
+        kernel's own wavelength.
 
     n_stds : float
         Kernel half-width in sigma units.
@@ -117,12 +109,12 @@ def reconstruct_all_waves(
 
     if adaptive:
         return _reconstruct_adaptive(
-            data_filtered_temporal, waves, dx_km, wavelength_resolution_km, Btheta, n_stds,
+            data_filtered_temporal, waves, dx_km, resolution, n_stds,
             rms_calibrate,
         )
     else:
         return _reconstruct_fixed(
-            data_filtered_temporal, waves, dx_km, wavelength_resolution_km, Btheta, n_stds,
+            data_filtered_temporal, waves, dx_km, resolution, n_stds,
             rms_calibrate,
         )
 
@@ -135,8 +127,7 @@ def _reconstruct_fixed(
     data_filtered_temporal,
     waves,
     dx_km,
-    wavelength_resolution_km,
-    Btheta,
+    resolution,
     n_stds,
     rms_calibrate,
 ):
@@ -150,12 +141,13 @@ def _reconstruct_fixed(
         orientation_deg = wave["orientation_deg"]
         wavelength_km   = wave["wavelength_km"]
         w_n_stds        = wave.get("n_stds", n_stds)
-        Bf              = compute_bf_for_wavelength(wavelength_resolution_km, wavelength_km)
+        Bf, Btheta      = resolution.gabor_bandwidths(wavelength_km)
 
         print(
             f"  [{wi+1}/{n_waves}] {label}: "
             f"lambda={wavelength_km:.1f} km, orient={orientation_deg:.1f} deg, "
-            f"Bf={Bf:.3f} octaves, n_stds={w_n_stds}  [fixed kernel]"
+            f"Bf={Bf:.3f} octaves, Btheta={np.degrees(Btheta):.1f} deg, "
+            f"n_stds={w_n_stds}  [fixed kernel]"
         )
 
         kernel = create_gabor_kernel(
@@ -209,8 +201,7 @@ def _reconstruct_adaptive(
     data_filtered_temporal,
     waves,
     dx_km,
-    wavelength_resolution_km,
-    Btheta,
+    resolution,
     n_stds,
     rms_calibrate,
 ):
@@ -288,7 +279,7 @@ def _reconstruct_adaptive(
                 or abs(od - _cache_orient) > _ORIENT_TOL
                 or abs(wl - _cache_wl)     > _WL_TOL
             ):
-                Bf = compute_bf_for_wavelength(wavelength_resolution_km, wl)
+                Bf, Btheta = resolution.gabor_bandwidths(wl)
                 _cache_kernel = create_gabor_kernel(
                     wavelength_km=wl,
                     orientation_deg=od,
@@ -458,3 +449,43 @@ def check_duplicate_waves(wave_cubes, waves, threshold=0.5):
 # ---------------------------------------------------------------------------
 # Utility: interpolate family parameters to the full time grid
 # ---------------------------------------------------------------------------
+
+
+def reconstruction_correlation(data_filtered_temporal, wave_cube, frames=None):
+    """
+    Pearson correlation between one wave's reconstruction and the filtered
+    data it was reconstructed from -- r**2 is roughly the fraction of the
+    filtered-data variance this wave explains, a measure of how dominant
+    it is in the scene.
+
+    Parameters
+    ----------
+    data_filtered_temporal, wave_cube : (n_time, ny, nx) arrays
+    frames : optional (n_time,) bool mask of frames to use (e.g. the wave's
+        owned frames); frames where the reconstruction is all zero (not
+        reconstructed) are always skipped.
+
+    Returns
+    -------
+    r_frames : (n_time,) per-frame correlation over pixels (NaN where skipped)
+    r_pooled : correlation over all pixels of all used frames, each frame
+        mean-removed (NaN if no frame is used)
+    """
+    data = np.asarray(data_filtered_temporal, dtype=float)
+    cube = np.asarray(wave_cube, dtype=float)
+    n_time = data.shape[0]
+    use = np.array([np.any(cube[t] != 0) for t in range(n_time)])
+    if frames is not None:
+        use &= np.asarray(frames, dtype=bool)
+    r_frames = np.full(n_time, np.nan)
+    sxy = sxx = syy = 0.0
+    for t in np.flatnonzero(use):
+        ok = np.isfinite(data[t]) & np.isfinite(cube[t])
+        x = cube[t][ok] - cube[t][ok].mean()
+        y = data[t][ok] - data[t][ok].mean()
+        xy, xx, yy = float(x @ y), float(x @ x), float(y @ y)
+        if xx > 0 and yy > 0:
+            r_frames[t] = xy / np.sqrt(xx * yy)
+            sxy, sxx, syy = sxy + xy, sxx + xx, syy + yy
+    r_pooled = sxy / np.sqrt(sxx * syy) if sxx > 0 and syy > 0 else np.nan
+    return r_frames, float(r_pooled)

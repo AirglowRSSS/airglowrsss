@@ -42,7 +42,7 @@ WAVE_FRAMES_COLUMNS = [
     "final_azimuth_deg", "final_wavelength_km", "final_speed_ms",
     "final_azimuth_std_deg", "final_wavelength_std_km", "final_speed_std_ms",
     "lobe_sign_frac", "lobe_disagreement", "lobe_majority_frac",
-    "collision_id", "collision_primary",
+    "collision_id", "collision_primary", "recon_corr",
 ]
 
 
@@ -50,7 +50,7 @@ def build_wave_frame_rows(
     wave_id, est_df: pd.DataFrame, *,
     raw_amplitude_1st, raw_amplitude_2nd, raw_kx_2nd, raw_ky_2nd,
     tuning_orient_deg, tuning_wavelength_km, tuning_wavespeed_ms,
-    collision_id, collision_primary,
+    collision_id, collision_primary, recon_corr=None,
 ) -> pd.DataFrame:
     """
     One wave's full `wave_frames.csv` row set: `estimate_wave_final`'s own
@@ -62,6 +62,10 @@ def build_wave_frame_rows(
     `searchsorted` when the source is a per-wave, edge-trimmed causal-KF
     slice, as `run_airglow_pipeline` does for the `tuning_*` columns). No
     re-alignment is performed here.
+
+    `recon_corr` is the per-frame correlation between this wave's
+    second-pass reconstruction and the filtered data
+    (`gabor_reconstruction.reconstruction_correlation`); NaN if omitted.
     """
     df = est_df.copy()
     df.insert(0, "wave_id", wave_id)
@@ -74,6 +78,7 @@ def build_wave_frame_rows(
     df["tuning_wavespeed_ms"] = tuning_wavespeed_ms
     df["collision_id"] = collision_id
     df["collision_primary"] = collision_primary
+    df["recon_corr"] = np.nan if recon_corr is None else recon_corr
     return df[WAVE_FRAMES_COLUMNS]
 
 
