@@ -13,7 +13,10 @@ Pipeline within this module, per wave:
     2. Episodes = maximal contiguous runs of `valid[t] == True`, then
        merged across short (<=2 frame) invalid gaps
        (`merge_close_episodes`) -- a brief validity dropout should not
-       split one continuous physical presence into separate episodes.
+       split one continuous physical presence into separate episodes --
+       then split where the propagation sign reverses for a sustained run
+       (`split_at_reversals`), so a wave that turns around without a
+       validity gap gets one direction per leg.
     3. Per merged episode: lobe (propagation-direction) resolution via
        `_averaged_sign_lobe` -- an amplitude-weighted mean axis (with a
        wrap-aware unwrap to avoid a spurious 0/180° boundary artifact; see
@@ -22,8 +25,10 @@ Pipeline within this module, per wave:
        the axis (`_aligned_phase_step`), with its significance `sign_z`.
     4. Each episode's own resolved azimuth/sign is its smoothing
        fold-reference when its evidence is significant (`SIGN_Z_DECISIVE`);
-       otherwise the wave-level pooled value if that is significant, else
-       the Stage-1 omega-k direction.
+       otherwise the wave-level pooled value. Frames are flagged
+       `direction_ambiguous` when that deciding `sign_z` is below
+       `SIGN_Z_DECISIVE` or the smoothed speed is below
+       `AMBIGUOUS_SPEED_MS`.
        `lobe_disagreement`/`lobe_majority_frac` are reported per wave as a
        QC signal of how much its episodes vary, not as a gate on which
        episode's evidence is trusted.
@@ -252,14 +257,94 @@ SIGN_Z_DECISIVE = 3.0
 Sign evidence bar: a set of frames (one episode, or a wave's pooled
 episodes) decides the propagation sign only when its mean aligned phase
 step is at least this many standard errors from zero (`sign_z`). Below it,
-`estimate_wave_final` uses the next level up: episode -> pooled wave ->
-the Stage-1 (omega-k) direction, which is unambiguous because omega > 0
-fixes the sign. On the single-wave Monte Carlo the omega-k direction was
-never flipped at any period or SNR, while the phase-step sign alone was
-near a coin flip for periods >= 40 min at SNR <= 0.1. A genuine reversal
-(e.g. DOY144 Family 7, episode sign_frac 1.0 over 12 frames) clears 3
-easily.
+an episode takes the pooled wave's sign. A genuine reversal (e.g. DOY144
+Family 7, episode sign_frac 1.0 over 12 frames) clears 3 easily, while a
+1-3 frame fragment's own sign does not decide (the case the former
+sign_frac/min-frames rule covered).
+
+The Stage-1 omega-k direction is deliberately not a fallback: it was never
+flipped in the single-wave Monte Carlo, but on real nights it was opposite
+to the motion measured directly from the second-pass wave movie for whole
+episodes (40-65 frames on 3 of 5 nights; 291 of 4968 frames reversed vs 95
+for this rule, 2026-10-21) -- the same lesson as the August decision not
+to override the reconstruction's evidence with another estimator.
 """
+
+MIN_REVERSAL_FRAMES = 5
+"""
+Shortest run of frames on either side of a mid-episode reversal for
+`split_at_reversals` to split there (10 min at 2-min cadence).
+"""
+
+AMBIGUOUS_SPEED_MS = 20.0
+"""
+Below this |final_speed_ms| a frame's direction is flagged ambiguous
+(`direction_ambiguous`): the speed and the propagation sign come from the
+same phase step, so as the speed tends to zero the sign is set by noise.
+On DOY144 2022 / DOY173 2023 the reported direction opposed the motion in
+the reconstruction movie for 56% of frames below 10 m/s, 32% at 10-20 m/s,
+20% at 20-40 and 4-5% above 40 (2026-10-22).
+"""
+
+
+def _signed_z_cumulative(step, w):
+    """Weighted mean and sign_z (as in `_averaged_sign_lobe`) of step[:s] for
+    every s = 1..n; returns (mean[s-1], z[s-1])."""
+    S0, S1, S2, Q = (np.cumsum(w), np.cumsum(w * step), np.cumsum(w * step ** 2),
+                     np.cumsum(w ** 2))
+    mean = S1 / S0
+    var = np.maximum(S2 / S0 - mean ** 2, 0.0)
+    se = np.sqrt(var * Q) / S0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = np.where(se > 0, np.abs(mean) / se, np.where(mean != 0, np.inf, 0.0))
+    return mean, z
+
+
+def split_at_reversals(kx, ky, complex_amp, episodes: list,
+                       min_frames: int = MIN_REVERSAL_FRAMES,
+                       z_min: float = SIGN_Z_DECISIVE) -> list:
+    """
+    Split episodes where the propagation sign reverses for a sustained run.
+
+    Episodes come from validity alone, so a wave that turns around without
+    a validity gap stays one episode and gets one direction: the frames on
+    the minority side of the turn are reported backwards (DOY144 2022
+    Family 2, frames 91-149: ~315 deg then ~132 deg, reported 316 deg
+    throughout). Within each episode, each frame's phase step is referred
+    to the episode's unwrapped axis (as in `_averaged_sign_lobe`), and the
+    split point is the one maximising the smaller of the two sides'
+    `sign_z`. The split is kept when both sides have >= `min_frames`
+    usable frames, opposite mean signs and `sign_z` >= `z_min`; each side
+    is then searched again (binary segmentation). Returns the new
+    (t_start, t_end) list, time-ordered.
+    """
+    out = []
+    stack = list(episodes)[::-1]
+    while stack:
+        t0, t1 = stack.pop()
+        idx = np.arange(t0, t1 + 1)
+        amp = np.abs(complex_amp[idx])
+        m = np.isfinite(kx[idx]) & np.isfinite(ky[idx]) & (amp > 0)
+        n = int(m.sum())
+        if n < 2 * min_frames:
+            out.append((t0, t1))
+            continue
+        t_m, w = idx[m], amp[m]
+        axis = np.degrees(np.unwrap(np.deg2rad(np.degrees(np.arctan2(-kx[t_m], -ky[t_m])) % 180.0) * 2.0)) / 2.0
+        step = _aligned_phase_step(kx[t_m], ky[t_m], complex_amp[t_m], axis)
+        mean_l, z_l = _signed_z_cumulative(step, w)
+        mean_r, z_r = _signed_z_cumulative(step[::-1], w[::-1])
+        mean_r, z_r = mean_r[::-1], z_r[::-1]        # [s] = stats of step[s:]
+        s = np.arange(min_frames, n - min_frames + 1)  # left = step[:s], right = step[s:]
+        score = np.minimum(z_l[s - 1], z_r[s])
+        score[np.sign(mean_l[s - 1]) == np.sign(mean_r[s])] = -np.inf
+        best = int(np.argmax(score))
+        if score[best] < z_min:
+            out.append((t0, t1))
+            continue
+        t_split = int(t_m[s[best]])                   # first frame of the right side
+        stack.extend([(t_split, t1), (t0, t_split - 1)])
+    return out
 
 
 def resolve_wave_lobe(kx, ky, complex_amp, episodes: list,
@@ -480,10 +565,7 @@ def estimate_wave_final(
     Parameters
     ----------
     wave : dict
-        Must have 'label' (for diagnostics/logging). 'azimuth' (the
-        Stage-1 omega-k direction, deg) decides the propagation sign when
-        neither the episode's nor the pooled phase-step evidence is
-        significant (`SIGN_Z_DECISIVE`).
+        Must have 'label' (for diagnostics/logging).
     kx, ky : ndarray (n_time,)
         Second-pass raw amplitude-weighted spatial phase gradient.
     complex_amp : ndarray (n_time,) complex
@@ -510,14 +592,16 @@ def estimate_wave_final(
         time, frame_idx, episode_id, valid,
         final_azimuth_deg, final_wavelength_km, final_speed_ms,
         final_azimuth_std_deg, final_wavelength_std_km, final_speed_std_ms,
-        lobe_sign_frac, lobe_disagreement, lobe_majority_frac
+        lobe_sign_frac, lobe_disagreement, lobe_majority_frac,
+        direction_sign_z (the sign_z that decided the frame's episode
+        direction: its own, or the pooled wave's), direction_ambiguous
     """
     n_time = len(time_vals)
     amp = np.abs(complex_amp)
     valid = unified_validity_mask(owned_mask, collision_primary_full, amp,
                                    snr_min_amplitude=snr_min_amplitude)
     raw_episodes = find_episodes(valid, min_episode_frames=min_episode_frames)
-    episodes = merge_close_episodes(raw_episodes, max_gap=2)
+    episodes = split_at_reversals(kx, ky, complex_amp, merge_close_episodes(raw_episodes, max_gap=2))
 
     out = pd.DataFrame({
         "time": time_vals, "frame_idx": np.arange(n_time),
@@ -525,6 +609,7 @@ def estimate_wave_final(
         "final_azimuth_deg": np.nan, "final_wavelength_km": np.nan, "final_speed_ms": np.nan,
         "final_azimuth_std_deg": np.nan, "final_wavelength_std_km": np.nan, "final_speed_std_ms": np.nan,
         "lobe_sign_frac": np.nan, "lobe_disagreement": False, "lobe_majority_frac": np.nan,
+        "direction_sign_z": np.nan, "direction_ambiguous": False,
     })
 
     if not episodes:
@@ -534,23 +619,20 @@ def estimate_wave_final(
     out["lobe_disagreement"] = bool(lobe["disagreement"])
     out["lobe_majority_frac"] = lobe["majority_frac"]
 
-    stage1_az = wave.get("azimuth", np.nan)
     for eid, ep in enumerate(lobe["episodes"]):
         t0, t1 = ep["t_start"], ep["t_end"]
         # Sign: the episode's own evidence when significant (SIGN_Z_DECISIVE),
-        # else the pooled wave's, else the Stage-1 omega-k direction (keeping
-        # the episode's own axis, choosing the end nearer Stage 1).
+        # else the pooled wave's. The direction always comes from the
+        # second-pass reconstruction's own phase evidence, never from Stage 1
+        # (see SIGN_Z_DECISIVE).
         if ep["sign_z"] >= SIGN_Z_DECISIVE:
             ep_azimuth, ep_sign, ep_sign_frac = ep["azimuth_deg"], ep["sign"], ep["sign_frac"]
-        elif lobe["wave_sign_z"] >= SIGN_Z_DECISIVE or not np.isfinite(stage1_az):
+            ep_sign_z = ep["sign_z"]
+        else:
             ep_azimuth = lobe["wave_azimuth_deg"]
             ep_sign_frac = lobe["wave_sign_frac"]
             ep_sign = lobe["pooled_sign"]
-        else:
-            flip = abs(full_circle_diff_deg(ep["azimuth_deg"], stage1_az)) > 90.0
-            ep_azimuth = (ep["azimuth_deg"] + 180.0) % 360.0 if flip else ep["azimuth_deg"]
-            ep_sign = -ep["sign"] if flip else ep["sign"]
-            ep_sign_frac = 1.0 - ep["sign_frac"] if flip else ep["sign_frac"]
+            ep_sign_z = lobe["wave_sign_z"]
 
         sm = _smooth_episode(
             kx, ky, complex_amp, dt, t0, t1, ep_azimuth, ep_sign,
@@ -567,5 +649,10 @@ def estimate_wave_final(
         out.loc[out.index[rows], "final_wavelength_std_km"] = sm["wavelength_std_km"]
         out.loc[out.index[rows], "final_speed_std_ms"] = sm["speed_std_ms"]
         out.loc[out.index[rows], "lobe_sign_frac"] = ep_sign_frac
+        # Ambiguous: the sign that decided this episode is weak, or the wave
+        # is too slow for its phase step to carry a sign (AMBIGUOUS_SPEED_MS).
+        out.loc[out.index[rows], "direction_sign_z"] = ep_sign_z
+        out.loc[out.index[rows], "direction_ambiguous"] = (
+            (ep_sign_z < SIGN_Z_DECISIVE) | ~(np.abs(sm["speed_ms"]) >= AMBIGUOUS_SPEED_MS))
 
     return out

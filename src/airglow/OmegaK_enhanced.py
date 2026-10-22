@@ -17,6 +17,7 @@ from scipy.ndimage import maximum_filter
 from sklearn.cluster import DBSCAN
 
 from airglow.resolution import ResolutionSpec
+from airglow.temporal_filter import bandpass_gain
 
 def analyze_and_plot_waves(ok_filter, filtered_ds, filter_mask,
                            power_threshold=90,
@@ -421,8 +422,18 @@ def analyze_wave_parameters_with_aliasing(ok_filter, filtered_fft,
     # mostly out of the passband there, does not). Taking the larger floor
     # can only lower false alarms, so the white-noise calibration of
     # detection_snr still bounds them.
-    floor = np.fmax(_local_noise_floor(power_positive, significant_points, footprint),
-                    _ring_noise_floor(power_positive, significant_points, ok_filter.kx, ok_filter.ky,
+    # With band-passed data, test significance on the band-pass-whitened
+    # power (power / gain(omega)^2) so the noise floor is flat in omega
+    # across the band's edges (ResolutionSpec.whiten_floor_by_band).
+    power_ref = power_positive
+    if resolution.whiten_floor_by_band:
+        dt_min = ok_filter.dt / 60.0
+        p_lo, p_hi = resolution.period_band(dt_min)
+        g2 = bandpass_gain(np.abs(omega_positive) / (2 * np.pi) * 60.0, dt_min, p_lo, p_hi,
+                           resolution.period_rolloff) ** 2
+        power_ref = power_positive / np.maximum(g2, 1e-3)[:, None, None]
+    floor = np.fmax(_local_noise_floor(power_ref, significant_points, footprint),
+                    _ring_noise_floor(power_ref, significant_points, ok_filter.kx, ok_filter.ky,
                                       2 * np.pi * resolution.native_dk_cyc_per_km() / 1000.0))
 
     azimuths = []
@@ -466,7 +477,7 @@ def analyze_wave_parameters_with_aliasing(ok_filter, filtered_fft,
                             wavelengths.append(wavelength_km)
                             periods.append(period_min)
                             weights.append(power_positive[i, j, k])
-                            peak_snr.append(power_positive[i, j, k] / floor[i, j, k])
+                            peak_snr.append(power_ref[i, j, k] / floor[i, j, k])
                             reliability.append(rel)
     
     # Convert to arrays

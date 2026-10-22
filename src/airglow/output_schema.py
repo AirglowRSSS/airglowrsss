@@ -42,6 +42,7 @@ WAVE_FRAMES_COLUMNS = [
     "final_azimuth_deg", "final_wavelength_km", "final_speed_ms",
     "final_azimuth_std_deg", "final_wavelength_std_km", "final_speed_std_ms",
     "lobe_sign_frac", "lobe_disagreement", "lobe_majority_frac",
+    "direction_sign_z", "direction_ambiguous",
     "collision_id", "collision_primary", "recon_corr",
 ]
 

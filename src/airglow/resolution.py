@@ -104,6 +104,24 @@ class ResolutionSpec:
                   keeps a ~2x margin. A real counter-propagating wave at the
                   same wavelength is lost only if it carries < 20 % of the
                   power (amplitude < 0.45x).
+    period_min, period_max : the analysed period band, minutes: full gain
+                  of the temporal band-pass (temporal_filter). The omega-k
+                  passband spans the band-pass's nonzero support
+                  (`period_support`). period_min None = Nyquist
+                  (2 x cadence). Default 20 min max: the study band (2-20
+                  min, i.e. 4-20 min at 2-min cadence).
+    period_rolloff : the band-pass gain falls to 0 along a raised cosine
+                  at period_max x rolloff (and period_min / rolloff).
+                  Default 2: ringing ~40 min for a 20-min edge, inside a
+                  90-min analysis window.
+    whiten_floor_by_band : set when the data were band-passed with this
+                  spec's band (temporal_filter.bandpass_cube). Noise floors
+                  and peak_snr are then computed on power / gain(omega)^2,
+                  so the noise is flat across the band's edges: otherwise
+                  the local floor's training bins reach into the
+                  attenuated 20-40 min edge and underestimate the noise at
+                  ~20 min (2 false families in 60 white-noise MC scenes,
+                  vs 0 with the FIR the threshold was calibrated on).
     """
     dlam_frac: float = 0.20
     dtheta_deg: float = 22.5
@@ -112,6 +130,10 @@ class ResolutionSpec:
     detection_snr: float = 30.0
     leakage_ratio: float = 0.05
     mirror_ratio: float = 0.2
+    period_min: float | None = None
+    period_max: float = 20.0
+    period_rolloff: float = 2.0
+    whiten_floor_by_band: bool = False
 
     # ── construction ─────────────────────────────────────────────────────
     def with_aperture(self, east_km, north_km) -> "ResolutionSpec":
@@ -246,6 +268,23 @@ class ResolutionSpec:
         w, y, x = np.mgrid[-nw:nw + 1, -ny:ny + 1, -nx:nx + 1]
         return (w / max(rw, 1e-9)) ** 2 + (y / max(ry, 1e-9)) ** 2 + (x / max(rx, 1e-9)) ** 2 <= 1.0
 
+    def period_band(self, dt_min: float) -> tuple:
+        """(period_min, period_max) in minutes, period_min defaulting to Nyquist."""
+        p_lo = 2.0 * dt_min if self.period_min is None else max(self.period_min, 2.0 * dt_min)
+        return p_lo, self.period_max
+
+    def period_support(self, dt_min: float) -> tuple:
+        """
+        Periods (minutes) where the band-pass gain is nonzero: the omega-k
+        passband. Its hard edges then never clip a peak the band-pass let
+        through -- a wave near period_max has a spectral peak ~c/T wide
+        (0.017 cycles/min in a 90-min window, a third of 1/20 min).
+        """
+        p_lo, p_hi = self.period_band(dt_min)
+        if p_lo > 2.0 * dt_min:
+            p_lo = max(p_lo / self.period_rolloff, 2.0 * dt_min)
+        return p_lo, p_hi * self.period_rolloff
+
     # ── reporting ────────────────────────────────────────────────────────
     def crossover_km(self) -> tuple:
         """Wavelengths above which the native floor overrides (lambda, theta)."""
@@ -256,7 +295,8 @@ class ResolutionSpec:
     def describe(self) -> str:
         s = (f"resolution: dlam={100 * self.dlam_frac:.0f}%, dtheta={self.dtheta_deg:g} deg, c={self.native_c:g}, "
              f"detection >= {self.detection_snr:g}x floor and >= {100 * self.leakage_ratio:g}% of strongest, "
-             f"mirrors < {100 * self.mirror_ratio:g}% dropped")
+             f"mirrors < {100 * self.mirror_ratio:g}% dropped, "
+             f"periods {'Nyquist' if self.period_min is None else f'{self.period_min:g}'}-{self.period_max:g} min")
         if self.aperture_km is not None:
             lx, lt = self.crossover_km()
             s += (f", L={self.aperture_km:.0f} km (native floor above "
