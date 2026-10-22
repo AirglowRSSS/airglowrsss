@@ -63,6 +63,7 @@ from airglow.OmegaKFilter       import OmegaKFilterXarray
 from airglow.OmegaK_enhanced    import analyze_and_plot_waves
 from airglow.OmegaK_enhanced    import circular_mean as _cmean, circular_std as _cstd
 from airglow.resolution         import ResolutionSpec
+from airglow.temporal_filter    import bandpass_cube
 from airglow.phase_speed_kalman import (
     analyze_all_waves_kalman,
     compute_binned_wave_stats,
@@ -110,6 +111,8 @@ def _load_real_data(
     elevation_min: float,
     filter_n_workers: int,
     verbose: bool,
+    temporal_filter: str = "fir",
+    resolution: ResolutionSpec | None = None,
 ) -> tuple[xr.Dataset, str, float]:
     """
     Load and preprocess one night of real airglow data from HDF5.
@@ -125,6 +128,11 @@ def _load_real_data(
     t_hi_min           : FIR passband upper period limit (minutes)
     elevation_min      : minimum CCD elevation for FOV mask (degrees)
     verbose            : if True, print loader diagnostics
+    temporal_filter    : ``"fir"`` (ntaps / t_lo_min / t_hi_min) or
+                         ``"bandpass"`` (zero-phase, whole night, band from
+                         ``resolution.period_band``; ntaps etc. unused)
+    resolution         : ResolutionSpec carrying the period band; required
+                         for ``"bandpass"``
 
     Returns
     -------
@@ -160,12 +168,26 @@ def _load_real_data(
     ds = MANGO_L2.load_hdf5_to_xarray(hdf5_path)
     times_pd = pd.to_datetime(ds.time.values)
 
-    # ── FIR bandpass filter (operates on (north, east, time) layout) ──────────
-    im3d = np.transpose(ds["ImageData"].values, (1, 2, 0))   # → (ny, nx, n_time)
-    b    = prepare_agimages.initialize_airglow_filter(ntaps, t_lo_min, t_hi_min, times_pd)
-    im3d_filt = prepare_agimages.filter_airglow(im3d, b, ntaps, n_workers=filter_n_workers)
+    # ── Temporal filter (before the moon mask, on the continuous night) ──────
+    if temporal_filter == "fir":
+        # FIR bandpass (operates on (north, east, time) layout)
+        im3d = np.transpose(ds["ImageData"].values, (1, 2, 0))   # → (ny, nx, n_time)
+        b    = prepare_agimages.initialize_airglow_filter(ntaps, t_lo_min, t_hi_min, times_pd)
+        im3d_filt = prepare_agimages.filter_airglow(im3d, b, ntaps, n_workers=filter_n_workers)
+        filtered = np.transpose(im3d_filt, (2, 0, 1))            # → (n_time, ny, nx)
+    elif temporal_filter == "bandpass":
+        steps = np.diff(times_pd.values) / np.timedelta64(1, "m")
+        dt = float(np.median(steps))
+        if np.any(np.abs(steps - dt) > 0.25 * dt):
+            warnings.warn(f"bandpass assumes a uniform cadence; {hdf5_path} has steps "
+                          f"{steps.min():.1f}-{steps.max():.1f} min (median {dt:.1f})")
+        p_lo, p_hi = resolution.period_band(dt)
+        filtered = bandpass_cube(ds["ImageData"].values, dt, p_lo, p_hi,
+                                 resolution.period_rolloff, axis=0)
+    else:
+        raise ValueError(f"unknown temporal_filter {temporal_filter!r}")
     ds["FilteredImageData"] = xr.DataArray(
-        np.transpose(im3d_filt, (2, 0, 1)),                  # → (n_time, ny, nx)
+        filtered,
         dims=("time", "north", "east"),
         coords={"time": ds.time, "north": ds.north, "east": ds.east},
     )
@@ -929,6 +951,7 @@ def run_airglow_pipeline(
     site: str = "blo",
     date: datetime | None = None,
     moon_elevation_max: float = 0.0,
+    temporal_filter: str = "fir",
     ntaps: int = 13,
     t_lo_min: float = 2.0,
     t_hi_min: float = 20.0,
@@ -956,6 +979,9 @@ def run_airglow_pipeline(
     res_detection_snr: float = 30.0,
     res_leakage_ratio: float = 0.05,
     res_mirror_ratio: float = 0.2,
+    res_period_min: float | None = None,
+    res_period_max: float = 20.0,
+    res_period_rolloff: float = 2.0,
     # ── Wave family grouping ──────────────────────────────────────────────────
     min_detections: int = 2,
     # ── Gabor reconstruction ──────────────────────────────────────────────────
@@ -1009,6 +1035,16 @@ def run_airglow_pipeline(
         Observation date passed to the data loader.
     moon_elevation_max : float
         Reject frames where moon elevation > this threshold (degrees).
+    temporal_filter : str
+        ``"fir"`` (default): the 13-tap FIR (``ntaps``, ``t_lo_min``,
+        ``t_hi_min``), a soft ~20-min high-pass; omega-k passband up to
+        ``period_max_min``. ``"bandpass"``: zero-phase whole-night
+        raised-cosine band-pass (``airglow.temporal_filter``) with full gain
+        over ``res_period_min``-``res_period_max`` and zero by
+        ``res_period_rolloff * res_period_max``; the omega-k passband is the
+        band-pass's support (``ResolutionSpec.period_support``, so
+        ``period_max_min`` is unused), detection floors are whitened by the
+        band gain, and no edge frames are trimmed.
     ntaps : int
         FIR filter tap count; first/last ``ntaps//2`` frames are trimmed before
         the Kalman step to remove filter edge artefacts.
@@ -1031,7 +1067,8 @@ def run_airglow_pipeline(
         value, and distinct nearby waves can be merged into one detection.
         Default 2, matching the synthetic case studies' convention.
     period_max_min : float
-        Omega-k filter upper period limit (minutes).
+        Omega-k filter upper period limit (minutes), ``temporal_filter="fir"``
+        only.
     lambda_h_min_km, lambda_h_max_km : float
         Omega-k filter horizontal wavelength bounds (km).
     apply_dispersion : bool
@@ -1067,6 +1104,9 @@ def run_airglow_pipeline(
         A wave at the opposite k (same wavelength, azimuth + 180) of a
         stronger wave in the same window, with < res_mirror_ratio of its
         power, is dropped as that wave's conjugate-image sidelobe.
+    res_period_min, res_period_max, res_period_rolloff : float
+        Period band (minutes; ``res_period_min=None`` = Nyquist), used by
+        ``temporal_filter="bandpass"`` -- see ``ResolutionSpec``.
     min_detections : int
         Minimum window appearances for a family to be retained.
     gabor_n_stds : float
@@ -1176,12 +1216,19 @@ def run_airglow_pipeline(
 
     # ── Step 1: Load data ─────────────────────────────────────────────────────
     _vprint("[1/9] Loading data ...")
+    spec = ResolutionSpec(
+        dlam_frac=res_dlam_frac, dtheta_deg=res_dtheta_deg, native_c=res_native_c,
+        detection_snr=res_detection_snr, leakage_ratio=res_leakage_ratio,
+        mirror_ratio=res_mirror_ratio, period_min=res_period_min,
+        period_max=res_period_max, period_rolloff=res_period_rolloff,
+        whiten_floor_by_band=temporal_filter == "bandpass",
+    )
     ds_full, data_var, dx_km = _load_real_data(
         hdf5_path=hdf5_path, site=site, date=date,
         moon_elevation_max=moon_elevation_max, ntaps=ntaps,
         t_lo_min=t_lo_min, t_hi_min=t_hi_min,
         elevation_min=elevation_min, filter_n_workers=filter_n_workers,
-        verbose=verbose,
+        verbose=verbose, temporal_filter=temporal_filter, resolution=spec,
     )
 
     time_vals = ds_full["time"].values          # (n_time,) datetime64
@@ -1191,13 +1238,9 @@ def run_airglow_pipeline(
     dt_min    = float(
         (time_vals[1] - time_vals[0]) / np.timedelta64(1, "m")
     )
-    resolution = ResolutionSpec(
-        dlam_frac=res_dlam_frac, dtheta_deg=res_dtheta_deg, native_c=res_native_c,
-        detection_snr=res_detection_snr, leakage_ratio=res_leakage_ratio,
-        mirror_ratio=res_mirror_ratio,
-    ).with_aperture(east_km, north_km)
+    resolution = spec.with_aperture(east_km, north_km)
     _vprint(f"  {resolution.describe()}")
-    edge_frames    = ntaps // 2
+    edge_frames    = ntaps // 2 if temporal_filter == "fir" else 0
     win_len_frames = int(round(win_len_min / dt_min))
     hop_frames     = int(round(hop_min     / dt_min))
 
@@ -1208,9 +1251,16 @@ def run_airglow_pipeline(
     )
 
     # Build grouped kwargs from individual parameters
+    # Omega-k passband: Nyquist to period_max_min after the FIR; the
+    # band-pass's whole nonzero support after the band-pass (the whitened
+    # floors account for its gain in the rolloff).
+    if temporal_filter == "bandpass":
+        omegak_period_min, omegak_period_max = resolution.period_support(dt_min)
+    else:
+        omegak_period_min, omegak_period_max = dt_min * 2, period_max_min
     filter_kwargs = dict(
-        period_min       = dt_min * 2,        # Nyquist
-        period_max       = period_max_min,
+        period_min       = omegak_period_min,
+        period_max       = omegak_period_max,
         lambda_h_min     = lambda_h_min_km,
         lambda_h_max     = lambda_h_max_km,
         apply_dispersion = apply_dispersion,
