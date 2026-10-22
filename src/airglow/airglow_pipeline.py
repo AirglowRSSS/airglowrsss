@@ -978,6 +978,7 @@ def run_airglow_pipeline(
     res_native_c: float = 1.5,
     res_detection_snr: float = 30.0,
     res_leakage_ratio: float = 0.05,
+    res_leakage_floor: float = 0.01,
     res_mirror_ratio: float = 0.2,
     res_period_min: float | None = None,
     res_period_max: float = 20.0,
@@ -1093,13 +1094,15 @@ def run_airglow_pipeline(
         family clustering, frame-ownership groups, the collision gate --
         and every Gabor kernel's FWHM. Default 20 % / 22.5 deg (half of a
         45-deg, 8-point compass climatology bin).
-    res_detection_snr, res_leakage_ratio : float
+    res_detection_snr, res_leakage_ratio, res_leakage_floor : float
         The spec's detection gates: a Stage-1 peak counts only if its power
         is >= res_detection_snr x the noise floor (the larger of the local
         (kx, ky, omega) and |k|-ring median power / ln 2 -- sets the
-        false-alarm rate) and
-        >= res_leakage_ratio x the window's strongest peak (rejects window
-        sidelobes; sets the dynamic range, sqrt(ratio) in amplitude).
+        false-alarm rate), is not < res_leakage_ratio x a stronger peak at
+        that peak's frequency or 2nd/3rd harmonic wavenumber (its window
+        sidelobes / median-filter harmonics), and is >= res_leakage_floor x
+        the window's strongest peak (the dynamic range, sqrt(floor) in
+        amplitude). See ResolutionSpec.
     res_mirror_ratio : float
         A wave at the opposite k (same wavelength, azimuth + 180) of a
         stronger wave in the same window, with < res_mirror_ratio of its
@@ -1219,6 +1222,7 @@ def run_airglow_pipeline(
     spec = ResolutionSpec(
         dlam_frac=res_dlam_frac, dtheta_deg=res_dtheta_deg, native_c=res_native_c,
         detection_snr=res_detection_snr, leakage_ratio=res_leakage_ratio,
+        leakage_floor=res_leakage_floor,
         mirror_ratio=res_mirror_ratio, period_min=res_period_min,
         period_max=res_period_max, period_rolloff=res_period_rolloff,
         whiten_floor_by_band=temporal_filter == "bandpass",

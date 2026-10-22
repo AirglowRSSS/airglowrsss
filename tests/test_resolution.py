@@ -96,7 +96,8 @@ def _n_waves(spec, peaks, snr=None):
     snr = np.full(len(az), 1e3) if snr is None else np.asarray(snr, dtype=float)
     wp = dict(reliability=np.array(['good'] * len(az)), azimuths=az.astype(float),
               wavelengths=wl.astype(float), phase_speeds=wl * 1000 / (per * 60),
-              periods=per.astype(float), weights=w.astype(float), peak_snr=snr, resolution=spec)
+              periods=per.astype(float), weights=w.astype(float), peak_snr=snr, resolution=spec,
+              window_min=88.0)
     with contextlib.redirect_stdout(io.StringIO()):
         return len(identify_physical_waves(wp))
 
@@ -141,13 +142,18 @@ def test_detection_gates(spec):
     # below the noise-floor gate -> dropped
     assert _n_waves(spec, far, snr=[100, spec.detection_snr - 1]) == 1
     assert _n_waves(spec, far, snr=[1, 1]) == 0
-    # leakage gate is relative to the strongest *significant* peak
-    weak = [(30, 30, 9, 1.0), (150, 60, 12, 0.5 * spec.leakage_ratio)]
-    assert _n_waves(spec, weak) == 1
-    weak[1] = (150, 60, 12, 2 * spec.leakage_ratio)
-    assert _n_waves(spec, weak) == 2
-    # an insignificant (noise) peak cannot raise the leakage reference
-    assert _n_waves(spec, [(30, 30, 9, 100.0), (150, 60, 12, 1.0)], snr=[1, 100]) == 1
+    # leakage gate: a weak peak at a stronger peak's frequency is its sidelobe ...
+    r = spec.leakage_ratio
+    assert _n_waves(spec, [(30, 30, 9, 1.0), (150, 60, 9, 0.5 * r)]) == 1
+    assert _n_waves(spec, [(30, 30, 9, 1.0), (150, 60, 9, 2 * r)]) == 2
+    # ... as is one at its 3rd-harmonic wavenumber (either sign), at any frequency
+    assert _n_waves(spec, [(30, 30, 9, 1.0), (30, 10, 5, 0.5 * r)]) == 1
+    assert _n_waves(spec, [(30, 30, 9, 1.0), (210, 10, 5, 0.5 * r)]) == 1
+    # elsewhere a weak peak stands down to leakage_floor x the strongest
+    assert _n_waves(spec, [(30, 30, 9, 1.0), (150, 60, 12, 0.5 * r)]) == 2
+    assert _n_waves(spec, [(30, 30, 9, 1.0), (150, 60, 12, 0.5 * spec.leakage_floor)]) == 1
+    # an insignificant (noise) peak cannot act as a parent
+    assert _n_waves(spec, [(30, 30, 9, 100.0), (150, 60, 9, 1.0)], snr=[1, 100]) == 1
 
 
 def test_mirror_gate(spec):

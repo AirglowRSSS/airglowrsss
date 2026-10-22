@@ -491,6 +491,7 @@ def analyze_wave_parameters_with_aliasing(ok_filter, filtered_fft,
         'reliability': np.array(reliability),
         'boundaries': boundaries,
         'resolution': resolution,
+        'window_min': ok_filter.nt * ok_filter.dt / 60.0,
     }
     
     # Print summary
@@ -865,9 +866,9 @@ def identify_physical_waves(wave_params,
         full-circle azimuth, with the native floor). Defaults to
         wave_params['resolution'] (set by analyze_wave_parameters_with_aliasing).
         Its detection gates select the peaks: peak_snr >= detection_snr
-        (local noise floor) and power >= leakage_ratio x the strongest
-        significant peak; then waves at the opposite k of a stronger wave
-        with < mirror_ratio of its power are dropped.
+        (local noise floor), not leakage of a stronger significant peak
+        (`ResolutionSpec.leakage_mask`); then waves at the opposite k of a
+        stronger wave with < mirror_ratio of its power are dropped.
         
     Returns
     -------
@@ -905,8 +906,10 @@ def identify_physical_waves(wave_params,
     if not np.any(significant):
         print(f"No peaks at >= {resolution.detection_snr:g}x the local noise floor")
         return []
-    max_power = weights[significant].max()
-    power_mask = significant & (weights >= resolution.leakage_ratio * max_power)
+    power_mask = significant.copy()
+    power_mask[significant] = resolution.leakage_mask(
+        wavelengths[significant], azimuths[significant], periods[significant],
+        weights[significant], wave_params['window_min'])
     
     azimuths = azimuths[power_mask]
     wavelengths = wavelengths[power_mask]
@@ -921,8 +924,8 @@ def identify_physical_waves(wave_params,
         return []
 
     print(f"\n=== PHYSICAL WAVE IDENTIFICATION ===")
-    print(f"Analyzing {len(azimuths)} peaks at >= {resolution.detection_snr:g}x noise floor and "
-          f">= {resolution.leakage_ratio*100:.1f}% of max power")
+    print(f"Analyzing {len(azimuths)} peaks at >= {resolution.detection_snr:g}x noise floor, "
+          f"not leakage of a stronger peak")
     
     # Cluster by k-vector (wavelength and direction) with the shared
     # same-wave test: DBSCAN on its normalised box distance, eps = 1.

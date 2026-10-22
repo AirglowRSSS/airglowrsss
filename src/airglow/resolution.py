@@ -47,10 +47,12 @@ Two detection gates complete the spec:
         estimate -- and the in-passband bins on its |k| ring). Noise power
         per bin is exponential, so the false-alarm rate is set by this
         number alone, whatever the scene's brightness or contrast.
-    leakage_ratio : a peak must also exceed this fraction of the window's
-        strongest peak. This rejects window sidelobes of a strong wave that
-        land more than one resolution element away; it sets the dynamic
-        range (weakest resolvable amplitude = sqrt(leakage_ratio)).
+    leakage_ratio : a peak below this fraction of a stronger peak is
+        dropped as that peak's leakage when it is where leakage lands: at
+        the stronger peak's frequency (spatial-window sidelobes share their
+        parent's omega) or at its 2nd/3rd harmonic wavenumber (the median
+        filter's nonlinearity). Elsewhere a weak peak stands on its own,
+        down to leakage_floor x the window's strongest peak (`leakage_mask`).
 
 A mirror gate then drops a wave that sits at the opposite k (same
 wavelength, azimuth + 180, within one resolution element) of a stronger wave
@@ -88,11 +90,21 @@ class ResolutionSpec:
                   the fitted tail gives P(window > 30) ~ 1.5e-4, i.e. < 1 %
                   per 10-h night even before requiring >= 2 detections per
                   family, while waves at per-pixel SNR >= 0.03 sit at >= 90.
-    leakage_ratio : minimum peak power / strongest peak in the window.
-                  Default 0.05: on noise-free single waves the strongest
-                  sidelobe more than one resolution element from the wave
-                  was 3.4 % (Tukey-0.1 analysis taper), so 0.05 keeps a 1.5x
-                  margin; amplitude dynamic range ~0.22.
+    leakage_ratio : minimum power / a stronger peak whose leakage could
+                  land on this one (same frequency within one native omega
+                  cell, c/T, or 2nd/3rd harmonic wavenumber). Default 0.05.
+                  Noise-free single waves, 4-20 min x 15-120 km
+                  (2026-10-22): spatial sidelobes sat within 0.1 omega cell
+                  of the wave at <= 0.9 %; harmonics at lambda/3 reached
+                  3.9 % (15 km), 0.4 % (25 km). A global 5 % gate (the
+                  former rule) lost 13 of 42 in-band waves on 5 real nights
+                  once the band-pass passed the night's strong ~20-min
+                  waves at full gain.
+    leakage_floor : minimum power / the window's strongest peak, anywhere.
+                  Default 0.01: the strongest spurious peak the local rule
+                  leaves on noise-free single waves is 0.62 % (15-km waves;
+                  <= 0.14 % from 25 km up), so 0.01 keeps a 1.6x margin;
+                  amplitude dynamic range 0.1.
     mirror_ratio : a wave within one resolution element of the exact
                   opposite (k -> -k: same wavelength, azimuth + 180) of a
                   stronger wave in the same window is dropped when its power
@@ -129,6 +141,7 @@ class ResolutionSpec:
     aperture_km: float | None = None
     detection_snr: float = 30.0
     leakage_ratio: float = 0.05
+    leakage_floor: float = 0.01
     mirror_ratio: float = 0.2
     period_min: float | None = None
     period_max: float = 20.0
@@ -285,6 +298,28 @@ class ResolutionSpec:
             p_lo = max(p_lo / self.period_rolloff, 2.0 * dt_min)
         return p_lo, p_hi * self.period_rolloff
 
+    # ── detection gates ──────────────────────────────────────────────────
+    def leakage_mask(self, lam_km, az_deg, period_min, power, window_min: float) -> np.ndarray:
+        """
+        True for peaks that are not leakage of a stronger peak (see
+        `leakage_ratio`, `leakage_floor`). Arrays are per peak; periods
+        are positive (omega folded to the positive half), `window_min` is
+        the analysis window length T, setting the native omega cell c/T.
+        """
+        lam = np.asarray(lam_km, dtype=float)
+        az = np.asarray(az_deg, dtype=float)
+        f = 1.0 / np.asarray(period_min, dtype=float)
+        P = np.asarray(power, dtype=float)
+        weaker = P[:, None] < self.leakage_ratio * P[None, :]          # [i, j]: i could be j's leakage
+        same_f = np.abs(f[:, None] - f[None, :]) * window_min / self.native_c <= 1.0
+        harmonic = np.zeros_like(weaker)
+        for n in (2, 3):
+            for flip in (0.0, 180.0):                                  # +n k or -n k
+                harmonic |= self.same_wave(lam[:, None], az[:, None], lam[None, :] / n,
+                                           (az[None, :] + flip) % 360.0)
+        leak = np.any(weaker & (same_f | harmonic), axis=1)
+        return ~leak & (P >= self.leakage_floor * P.max())
+
     # ── reporting ────────────────────────────────────────────────────────
     def crossover_km(self) -> tuple:
         """Wavelengths above which the native floor overrides (lambda, theta)."""
@@ -294,7 +329,8 @@ class ResolutionSpec:
 
     def describe(self) -> str:
         s = (f"resolution: dlam={100 * self.dlam_frac:.0f}%, dtheta={self.dtheta_deg:g} deg, c={self.native_c:g}, "
-             f"detection >= {self.detection_snr:g}x floor and >= {100 * self.leakage_ratio:g}% of strongest, "
+             f"detection >= {self.detection_snr:g}x floor, leakage < {100 * self.leakage_ratio:g}% of a parent at its "
+             f"frequency/harmonic, floor {100 * self.leakage_floor:g}% of strongest, "
              f"mirrors < {100 * self.mirror_ratio:g}% dropped, "
              f"periods {'Nyquist' if self.period_min is None else f'{self.period_min:g}'}-{self.period_max:g} min")
         if self.aperture_km is not None:
