@@ -39,6 +39,7 @@ analysis can be done without re-running the pipeline.
 from __future__ import annotations
 
 import contextlib
+import gc
 import io
 import os
 import shutil
@@ -262,6 +263,11 @@ def _window_worker(args: dict) -> dict:
             save_prefix=save_prefix, **analysis_kwargs,
         )
         _plt.close(fig)
+    # The window's omega-k arrays (~3 GB at full resolution) sit in reference
+    # cycles; without an explicit collection two or three windows' worth
+    # stay alive at once and the serial loop peaks at 8-9 GB.
+    del ok, mask, ds_w
+    gc.collect()
 
     return {
         "center_index":  center_idx,
