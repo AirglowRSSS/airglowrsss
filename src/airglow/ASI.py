@@ -4,10 +4,7 @@ import matplotlib
 import airglow.ASIDisplay as ASIDisplay
 import numpy as np
 import os
-try:
-    import Image
-except ImportError:
-    from PIL import Image
+from PIL import Image
 import matplotlib.pyplot as plt
 import string
 import random
@@ -46,13 +43,13 @@ def RawMovie(files, movie_name=None, cmin=None, cmax=None, darks=None, flips=Non
     if darks:
         # Find out the size of the image
         d = Image.open(darks[0])
-        all_dark = np.zeros_like(np.reshape(d.getdata(), d.size))
+        all_dark = np.zeros(d.size[::-1])  # PIL size is (width, height)
 
         # Sum up all of the dark images
         for dark in darks:
             d = Image.open(dark)
 #            all_dark = all_dark + np.reshape(d.getdata(), d.size)
-            all_dark = all_dark + np.array(d.getdata(),np.uint16).reshape(d.size)
+            all_dark = all_dark + np.asarray(d, dtype=float)
 
         # Divide by the number of dark images to create a mean image
         darks = all_dark/len(darks)
@@ -66,7 +63,7 @@ def RawMovie(files, movie_name=None, cmin=None, cmax=None, darks=None, flips=Non
 
         for f in files:
             d = Image.open(f)
-            im = np.array(d.getdata(),np.uint16).reshape(d.size)
+            im = np.asarray(d, dtype=float)
 
 #            all_min.append(d.info['pmin'])
 #            all_max.append(d.info['pmax'])
@@ -201,13 +198,13 @@ def MapMovie(files, m, lat, lon, mask, movie_name=None, cmin=None, cmax=None, da
     if darks:
         # Find out the size of the image
         d = Image.open(darks[0])
-        all_dark = np.zeros_like(np.reshape(d.getdata(), d.size))
+        all_dark = np.zeros(d.size[::-1])  # PIL size is (width, height)
 
         # Sum up all of the dark images
         for dark in darks:
             d = Image.open(dark)
 #            all_dark = all_dark + np.reshape(d.getdata(), d.size)
-            all_dark = all_dark + np.array(d.getdata(),np.uint16).reshape(d.size)
+            all_dark = all_dark + np.asarray(d, dtype=float)
 
         # Divide by the number of dark images to create a mean image
         darks = all_dark/len(darks)
@@ -221,7 +218,7 @@ def MapMovie(files, m, lat, lon, mask, movie_name=None, cmin=None, cmax=None, da
 
         for f in files:
             d = Image.open(f)
-            im = np.array(d.getdata(),np.uint16).reshape(d.size)
+            im = np.asarray(d, dtype=float)
 
             if darks is None:
                 print('No Dark Subtraction')
@@ -401,17 +398,12 @@ def ConvertAzEl2LatLon(az,el,ht,rx_lat,rx_lon, horizon=-1.):
     lat = lat_r*180./np.pi
     lon = lon_r*180./np.pi
 
-    # NaN out values below the horizon
-    # Need to check if value is a scalar or a list/array/whatever.
-    # Why is there not a cleaner way of checking this?
-#    import collections
-#    if isinstance(lat, collections.abc.Iterable): # it's an array/list
-#        lat[el < horizon] = np.nan
-#        lon[el < horizon] = np.nan
-#    else: # it's a scalar
-#        if el < horizon:
-#            lat = np.nan
-#            lon = np.nan
+    # NaN out values below the horizon (works for scalars and arrays)
+    below = np.asarray(el) < horizon
+    lat = np.where(below, np.nan, lat)
+    lon = np.where(below, np.nan, lon)
+    if lat.ndim == 0:
+        lat, lon = float(lat), float(lon)
 
 
     return lat, lon
