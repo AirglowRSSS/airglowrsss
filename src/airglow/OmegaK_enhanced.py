@@ -1,3 +1,15 @@
+"""
+OmegaK_enhanced.py
+--------------------
+Stage 1 peak detection: given one window's omega-k filtered FFT, finds
+distinct spectral peaks, converts each to physical wave parameters
+(wavelength, azimuth, phase speed, period), flags temporal-aliasing
+ambiguity, and scores each candidate's reliability. `analyze_and_plot_waves`
+is the entry point, called once per sliding-window analysis; everything
+else in this file is reached through its own call tree, or (`circular_mean`/
+`circular_std`) imported directly elsewhere in the package.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
@@ -530,65 +542,6 @@ def find_spectral_peaks(power, power_threshold_percentile, min_distance=3):
     
     return peaks
 
-def apply_3d_window(data, window_type='tukey', alpha=0.25):
-    """
-    Apply a 3D window function to reduce spectral leakage.
-    
-    Parameters
-    ----------
-    data : 3D array
-        Data to window (time, y, x) or (omega, ky, kx)
-    window_type : str
-        'tukey', 'hann', 'hamming', or 'blackman'
-    alpha : float
-        For Tukey window: fraction of the window inside the cosine tapered region.
-        alpha=0 is rectangular, alpha=1 is Hann.
-        
-    Returns
-    -------
-    windowed_data : 3D array
-        Windowed data
-    window : 3D array
-        The window function used
-    """
-    nt, ny, nx = data.shape
-    
-    if window_type == 'tukey':
-        from scipy.signal.windows import tukey
-        win_t = tukey(nt, alpha=alpha)
-        win_y = tukey(ny, alpha=alpha)
-        win_x = tukey(nx, alpha=alpha)
-    elif window_type == 'hann':
-        win_t = np.hanning(nt)
-        win_y = np.hanning(ny)
-        win_x = np.hanning(nx)
-    elif window_type == 'hamming':
-        win_t = np.hamming(nt)
-        win_y = np.hamming(ny)
-        win_x = np.hamming(nx)
-    elif window_type == 'blackman':
-        win_t = np.blackman(nt)
-        win_y = np.blackman(ny)
-        win_x = np.blackman(nx)
-    else:
-        raise ValueError(f"Unknown window type: {window_type}")
-    
-    # Create 3D window
-    window = win_t[:, np.newaxis, np.newaxis] * win_y[np.newaxis, :, np.newaxis] * win_x[np.newaxis, np.newaxis, :]
-    
-    # Apply window
-    windowed_data = data * window
-    
-    # Report power loss
-    power_original = np.sum(data**2)
-    power_windowed = np.sum(windowed_data**2)
-    power_ratio = power_windowed / power_original
-    
-    print(f"\nWindowing applied ({window_type}, alpha={alpha}):")
-    print(f"  Power retained: {power_ratio*100:.1f}%")
-    print(f"  Power lost: {(1-power_ratio)*100:.1f}%")
-    
-    return windowed_data, window
 
 def calculate_aliasing_boundaries(ok_filter):
     """

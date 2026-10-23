@@ -23,6 +23,7 @@ dagster = [
     "dagster-aws",
     "dagster-postgres",
     "dagster-mysql",
+    "sqlalchemy>=2.0,<2.1",
 ]
 dev = [
     "dagster-webserver",

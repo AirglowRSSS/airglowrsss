@@ -1,15 +1,17 @@
 """
 wave_validation.py
 ------------------
-Utilities for validating the omega-k pipeline against synthetic wave inputs.
+Validation/diagnostic utilities for the omega-k pipeline, plus the
+`run_airglow_pipeline` Stage 1 output helpers `families_to_xarray`/
+`spatial_resolutions`/`plot_wave_family_timeseries`.
 
 Functions
 ---------
 sampling_properties_table   -- HTML summary of sampling limits and resolutions
 boxcar_expected             -- Expected sliding-window average of a truth signal
 sliding_window_analysis     -- Run the omega-k pipeline over a sliding window
-build_wave_families         -- Cluster per-window detections into coherent wave families
-families_to_xarray          -- Convert family list to xarray Dataset (Gabor/KF handoff)
+families_to_xarray          -- Convert a family list to an xarray Dataset
+spatial_resolutions         -- Wavelength/orientation clustering resolution for one wavelength
 plot_wave_family_timeseries -- 3-panel time series: speed, wavelength, azimuth
 """
 
@@ -259,146 +261,6 @@ def sliding_window_analysis(
 # Wave family building
 # ---------------------------------------------------------------------------
 
-def build_wave_families(
-    window_results: list,
-    dir_tol_deg: float = 15.0,
-    lambda_tol_km: float = 20.0,
-    min_detections: int = 1,
-) -> list:
-    """
-    Cluster per-window detections into temporally coherent wave families.
-
-    Grouping is based only on direction and wavelength (not speed), so a
-    family can track a wave whose speed evolves over time.
-
-    Parameters
-    ----------
-    window_results  : output of sliding_window_analysis()
-    dir_tol_deg     : max azimuth difference (degrees) to merge into same family
-    lambda_tol_km   : max wavelength difference (km) to merge into same family
-    min_detections  : minimum number of windows a family must appear in to be kept
-
-    Returns
-    -------
-    families : list of dicts, each containing:
-        family_id         : int
-        direction_center  : mean azimuth (degrees, 0=N, 90=E, cw)
-        wavelength_center : mean wavelength (km)
-        members           : list of per-detection dicts with keys:
-                            time, direction, wavelength, speed, period,
-                            power, confidence
-    """
-
-    def _angular_diff(a, b):
-        d = abs(a - b) % 180
-        return min(d, 180 - d)
-
-    def _full_circle_diff(a, b):
-        d = abs(a - b) % 360
-        return min(d, 360 - d)
-
-    # Flatten all detections
-    all_waves = []
-    for r in window_results:
-        for w in r["physical_waves"]:
-            full_az = float(w["azimuth"])
-            all_waves.append({
-                "time":         r["center_time"],
-                "direction":    full_az % 180,          # [0, 180) for Gabor orientation
-                "azimuth_full": full_az,                # [0, 360) for KF sign convention
-                "wavelength":   float(w["wavelength"]),
-                "speed":        float(w["phase_speed"]),
-                "period":       float(w["period"]),
-                "power":        float(w.get("power",      np.nan)),
-                "confidence":   float(w.get("confidence", np.nan)),
-            })
-
-    print(f"Total detections across all windows: {len(all_waves)}")
-
-    # Greedy grouping — centroid is FIXED at the founding detection.
-    #
-    # Critically, we do NOT update direction_center / wavelength_center
-    # after a group is created.  Comparing against a running mean allows
-    # slow parameter drift to chain detections arbitrarily far from the
-    # founding values (e.g. a wave rotating 60° can be absorbed into one
-    # family via 24 incremental 2.5° steps).  Using a fixed founding
-    # centroid bounds the total parameter spread to ≤ dir_tol_deg and
-    # ≤ lambda_tol_km, which is the intended behaviour.
-    #
-    # Consequence: a wave whose azimuth rotates by 60° over 6 hours will
-    # be split into ~(60/dir_tol_deg) families, each covering one segment
-    # of the rotation.  The Voronoi step in build_waves_for_gabor then
-    # stitches their reconstructions into a seamless time series.
-    # _angular_diff alone is not enough: it wraps every 180 deg, so an axis
-    # of 14 deg and one of 175 deg read as only 19 deg apart (both sit near
-    # the 0/180 boundary from opposite sides) even though the two waves
-    # propagate in nearly opposite true directions (azimuth_full 194 deg vs
-    # 355 deg, 161 deg apart) -- silently merging genuinely different waves
-    # into one "family" and violating the fixed-founding-centroid invariant
-    # this loop is supposed to guarantee. Require azimuth_full proximity
-    # too (a real full-circle distance, not axis-only) so only detections
-    # that agree on both the spatial axis AND the propagation direction can
-    # join the same group.
-    groups = []
-    for w in all_waves:
-        matched = False
-        for g in groups:
-            if (
-                _angular_diff(w["direction"], g["direction_center"]) < dir_tol_deg
-                and _full_circle_diff(w["azimuth_full"], g["azimuth_full_center"]) < dir_tol_deg
-                and abs(w["wavelength"] - g["wavelength_center"]) < lambda_tol_km
-            ):
-                g["members"].append(w)
-                # Do NOT update direction_center or wavelength_center here.
-                # The founding centroid is the reference for all future matches.
-                matched = True
-                break
-        if not matched:
-            groups.append({
-                "direction_center":    w["direction"],
-                "azimuth_full_center": w["azimuth_full"],
-                "wavelength_center":   w["wavelength"],
-                "members":             [w],
-            })
-
-    # Per-window deduplication: when the peak-finder splits one wave's power
-    # across two nearby k-bins (common during parameter ramps), both detections
-    # land in the same family at the same timestamp.  Keep only the
-    # strongest-power detection per (family, window-time) pair so the time
-    # series has at most one point per window.
-    for g in groups:
-        seen_times = {}
-        for m in g["members"]:
-            t = m["time"]
-            if t not in seen_times or m["power"] > seen_times[t]["power"]:
-                seen_times[t] = m
-        n_before = len(g["members"])
-        g["members"] = list(seen_times.values())
-        n_after = len(g["members"])
-        if n_after < n_before:
-            print(f"  Dedup: removed {n_before - n_after} weaker co-temporal "
-                  f"peak(s) in family "
-                  f"(dir~{g['direction_center']:.0f} deg, "
-                  f"lam~{g['wavelength_center']:.0f} km)")
-
-    # Filter and sort
-    families = [g for g in groups if len(g["members"]) >= min_detections]
-    families = sorted(families, key=lambda g: -len(g["members"]))
-
-    for i, f in enumerate(families):
-        f["family_id"] = i + 1
-
-    print(f"Wave families found (≥{min_detections} detections): {len(families)}")
-    for f in families:
-        times  = [m["time"]  for m in f["members"]]
-        speeds = [m["speed"] for m in f["members"]]
-        print(f"  Family {f['family_id']}: dir={f['direction_center']:.1f}°  "
-              f"λ={f['wavelength_center']:.1f} km  "
-              f"n={len(f['members'])}  "
-              f"speed {min(speeds):.0f}–{max(speeds):.0f} m/s")
-
-    return families
-
 
 # ---------------------------------------------------------------------------
 # Convert to xarray for Gabor / KF handoff
@@ -419,7 +281,9 @@ def families_to_xarray(
 
     Parameters
     ----------
-    families  : output of build_wave_families()
+    families  : list of family dicts (family_id/direction_center/
+                wavelength_center/members), e.g. from
+                `wave_identity.cluster_detections_into_families`
     ds_truth  : optional synthetic truth Dataset (from build_synthetic_wave).
                 If provided, truth variables are merged in for easy comparison.
 
@@ -588,7 +452,8 @@ def plot_wave_family_timeseries(
 
     Parameters
     ----------
-    families       : output of build_wave_families()
+    families       : list of family dicts, e.g. from
+                     `wave_identity.cluster_detections_into_families`
     ds_truth       : synthetic truth Dataset from build_synthetic_wave()
     win_len_frames : frames per analysis window  -> enables dv speed bars
     dt_min         : temporal sampling (minutes) -> enables dv speed bars

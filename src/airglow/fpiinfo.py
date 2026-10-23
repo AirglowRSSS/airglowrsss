@@ -1246,7 +1246,7 @@ _instruments['minime06'] = {
         'skyI_quality_thresh'   : [0.0708,0.0224], # The brightness [counts/sec] below which we raise the quality flag (for q=1 and q=2, respectively). Red only.
         'skyB_quality_thresh'   : np.inf,            # Label with q=1 for data with skyB > this number. Red and green.
         'plot_ref'              : 'laser',           # 'laser' or 'zenith'. How to generate quicklook plots (This doesn't affect what's in npz file)
-        'expected_tags'         : ['XR'],
+        'expected_tags'         : ['X'],
     }
 
 _instruments['minime07'] = {

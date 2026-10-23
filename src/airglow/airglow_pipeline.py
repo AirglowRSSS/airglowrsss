@@ -5,19 +5,22 @@ airglow_pipeline.py
 
 Covers the complete analysis chain from a single HDF5 file to outputs:
 
-    1. Data loading & preprocessing       (_load_real_data — fill in your loader)
+    1. Data loading & preprocessing       (_load_real_data, MANGO HDF5 loader)
     2. Sliding-window omega-k analysis    (parallel across windows)
-    3. Wave family grouping               (build_wave_families)
-    4. Per-frame parameter interpolation  (build_waves_for_gabor)
+    3. Wave family grouping               (wave_identity.cluster_detections_into_families)
+    4. Per-frame parameter interpolation  (wave_identity.resolve_frame_ownership)
     5. Adaptive Gabor reconstruction      (reconstruct_all_waves)
     6. Omega-k cross-validation           (Pearson r per frame)
-    7. Kalman tracking (speed / orientation / wavelength)
-    8. Plots: family timeseries, ownership, KF timeseries, correlation, scatter
-    9. Animation (parallel frame rendering → ffmpeg mp4)
+    7. Kalman tracking (speed / orientation / wavelength) -- causal, legacy-comparison only
+    8. Second-pass reconstruction + collision resolution + final estimation
+       (kernel_tuning.py, wave_identity.resolve_collisions, final_estimation.py)
+       -> wave_frames.csv / wave_hourly.csv (output_schema.py), the
+       authoritative output
+    9. Plots and animation (parallel frame rendering -> ffmpeg mp4)
 
 Typical usage — multi-night loop:
 
-    from airglow_pipeline import run_airglow_pipeline
+    from airglow.airglow_pipeline import run_airglow_pipeline
     from datetime import datetime
 
     nights = [
@@ -62,19 +65,27 @@ from airglow.wave_clustering    import compute_adaptive_gabor_parameters
 from airglow.phase_speed_kalman import (
     analyze_all_waves_kalman,
     compute_binned_wave_stats,
-    flag_kf_wave_collisions_by_correlation,
-    validate_wave_azimuth_sign,
-    circular_diff_deg,
+    build_kf_merge_log,
 )
 from airglow.wave_validation import (
-    build_wave_families,
     families_to_xarray,
     plot_wave_family_timeseries,
 )
 from airglow.gabor_reconstruction import (
     reconstruct_all_waves,
-    build_waves_for_gabor,
     check_duplicate_waves,
+)
+from airglow.wave_identity import (
+    cluster_detections_into_families,
+    resolve_frame_ownership,
+    resolve_collisions,
+)
+from airglow.kernel_tuning import build_kernel_tuning_signal
+from airglow.final_estimation import estimate_wave_final
+from airglow.output_schema import (
+    build_wave_frame_rows,
+    build_wave_frames_table,
+    build_wave_hourly_table,
 )
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -291,6 +302,8 @@ def _frame_worker(t: int) -> None:
     frames_dir = d["frames_dir"]
     time_lbl   = d["time_labels"][t]
     n_time     = d["n_time"]
+    east_km    = d["east_km"]
+    north_km   = d["north_km"]
 
     fig, axes = _plt.subplots(n_rows, n_cols, figsize=figsize)
     axes = _np.array(axes).reshape(n_rows, n_cols)
@@ -307,10 +320,11 @@ def _frame_worker(t: int) -> None:
     for idx, (cube, base_title) in enumerate(panels):
         r, c = divmod(idx, n_cols)
         ax   = axes[r, c]
-        im   = ax.imshow(
-            cube[t], origin="lower", cmap="RdBu_r",
-            vmin=-vmax, vmax=vmax, aspect="equal",
+        im   = ax.pcolormesh(
+            east_km, north_km, cube[t], cmap="RdBu_r",
+            vmin=-vmax, vmax=vmax, shading="auto",
         )
+        ax.set_aspect("equal")
         _plt.colorbar(im, ax=ax, shrink=0.85)
 
         # Build per-frame title for wave panels; static title for overview panels
@@ -336,39 +350,44 @@ def _frame_worker(t: int) -> None:
             title = f"{wave_title}\n{line2}"
 
             # Velocity vector: direction+speed of this wave at this frame,
-            # centered in the panel (pixel coords here, unlike the notebook's
-            # km-coordinate version). Convention B: 0 deg = North (+y, since
-            # origin="lower"), 90 deg = East (+x), clockwise. Purely a
+            # centered at (0, 0) km (panel center) -- matches
+            # CaseStudy_RealData_OneNight.ipynb's plot_second_pass_grid
+            # exactly (km coordinates, not pixels). Convention B: 0 deg =
+            # North (+north), 90 deg = East (+east), clockwise. Purely a
             # visualization aid -- lets the computed direction/speed be
             # checked by eye against the crest motion actually visible in
-            # the reconstruction. A wave at _ARROW_SPEED_REF_MS reaches the
-            # full _ARROW_MAX_LEN_FRAC-of-panel arrow length. Drawn for both
-            # normal (black) and "*" / coasting (grey, innovation_valid=False)
+            # the reconstruction. A wave at ARROW_SPEED_REF_MS reaches the
+            # full ARROW_MAX_LEN_KM arrow length. Drawn for both normal
+            # (black) and "*" / coasting (grey, innovation_valid=False)
             # frames -- not drawn for "XX" suppressed frames (nothing is
             # reconstructed there).
             if not (_np.isnan(az) or _np.isnan(spd)) and not sup:
-                _ARROW_SPEED_REF_MS  = 150.0
-                _ARROW_MAX_LEN_FRAC  = 0.35
+                _ARROW_SPEED_REF_MS = 150.0
+                _ARROW_MAX_LEN_KM   = 90.0
                 _arrow_color = "black" if valid else "grey"
-                ny_px, nx_px = cube[t].shape
-                cx, cy = nx_px / 2.0, ny_px / 2.0
                 az_rad = _np.deg2rad(az)
                 ux, uy = _np.sin(az_rad), _np.cos(az_rad)
-                arrow_len_px = (min(spd / _ARROW_SPEED_REF_MS, 1.0)
-                                * _ARROW_MAX_LEN_FRAC * min(nx_px, ny_px))
+                arrow_len_km = min(spd / _ARROW_SPEED_REF_MS, 1.0) * _ARROW_MAX_LEN_KM
                 ax.annotate(
-                    "", xy=(cx + ux * arrow_len_px, cy + uy * arrow_len_px),
-                    xytext=(cx, cy),
+                    "", xy=(ux * arrow_len_km, uy * arrow_len_km), xytext=(0, 0),
                     arrowprops=dict(arrowstyle="-|>", color=_arrow_color, lw=2.0, mutation_scale=16),
                 )
-                ax.plot(cx, cy, marker="o", color=_arrow_color, markersize=3)
+                ax.plot(0, 0, marker="o", color=_arrow_color, markersize=3)
         else:
             title = base_title
 
-        ax.set_title(title, fontsize=8, family="monospace")
-        ax.set_xlabel("East (px)", fontsize=7)
-        ax.set_ylabel("North (px)", fontsize=7)
-        ax.tick_params(labelsize=6)
+        # Matches the notebook: only per-wave panels (idx >= n_static) get
+        # monospace/fontsize 8; static overview panels get the default font
+        # at fontsize 9. Axis labels only on the left column/bottom row, not
+        # every panel, and no explicit tick-label size override (inherits
+        # rcParams default) -- all per the notebook's plot_second_pass_grid.
+        is_wave_panel = idx >= n_static and kf_az is not None
+        ax.set_title(title, fontsize=8 if is_wave_panel else 9,
+                     family="monospace" if is_wave_panel else None)
+        if c == 0:
+            ax.set_ylabel("North (km)")
+        if r == n_rows - 1:
+            ax.set_xlabel("East (km)")
 
     for idx in range(len(panels), n_rows * n_cols):
         r, c = divmod(idx, n_cols)
@@ -815,6 +834,68 @@ def _write_kf_table(
 
 
 # =============================================================================
+# wave_identity.resolve_collisions -> kf_results merge-back
+# =============================================================================
+
+def _merge_collision_result_into_kf_results(kf_results, collisions, n_waves, time_vals):
+    """
+    Write `wave_identity.resolve_collisions`'s output into `kf_results` as
+    four columns (`collision_id`, `collision_group_wave_ids`,
+    `collision_primary_wave_id`, `collision_primary`). `resolve_collisions`
+    returns its own complete DataFrame (one row per wave_id x frame_idx,
+    every frame on the full night grid) rather than annotating a caller's
+    table directly, so the two have to be merged by timestamp rather than
+    by row position: `kf_results` only covers the edge-trimmed slice
+    `analyze_all_waves_kalman` produces, not the full grid `collisions` is
+    built on.
+
+    Parameters
+    ----------
+    kf_results : pd.DataFrame
+        Output of `analyze_all_waves_kalman`, to annotate.
+    collisions : pd.DataFrame
+        Output of `wave_identity.resolve_collisions`, same `time_vals`.
+    n_waves : int
+        Number of waves (`len(waves_detected)`).
+    time_vals : np.ndarray of datetime64
+        Full night time grid, same length/order `collisions`'s `frame_idx`
+        column uses.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of `kf_results` with `collision_id`/`collision_group_wave_ids`/
+        `collision_primary_wave_id`/`collision_primary` added.
+    """
+    df = kf_results.copy()
+    df["collision_id"] = -1
+    df["collision_group_wave_ids"] = ""
+    df["collision_primary_wave_id"] = -1
+    df["collision_primary"] = True
+
+    n_time = len(time_vals)
+    _t_full_ns = time_vals.astype("datetime64[ns]").astype(np.int64)
+
+    for wid in range(n_waves):
+        wmask = (df["wave_id"] == wid).to_numpy()
+        if not np.any(wmask):
+            continue
+        wtimes_ns = pd.to_datetime(df.loc[wmask, "time"].values).astype(np.int64)
+        kf_idx = np.searchsorted(_t_full_ns, wtimes_ns).clip(0, n_time - 1)
+        match = np.abs(_t_full_ns[kf_idx] - wtimes_ns) < int(1e9)
+
+        c_wid = collisions[collisions["wave_id"] == wid].sort_values("frame_idx").reset_index(drop=True)
+        idx = df.index[wmask][match]
+        c_rows = c_wid.iloc[kf_idx[match]]
+        df.loc[idx, "collision_id"] = c_rows["collision_id"].to_numpy()
+        df.loc[idx, "collision_group_wave_ids"] = c_rows["collision_group_wave_ids"].to_numpy()
+        df.loc[idx, "collision_primary_wave_id"] = c_rows["collision_primary_wave_id"].to_numpy()
+        df.loc[idx, "collision_primary"] = c_rows["collision_primary"].to_numpy()
+
+    return df
+
+
+# =============================================================================
 # Quiet context manager
 # =============================================================================
 
@@ -896,7 +977,7 @@ def run_airglow_pipeline(
     # ── KF collision check (second-pass reconstruction) ───────────────────────
     kf_collision_corr_threshold: float = 0.7,
     # ── Animation ─────────────────────────────────────────────────────────────
-    frame_dpi: int = 72,
+    frame_dpi: int = 100,
     movie_fps: int = 5,
     make_animation: bool = True,
     # ── Execution ─────────────────────────────────────────────────────────────
@@ -1017,11 +1098,12 @@ def run_airglow_pipeline(
         Smoothed per-frame Pearson r, between two waves' second-pass Gabor
         reconstructions, at or above which they're judged to be
         reconstructing the same physical structure (see
-        flag_kf_wave_collisions_by_correlation). Default 0.7 -- calibrated
-        empirically on real data, not check_duplicate_waves's 0.5 (see
+        `wave_identity.resolve_collisions`). Default 0.7 -- calibrated
+        empirically on real data, not `check_duplicate_waves`'s 0.5 (see
         that function's docstring for why).
     frame_dpi : int
-        DPI for animation frames (72 = fast preview, 150 = publication).
+        DPI for animation frames (72 = fast preview, 100 = standard,
+        150 = publication).
     movie_fps : int
         Output mp4 frame rate.
     make_animation : bool
@@ -1178,7 +1260,7 @@ def run_airglow_pipeline(
     # ── Step 3: Wave family grouping ──────────────────────────────────────────
     _vprint("[3/9] Wave family grouping ...")
     with _maybe_quiet(verbose):
-        families = build_wave_families(
+        families = cluster_detections_into_families(
             window_results,
             dir_tol_deg    = dir_tol_deg,
             lambda_tol_km  = lambda_tol_km,
@@ -1251,8 +1333,13 @@ def run_airglow_pipeline(
     gabor_btheta   = gabor_btheta_full / 2.0
     full_time_grid = time_vals.astype("datetime64[ns]")
 
+    # Each wave's founding seed values (orientation_deg/azimuth) use
+    # angles.circular_mean_axis_deg/circular_mean_full_deg rather than a
+    # plain median -- see resolve_frame_ownership's own docstring for why
+    # a median can be wrong for a family whose members straddle the
+    # 0/180 or 0/360 wrap boundary.
     with _maybe_quiet(verbose):
-        waves_detected = build_waves_for_gabor(
+        waves_detected = resolve_frame_ownership(
             families      = families,
             time_grid     = full_time_grid,
             n_stds        = gabor_n_stds,
@@ -1455,25 +1542,6 @@ def run_airglow_pipeline(
 
     kf_results = _run_kf()
 
-    # ── Step 8-validate: informational only -- cross-check each wave's fixed
-    # azimuth against its own measured KF omega sign and flag disagreement.
-    # Deliberately NOT auto-corrected: kf_omega_rads's sign is exactly the
-    # signal _kalman_omega_tracker's own docstring warns against trusting for
-    # direction ("noise bursts that push the cross-correlation phasor across
-    # zero contaminate the sign estimate... tracking |ω| eliminates all such
-    # artefacts") -- that's why kf_prop_azimuth_deg is hard-fixed to
-    # wave['azimuth'] regardless of ω's sign, by original design. An earlier
-    # version of this step auto-flipped flagged waves' azimuth, which on real
-    # (not synthetic) data flipped at least one *already-correct* azimuth
-    # (confirmed against real imagery), because the sign-vote is systematically
-    # biased toward orientation_deg (always < 180°) rather than reflecting a
-    # genuine, evenly-distributed real-data disagreement. Kept as a flag only
-    # -- worth a manual look, not a safe automatic correction.
-    with _maybe_quiet(verbose):
-        kf_az_validation = validate_wave_azimuth_sign(
-            kf_results, waves_detected, verbose=verbose,
-        )
-
     _kf_ts_path = str(results_dir / f"{stem}_kf_timeseries.png")
     _plot_kf_timeseries(kf_results, waves_detected, time_kf, _kf_ts_path, verbose)
     output_paths["kf_timeseries"] = _kf_ts_path
@@ -1481,10 +1549,6 @@ def run_airglow_pipeline(
     _kf_tbl_path = str(results_dir / f"{stem}_kf_table.txt")
     _write_kf_table(kf_results, waves_detected, _kf_tbl_path, verbose)
     output_paths["kf_table"] = _kf_tbl_path
-
-    _kf_az_val_path = str(results_dir / f"{stem}_kf_azimuth_validation.csv")
-    kf_az_validation.to_csv(_kf_az_val_path, index=False, float_format="%.4f")
-    output_paths["kf_azimuth_validation"] = _kf_az_val_path
 
     # ── Step 8b: Second-pass Gabor reconstruction using KF estimates ──────────
     # Uses KF-refined per-frame orientation and wavelength as the kernel
@@ -1498,45 +1562,52 @@ def run_airglow_pipeline(
     # n_time-edge_frames]; edge frames receive NaN → zero contribution.
     _t_full_ns = time_vals.astype("datetime64[ns]").astype(np.int64)
     waves_kf   = []
-    # Also collect KF arrays (n_time-length) for animation labels
-    _kf_az_series    = []
-    _kf_lam_series   = []
-    _kf_spd_series   = []
-    _kf_valid_series = []
+
+    # kernel_tuning.build_kernel_tuning_signal's offline-smoothed signal --
+    # not the causal analyze_all_waves_kalman output -- drives the
+    # second-pass Gabor kernel. Reuses the causal KF call's own
+    # already-sliced inputs (`cmplx_sl`, `kx_obs_sl`, `ky_obs_sl`,
+    # `time_kf`, `dt_seconds`), so no separate edge-alignment scheme is
+    # needed. `kf_results` (the causal tracker) keeps running unchanged
+    # for `kf_results.csv`/`kf_binned.csv` -- only kernel construction's
+    # own input source changes. The movie's animation labels no longer
+    # come from `kf_results` at all -- see the Step 9 prep block further
+    # below, which sources them from `wave_frames` (final_estimation.py's
+    # own output) instead.
+    with _maybe_quiet(verbose):
+        tuning_signal = build_kernel_tuning_signal(
+            waves               = waves_detected,
+            kx_obs_list         = kx_obs_sl,
+            ky_obs_list         = ky_obs_sl,
+            complex_amplitudes  = cmplx_sl,
+            time_vals           = time_kf,
+            dt                  = dt_seconds,
+            btheta_rad          = gabor_btheta,
+            snr_min_amplitude   = kf_snr_min,
+            chi2_gate           = kf_chi2_gate,
+            verbose             = verbose,
+        )
 
     for wi, wave in enumerate(waves_detected):
-        wdf = kf_results[kf_results["wave_id"] == wi].copy()
-        orient_kf = np.full(n_time, np.nan)
-        lam_kf    = np.full(n_time, np.nan)
-        az_kf     = np.full(n_time, np.nan)
-        spd_kf    = np.full(n_time, np.nan)
-        valid_kf  = np.zeros(n_time, dtype=bool)
-
-        if len(wdf) > 0:
-            _t_kf_ns = pd.to_datetime(wdf["time"].values).astype(np.int64)
-            kf_idx   = np.searchsorted(_t_full_ns, _t_kf_ns).clip(0, n_time - 1)
-            # Only accept frames whose time matches exactly (within 1 s)
-            match = np.abs(_t_full_ns[kf_idx] - _t_kf_ns) < int(1e9)
-            kf_idx = kf_idx[match]
-
-            orient_kf[kf_idx] = wdf["kf_orient_deg"].values[match] % 180.0
-            lam_kf[kf_idx]    = wdf["kf_lambda_km"].values[match]
-            az_kf[kf_idx]     = wdf["kf_orient_deg"].values[match]       # full-circle
-            spd_kf[kf_idx]    = np.abs(wdf["kf_wavespeed_ms"].values[match])
-            valid_kf[kf_idx]  = wdf["innovation_valid"].values[match].astype(bool)
+        # Second-pass kernel input: offline-smoothed (kernel_tuning.py),
+        # placed onto the full grid by direct slice assignment -- `sl`
+        # (`time_kf = time_vals[sl]`) is an exact positional offset, no
+        # timestamp search needed (unlike the animation-label arrays,
+        # sourced from `wave_frames` further below, which needs no
+        # alignment either -- `wave_identity`'s per-frame grain already
+        # matches the full night grid).
+        orient_kt = np.full(n_time, np.nan)
+        lam_kt    = np.full(n_time, np.nan)
+        orient_kt[sl] = tuning_signal[wi]["orientation_deg_series"]
+        lam_kt[sl]    = tuning_signal[wi]["wavelength_km_series"]
 
         wave_kf = dict(wave)
-        wave_kf["orientation_deg_series"] = orient_kf
-        wave_kf["wavelength_km_series"]   = lam_kf
+        wave_kf["orientation_deg_series"] = orient_kt
+        wave_kf["wavelength_km_series"]   = lam_kt
         waves_kf.append(wave_kf)
 
-        _kf_az_series.append(az_kf)
-        _kf_lam_series.append(lam_kf)
-        _kf_spd_series.append(spd_kf)
-        _kf_valid_series.append(valid_kf)
-
     with _maybe_quiet(verbose):
-        wave_cubes_kf, composite_kf, _, _, _ = reconstruct_all_waves(
+        wave_cubes_kf, composite_kf, complex_amp_2nd, kx_2nd, ky_2nd = reconstruct_all_waves(
             data_filtered_temporal   = data_arr_full,
             waves                    = waves_kf,
             dx_km                    = dx_km,
@@ -1546,19 +1617,54 @@ def run_airglow_pipeline(
             rms_calibrate            = rms_calibrate,
         )
     _vprint("  Second-pass reconstruction complete.")
+    # complex_amp_2nd/kx_2nd/ky_2nd (per-wave, per-frame second-pass phasor
+    # and spatial phase gradient) are kept -- they're final_estimation.py's
+    # own raw material for Stage 5, not discarded.
+
+    # ── Step 8b-ownership-gate: zero wave_cubes_kf for frames a wave doesn't
+    #    legitimately own ──────────────────────────────────────────────────
+    # Mirrors the first pass's own NaN-orientation-series -> cube[t] = 0.0
+    # pattern (gabor_reconstruction.py's _reconstruct_adaptive), which the
+    # second pass doesn't get for free. waves_kf's orientation_deg_series/
+    # wavelength_km_series come from kernel_tuning.py's offline smoother,
+    # which produces a finite (not NaN) value at every frame in its input
+    # slice regardless of ownership -- so without this gate, the
+    # second-pass kernel still gets built and applied on frames this wave
+    # doesn't own, reconstructing whatever real signal happens to fall in
+    # a nearby wave's passband under this wave's own stale label.
+    # waves_detected[i]['_owned_mask'] (Stage B's own per-frame ownership
+    # answer, structural and pass-independent) is the correct gate.
+    #
+    # Must run HERE, before Step 8b-collision-check below, not after: an
+    # unowned wave's borrowed-signal artifact can otherwise get flagged as
+    # a real "collision" with the wave whose signal it borrowed, and can
+    # also distort which wave wins a correlation-based collision it's not
+    # actually part of.
+    for _wi, _wave in enumerate(waves_detected):
+        _owned = _wave.get("_owned_mask")
+        if _owned is not None:
+            wave_cubes_kf[_wi][~_owned] = 0.0
+    composite_kf = np.sum(wave_cubes_kf, axis=0)
 
     # ── Step 8b-collision-check: cross-correlate the second-pass reconstructions ─
     # Must run here, not before Step 8b, since it needs wave_cubes_kf to exist.
-    # See flag_kf_wave_collisions_by_correlation's docstring for why this
-    # replaced the earlier orientation/wavelength-tolerance check.
+    # `apply_duplicate_gate=False` is required for this second-pass call --
+    # see `resolve_collisions`'s own docstring for why. `check_duplicate_waves`
+    # (the first-pass check, above) is a separate, deliberately untouched
+    # mechanism.
     with _maybe_quiet(verbose):
-        kf_results = flag_kf_wave_collisions_by_correlation(
-            kf_results, waves_detected, waves_kf, wave_cubes_kf, time_vals,
+        _collisions_2nd = resolve_collisions(
+            waves_kf, wave_cubes_kf, complex_amp_2nd, time_vals,
+            pass_label     = "second-pass",
             corr_threshold = kf_collision_corr_threshold,
             dir_tol_deg    = dir_tol_deg,
             lambda_tol_km  = lambda_tol_km,
+            apply_duplicate_gate = False,
             verbose        = verbose,
         )
+    kf_results = _merge_collision_result_into_kf_results(
+        kf_results, _collisions_2nd, len(waves_detected), time_vals,
+    )
     _kf_coll_path = str(results_dir / f"{stem}_kf_collisions.png")
     _plot_kf_collisions(kf_results, waves_detected, _kf_coll_path, verbose)
     output_paths["kf_collisions"] = _kf_coll_path
@@ -1567,12 +1673,76 @@ def run_airglow_pipeline(
     # The only persisted record of which (wave, frame) rows were judged
     # duplicates -- everything else from the collision check (the Gantt plot,
     # the composite_kf suppression below) is either a picture or an in-memory
-    # effect. Written here, after flag_kf_wave_collisions_by_correlation, so
+    # effect. Written here, after the collision merge-back above, so
     # collision_id/collision_group_wave_ids/collision_primary/
     # collision_primary_wave_id are already populated.
     _kf_results_path = str(results_dir / f"{stem}_kf_results.csv")
     kf_results.to_csv(_kf_results_path, index=False, float_format="%.4f")
     output_paths["kf_results_csv"] = _kf_results_path
+
+    # ── Step 5: Final estimation (offline, second-pass) ────────────────────────
+    # Runs final_estimation.py per wave, on the same second-pass
+    # kx_2nd/ky_2nd/complex_amp_2nd this Step 8b call already computed
+    # (kept above, not recomputed), the same per-frame ownership
+    # (`_owned_mask`) Step 8b-ownership-gate above already used, and this
+    # pass's own now-finalized collision_primary (merged in from
+    # wave_identity.resolve_collisions above). Output schema: wave_frames.csv
+    # (per-frame) + wave_hourly.csv (hourly, final_*-only aggregate) via
+    # output_schema.py.
+    _vprint("[8c/9] Final estimation (Stage 5, offline second-pass) ...")
+    dt_sec = dt_min * 60.0
+    _wave_frame_rows = []
+    for wi, wave in enumerate(waves_detected):
+        wdf = kf_results[kf_results["wave_id"] == wi].copy()
+        amp1_full   = np.full(n_time, np.nan)
+        tune_or_full = np.full(n_time, np.nan)
+        tune_lam_full = np.full(n_time, np.nan)
+        tune_spd_full = np.full(n_time, np.nan)
+        cid_full    = np.full(n_time, -1, dtype=int)
+        cp_full     = np.zeros(n_time, dtype=bool)
+
+        if len(wdf) > 0:
+            _t_kf_ns = pd.to_datetime(wdf["time"].values).astype(np.int64)
+            kf_idx   = np.searchsorted(_t_full_ns, _t_kf_ns).clip(0, n_time - 1)
+            match    = np.abs(_t_full_ns[kf_idx] - _t_kf_ns) < int(1e9)
+            kf_idx_m = kf_idx[match]
+
+            amp1_full[kf_idx_m]     = wdf["amplitude"].values[match]
+            tune_or_full[kf_idx_m]  = wdf["kf_orient_deg"].values[match]
+            tune_lam_full[kf_idx_m] = wdf["kf_lambda_km"].values[match]
+            tune_spd_full[kf_idx_m] = wdf["kf_wavespeed_ms"].values[match]
+            cid_full[kf_idx_m]      = wdf["collision_id"].values[match].astype(int)
+            cp_full[kf_idx_m]       = wdf["collision_primary"].values[match].astype(bool)
+
+        owned_mask = wave.get("_owned_mask", np.zeros(n_time, dtype=bool))
+        est_df = estimate_wave_final(
+            wave, kx_2nd[wi], ky_2nd[wi], complex_amp_2nd[wi], time_vals, dt_sec,
+            owned_mask, cp_full,
+        )
+        _wave_frame_rows.append(build_wave_frame_rows(
+            wi, est_df,
+            raw_amplitude_1st=amp1_full,
+            raw_amplitude_2nd=np.abs(complex_amp_2nd[wi]),
+            raw_kx_2nd=kx_2nd[wi], raw_ky_2nd=ky_2nd[wi],
+            tuning_orient_deg=tune_or_full, tuning_wavelength_km=tune_lam_full,
+            tuning_wavespeed_ms=tune_spd_full,
+            collision_id=cid_full, collision_primary=cp_full,
+        ))
+
+    wave_frames = build_wave_frames_table(_wave_frame_rows)
+    _wave_frames_path = str(results_dir / f"{stem}_wave_frames.csv")
+    wave_frames.to_csv(_wave_frames_path, index=False, float_format="%.4f")
+    output_paths["wave_frames_csv"] = _wave_frames_path
+
+    wave_hourly = build_wave_hourly_table(
+        wave_frames, bin_width_min=bin_width_min, min_valid_frames=min_valid_frames,
+    )
+    if len(wave_hourly) > 0:
+        _wave_hourly_path = str(results_dir / f"{stem}_wave_hourly.csv")
+        wave_hourly.to_csv(_wave_hourly_path, index=False, float_format="%.4f")
+        output_paths["wave_hourly_csv"] = _wave_hourly_path
+    _vprint(f"  Final estimation complete: {len(waves_detected)} wave(s), "
+            f"{int(wave_frames['valid'].sum())}/{len(wave_frames)} valid frame-rows.")
 
     # ── Binned wave statistics, computed AFTER dedup ───────────────────────────
     # Must run here (not right after analyze_all_waves_kalman, where it used to
@@ -1592,8 +1762,16 @@ def run_airglow_pipeline(
         kf_binned.to_csv(_kfb_path, index=False, float_format="%.4f")
         output_paths["kf_binned_csv"] = _kfb_path
 
+    # ── Merge-log audit: wave_ids fully absorbed into another wave all night,
+    # invisible to kf_binned above since it only ever sees collision_primary
+    # frames. Built from the same, unfiltered kf_results.
+    kf_merge_log = build_kf_merge_log(kf_results, night=stem)
+    _kfml_path = str(results_dir / f"{stem}_kf_merge_log.csv")
+    kf_merge_log.to_csv(_kfml_path, index=False, float_format="%.4f")
+    output_paths["kf_merge_log_csv"] = _kfml_path
+
     # ── Step 8b-collision-suppress: drop the losing wave from composite_kf ────
-    # flag_kf_wave_collisions_by_correlation just judged, per episode, which
+    # The collision check above just judged, per episode, which
     # wave is the "real" one. Zero the loser's contribution for exactly the
     # frames it lost, so the two waves' Gabor kernels stop double-counting
     # the same physical wave in composite_kf/wave_cubes_kf -- otherwise the
@@ -1634,6 +1812,36 @@ def run_airglow_pipeline(
 
     composite_kf = np.sum(wave_cubes_kf, axis=0)
 
+    # ── Step 9 prep: point the movie's label/arrow at final_estimation.py's
+    #    actual output ────────────────────────────────────────────────────
+    # The animation's per-frame label/arrow arrays are sourced from
+    # wave_frames' final_azimuth_deg/final_wavelength_km/final_speed_ms --
+    # one row per (wave_id, frame_idx) already on the full n_time grid, no
+    # realignment needed -- not from the causal tracker's kf_orient_deg/
+    # kf_lambda_km/kf_wavespeed_ms. `wave_frames['valid']` is
+    # `unified_validity_mask` (owned AND collision_primary AND amp>0 AND
+    # SNR floor), a superset of a collision-only suppression check, so
+    # using `~valid` as the single suppression signal collapses
+    # "collision-suppressed" and "simply not owned" into one "not
+    # legitimately present here" state without a separate not-owned check.
+    # This also collapses the old three-way normal/coasting/suppressed
+    # state into two-way present/not-present -- final_estimation.py has no
+    # per-frame confidence gradation analogous to the causal tracker's
+    # `innovation_valid` to carry the "coasting" (grey arrow, "*" flag)
+    # case forward, and none is invented here: `_frame_worker`'s own
+    # rendering logic is unchanged, only its input arrays are.
+    _fe_az_series    = []
+    _fe_lam_series   = []
+    _fe_spd_series   = []
+    _fe_valid_series = []
+    for wi in range(len(waves_detected)):
+        wf = wave_frames[wave_frames["wave_id"] == wi].sort_values("frame_idx")
+        _fe_az_series.append(wf["final_azimuth_deg"].to_numpy())
+        _fe_lam_series.append(wf["final_wavelength_km"].to_numpy())
+        _fe_spd_series.append(wf["final_speed_ms"].to_numpy())
+        _fe_valid_series.append(wf["valid"].to_numpy(dtype=bool))
+    _fe_suppressed_series = [~v for v in _fe_valid_series]
+
     # ── Step 9: Animation ─────────────────────────────────────────────────────
     if make_animation:
         _vprint(
@@ -1655,7 +1863,12 @@ def run_airglow_pipeline(
         )
         n_pa   = len(panels_a); n_ca = 4
         n_ra   = (n_pa + n_ca - 1) // n_ca
-        vmax_a = 2.0 * float(np.nanstd(np.concatenate([c.ravel() for c, _ in panels_a])))
+        # Matches CaseStudy_RealData_OneNight.ipynb's plot_second_pass_grid:
+        # scale from the input data alone, not the full panel set (wave cubes
+        # individually have less variance than the raw input, so folding them
+        # into the same std would pull the scale away from what the notebook
+        # uses -- see VORONOI_FIX_STATUS.md-era discussion on movie styling).
+        vmax_a = 2.0 * float(np.nanstd(data_arr_full))
         shared = {
             "panels":          panels_a,
             "vmax_common":     vmax_a,
@@ -1666,13 +1879,17 @@ def run_airglow_pipeline(
             "frames_dir":      str(frames_dir),
             "time_labels":     [str(pd.to_datetime(t))[:19] for t in time_vals],
             "n_time":          n_time,
-            # Per-frame KF label arrays (one (n_time,) array per wave)
+            "east_km":         east_km,
+            "north_km":        north_km,
+            # Per-frame label arrays (one (n_time,) array per wave), sourced
+            # from final_estimation.py's own output (see Step 9 prep above)
+            # -- not the causal KF's.
             "n_static_panels": N_STATIC,
-            "kf_az_series":    _kf_az_series,
-            "kf_lam_series":   _kf_lam_series,
-            "kf_spd_series":   _kf_spd_series,
-            "kf_valid_series": _kf_valid_series,
-            "kf_suppressed_series": _kf_suppressed_series,
+            "kf_az_series":    _fe_az_series,
+            "kf_lam_series":   _fe_lam_series,
+            "kf_spd_series":   _fe_spd_series,
+            "kf_valid_series": _fe_valid_series,
+            "kf_suppressed_series": _fe_suppressed_series,
             "kf_suppressed_into_series": _kf_suppressed_into_series,
             "wave_labels":     [w["label"] for w in waves_detected],
         }
@@ -1743,6 +1960,8 @@ def run_airglow_pipeline(
         "data_omegak":        data_omegak,
         "kf_results":         kf_results,
         "kf_binned":          kf_binned,
+        "wave_frames":        wave_frames,       # Stage 5: final_estimation.py per-frame
+        "wave_hourly":        wave_hourly,        # Stage 5: final_*-only hourly aggregate
         "correlation_stats":  correlation_stats,
         "output_paths":       output_paths,
     }

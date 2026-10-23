@@ -1,3 +1,15 @@
+"""
+OmegaKFilter.py
+----------------
+The 3D (time, north, east) omega-k spectral filter: the pipeline's Stage 1
+entry point. Detrends and windows a night's image cube, 3D-FFTs it into
+(omega, ky, kx) space, and builds/applies a passband mask there (temporal
+period, horizontal wavelength, and optionally a gravity-wave dispersion-
+relation band) before inverse-transforming back to physical space.
+Instantiated once per sliding analysis window and once on the full night
+(the latter as an independent cross-validation reference).
+"""
+
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
@@ -6,7 +18,8 @@ from scipy.fft import fftn, ifftn, fftfreq, next_fast_len
 
 class OmegaKFilterXarray:
     """
-    Omega-k filter for atmospheric gravity wave analysis using xarray.
+    Builds and applies a 3D omega-k passband filter to one night's (or one
+    window's) image cube.
     """
     
     def __init__(self, ds, data_var='ImageData', zero_pad_factor=1, spatial_zero_pad_factor=1):
@@ -131,8 +144,13 @@ class OmegaKFilterXarray:
         N : float
             Brunt-Väisälä frequency for dispersion relation
         apply_dispersion : bool
-            If True, apply gravity wave dispersion relation filter
-            
+            If True, apply gravity wave dispersion relation filter. The
+            pipeline's own default is False -- omega measured from the FFT
+            is in the observer frame, while the dispersion relation is a
+            statement about intrinsic frequency (they differ by k.U for a
+            nonzero background wind); this filter stays off for real data
+            until a wind (U) correction is available, not because of a bug.
+
         Returns
         -------
         filter_mask : xarray.DataArray
@@ -285,102 +303,4 @@ class OmegaKFilterXarray:
         
         return filtered_ds
     
-    def plot_dispersion_diagram(self, filter_mask=None, vmax_percentile=99):
-        """
-        Plot omega-k dispersion diagram.
-        """
-        # Compute FFT
-        data = self.ds[self.data_var].values
-        data_fft = fftn(signal.detrend(data, axis=0))
-        power = np.abs(data_fft)**2
-        
-        # Create 2D horizontal wavenumber matching data dimensions (north, east)
-        Kx_2d, Ky_2d = np.meshgrid(self.kx, self.ky, indexing='xy')
-        Kh_2d = np.sqrt(Kx_2d**2 + Ky_2d**2)
-        
-        # Average over azimuthal direction
-        kh_bins = np.linspace(0, np.max(Kh_2d), 100)
-        omega_bins = self.omega[self.omega >= 0]
-        
-        diagram = np.zeros((len(omega_bins), len(kh_bins)-1))
-        
-        for i in range(len(omega_bins)):
-            for j in range(len(kh_bins)-1):
-                mask = (Kh_2d >= kh_bins[j]) & (Kh_2d < kh_bins[j+1])
-                if i < len(self.omega) // 2:
-                    # Get the 2D spatial slice at this frequency
-                    power_slice = power[i, :, :]
-                    if np.any(mask):
-                        diagram[i, j] = np.mean(power_slice[mask])
-        
-        # Plot
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        kh_plot = (kh_bins[:-1] + kh_bins[1:]) / 2 * 1000  # Convert to cycles/km
-        omega_plot = omega_bins * 1000  # Convert to mrad/s
-        
-        vmax = np.percentile(diagram[diagram > 0], vmax_percentile)
-        im = ax.pcolormesh(kh_plot, omega_plot, diagram, 
-                          shading='auto', cmap='viridis',
-                          norm=plt.matplotlib.colors.LogNorm(vmin=diagram[diagram>0].min(), 
-                                                             vmax=vmax))
-        
-        # Overlay dispersion curves for different N values
-        kh_theory = np.linspace(kh_plot[kh_plot > 0].min(), kh_plot.max(), 200)
-        for N, label in [(0.015, 'N=0.015'), (0.02, 'N=0.02'), (0.025, 'N=0.025')]:
-            omega_theory = N * (kh_theory / 1000) / np.sqrt((kh_theory/1000)**2 + (1/(4*7000**2)))
-            ax.plot(kh_theory, omega_theory * 1000, 'r--', alpha=0.5, linewidth=1.5,
-                   label=label if N == 0.02 else None)
-        
-        ax.set_xlabel('Horizontal Wavenumber (cycles/km)', fontsize=12)
-        ax.set_ylabel('Frequency (mrad/s)', fontsize=12)
-        ax.set_title('Omega-k Dispersion Diagram (557.7 nm Airglow)', fontsize=14)
-        ax.legend()
-        plt.colorbar(im, label='Power')
-        ax.grid(True, alpha=0.3)
-        
-        return fig, ax
     
-    def plot_snapshots(self, filtered_ds, time_indices=[0, -1]):
-        """
-        Plot comparison of original vs filtered data at selected times.
-        """
-        n_times = len(time_indices)
-        fig, axes = plt.subplots(3, n_times, figsize=(5*n_times, 12))
-        
-        if n_times == 1:
-            axes = axes.reshape(3, 1)
-        
-        for i, tidx in enumerate(time_indices):
-            # Original
-            im1 = axes[0, i].pcolormesh(self.east, self.north,
-                                        self.ds[self.data_var].isel(time=tidx),
-                                        shading='auto', cmap='viridis')
-            axes[0, i].set_xlabel('East (km)')
-            axes[0, i].set_ylabel('North (km)')
-            axes[0, i].set_title(f'Original\n{self.time[tidx]}')
-            axes[0, i].set_aspect('equal')
-            plt.colorbar(im1, ax=axes[0, i], label='Counts')
-            
-            # Filtered
-            im2 = axes[1, i].pcolormesh(self.east, self.north,
-                                        filtered_ds[self.data_var + '_filtered'].isel(time=tidx),
-                                        shading='auto', cmap='RdBu_r')
-            axes[1, i].set_xlabel('East (km)')
-            axes[1, i].set_ylabel('North (km)')
-            axes[1, i].set_title(f'Omega-K Filtered\n{self.time[tidx]}')
-            axes[1, i].set_aspect('equal')
-            plt.colorbar(im2, ax=axes[1, i], label='Perturbation')
-
-            # Filtered
-            im3 = axes[2, i].pcolormesh(self.east, self.north,
-                                        filtered_ds['FilteredImageData'].isel(time=tidx),
-                                        shading='auto', cmap='RdBu_r')
-            axes[2, i].set_xlabel('East (km)')
-            axes[2, i].set_ylabel('North (km)')
-            axes[2, i].set_title(f'Temporal Filtered\n{self.time[tidx]}')
-            axes[2, i].set_aspect('equal')
-            plt.colorbar(im3, ax=axes[2, i], label='Perturbation')
-        
-        plt.tight_layout()
-        return fig

@@ -1262,397 +1262,8 @@ def analyze_all_waves_kalman(
 
 
 # ---------------------------------------------------------------------------
-# Post-hoc azimuth-sign validation
-# ---------------------------------------------------------------------------
-
-def validate_wave_azimuth_sign(
-    kf_results: pd.DataFrame,
-    waves_detected: list,
-    min_valid_frames: int = 10,
-    flip_threshold: float = 0.5,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """
-    Cross-check each wave's fixed, full-circle ``azimuth`` (the one-time ω-k
-    detection value stored in ``wave['azimuth']``, used verbatim as
-    ``kf_prop_azimuth_deg`` and as the theta-tracker's disambiguation anchor
-    for the whole night) against the sign of that same wave's own
-    frame-by-frame ``kf_omega_rads``.
-
-    Why this can disagree
-    ----------------------
-    ``kf_omega_rads``'s sign is a genuinely independent, continuously
-    re-measured quantity: ``angle(conj(conv_t) * conv_{t-1}) / dt`` on the
-    Gabor-filtered complex field, referenced against the wave's fixed
-    ``orientation_deg`` axis.  By construction (verified empirically against
-    a synthetic wave of known direction — a south-propagating wave on a
-    0 deg N-S axis measures negative ω, matching the documented "negative =
-    opposite of orientation_deg" convention), positive ω means the wave is
-    propagating toward ``orientation_deg``; negative means toward
-    ``orientation_deg + 180``.
-
-    ``wave['azimuth']`` is a *different*, one-time measurement made upstream
-    at the original ω-k detection (before any Kalman tracking), and is never
-    revisited afterward — deliberately, to avoid noise-driven sign-flip
-    artefacts (see ``_kalman_omega_tracker``'s docstring). That means if the
-    original detection assigned the wrong lobe to a family (or the wave's
-    true direction is simply inconsistent with it), nothing downstream will
-    ever catch it — ``kf_prop_azimuth_deg`` and the theta-tracker's
-    disambiguation anchor both just inherit the same fixed value all night,
-    self-consistently, without ever being checked against the independently
-    re-measured ω sign.
-
-    This function does that check once, after the first-pass Kalman fit.
-
-    Parameters
-    ----------
-    kf_results : pd.DataFrame
-        Output of ``analyze_all_waves_kalman`` (needs ``wave_id``,
-        ``kf_omega_rads``, ``innovation_valid``).
-    waves_detected : list of dict
-        Needs ``orientation_deg`` and ``azimuth`` per wave.
-    min_valid_frames : int
-        Minimum number of valid frames required before a wave's azimuth is
-        judged flippable at all — too few frames make the sign vote
-        unreliable.
-    flip_threshold : float
-        A wave is flagged when the fraction of valid frames whose
-        ``kf_omega_rads`` sign *matches* what ``wave['azimuth']`` implies
-        falls below this (i.e. the majority of frames disagree).
-
-    Returns
-    -------
-    pd.DataFrame, one row per wave:
-        wave_id, label, orientation_deg, azimuth_deg, expected_sign
-        (+1/-1, what ``azimuth_deg`` implies for sign(ω)), n_valid_frames,
-        frac_matching (fraction of valid frames agreeing with
-        expected_sign), suggested_azimuth_deg (``orientation_deg`` or
-        ``orientation_deg + 180``, whichever the *measured* ω sign
-        majority actually supports), flagged (bool).
-    """
-    rows = []
-    for wi, wave in enumerate(waves_detected):
-        orient = float(wave["orientation_deg"]) % 360.0
-        az     = float(wave["azimuth"]) % 360.0
-        diff   = circular_diff_deg(az, orient)          # [-180, 180)
-        expected_sign = 1 if abs(diff) < 90.0 else -1
-
-        wdf = kf_results[
-            (kf_results["wave_id"] == wi) & kf_results["innovation_valid"]
-        ]
-        omega = wdf["kf_omega_rads"].values
-        omega = omega[np.isfinite(omega) & (omega != 0.0)]
-        n = len(omega)
-
-        if n == 0:
-            rows.append(dict(
-                wave_id=wi, label=wave["label"], orientation_deg=orient,
-                azimuth_deg=az, expected_sign=expected_sign,
-                n_valid_frames=0, frac_matching=np.nan,
-                suggested_azimuth_deg=np.nan, flagged=False,
-            ))
-            continue
-
-        measured_sign = 1 if np.sum(omega > 0) >= np.sum(omega < 0) else -1
-        frac_matching = float(np.mean(np.sign(omega) == expected_sign))
-        flagged = (n >= min_valid_frames) and (frac_matching < flip_threshold)
-        suggested_az = orient if measured_sign == 1 else (orient + 180.0) % 360.0
-
-        rows.append(dict(
-            wave_id=wi, label=wave["label"], orientation_deg=orient,
-            azimuth_deg=az, expected_sign=expected_sign,
-            n_valid_frames=n, frac_matching=frac_matching,
-            suggested_azimuth_deg=suggested_az, flagged=flagged,
-        ))
-
-    df = pd.DataFrame(rows)
-
-    if verbose:
-        print("\nAZIMUTH-SIGN VALIDATION (fixed wave['azimuth'] vs measured KF omega sign)")
-        print("-" * 70)
-        any_flagged = False
-        for _, r in df.iterrows():
-            if r["n_valid_frames"] == 0:
-                print(f"  {r['label']}: no valid frames -- skipped")
-                continue
-            flag_str = ""
-            if r["flagged"]:
-                any_flagged = True
-                flag_str = (f"  <-- SUSPECT: majority of frames disagree; "
-                            f"measured direction looks like "
-                            f"{r['suggested_azimuth_deg']:.1f} deg, "
-                            f"not the labeled {r['azimuth_deg']:.1f} deg")
-            print(f"  {r['label']}: az={r['azimuth_deg']:.1f} deg  "
-                  f"match={100*r['frac_matching']:.0f}% of {r['n_valid_frames']} "
-                  f"valid frames{flag_str}")
-        if any_flagged:
-            print("\n  NOTE: flagged waves' kf_prop_azimuth_deg / kf_orient_deg are "
-                  "anchored to a fixed azimuth that this night's own KF measurements "
-                  "persistently contradict -- treat those families' direction labels "
-                  "with caution until the root cause is fixed.")
-        print("=" * 70)
-
-    return df
-
-
-# ---------------------------------------------------------------------------
 # Post-hoc cross-wave collision detection
 # ---------------------------------------------------------------------------
-
-def flag_kf_wave_collisions_by_correlation(
-    kf_results: pd.DataFrame,
-    waves_detected: list,
-    waves_kf: list,
-    wave_cubes_kf: list,
-    time_vals: np.ndarray,
-    corr_threshold: float = 0.7,
-    smoothing_window: int = 5,
-    min_episode_frames: int = 3,
-    dir_tol_deg: float = 22.5,
-    lambda_tol_km: float = 20.0,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """
-    Flag periods where two or more waves' KF-refined second-pass Gabor
-    reconstructions are essentially reconstructing the same physical
-    structure -- the same failure mode flag_kf_wave_collisions (parameter-
-    tolerance based) targeted, but detected directly from the reconstructed
-    fields instead of from orientation/wavelength distance.
-
-    Comparing kf_orient_deg/kf_lambda_km against fixed tolerances (the
-    previous approach) has two blind spots: it isn't scale-aware (a fixed
-    lambda_tol_km is a huge relative tolerance for a short wave and a tiny
-    one for a long wave), and it ignores phase -- two waves can sit just
-    outside the numeric tolerance while their actual reconstructed spatial
-    fields are nearly identical, or have similar orientation/wavelength by
-    coincidence while being spatially distinct. Cross-correlating
-    wave_cubes_kf directly (same per-frame Pearson r used by
-    gabor_reconstruction.check_duplicate_waves, here resolved per-frame
-    instead of averaged over the whole night) measures the thing that
-    actually matters: are two waves painting the same picture.
-
-    Must run AFTER the second-pass reconstruction (wave_cubes_kf has to
-    exist), unlike the old parameter-based check which only needed
-    kf_results and so could run before it.
-
-    Resolution is done in two stages, same rationale as the previous
-    version (avoid frame-by-frame flip-flopping over which wave "wins"):
-
-    1. Each pair's per-frame Pearson r is smoothed with a rolling mean
-       before thresholding; smoothed-collision runs shorter than
-       min_episode_frames are discarded as noise.
-    2. Per frame, waves connected by a smoothed r >= corr_threshold are
-       grouped via connected components -- not pairwise-only, so a three
-       (or more)-way collision (e.g. four waves all correlating with their
-       neighbors around the same k-space region) resolves as one group
-       instead of overlapping independent pairs. A run of frames keeps its
-       episode identity only while the group's exact membership is stable;
-       a member joining or leaving closes the old episode and opens a new
-       one. Within each episode, ONE wave is judged primary: whichever
-       stayed closest, averaged over the episode, to its own founding
-       parameters (waves_detected[i]['orientation_deg']/['wavelength_km']).
-       dir_tol_deg/lambda_tol_km are used only to normalize orientation vs.
-       wavelength distance onto comparable scales for that tie-break --
-       they no longer gate collision detection itself.
-
-    Purely informational: returns a copy of kf_results with new columns;
-    the caller (airglow_pipeline.py Step 8b / notebook Section 12) is
-    responsible for acting on collision_primary if it wants to suppress the
-    losing wave's contribution to composite_kf.
-
-    Parameters
-    ----------
-    kf_results : pd.DataFrame
-        Output of analyze_all_waves_kalman().
-    waves_detected : list of dict
-        For wave['label'] (printed summary) and founding
-        wave['orientation_deg']/['wavelength_km'] (primary tie-break).
-    waves_kf : list of dict
-        Per-wave dicts with 'orientation_deg_series'/'wavelength_km_series'
-        (n_time,) arrays on the full night grid -- the same dicts already
-        built for reconstruct_all_waves() in Step 8b/Section 12.
-    wave_cubes_kf : list of np.ndarray, each (n_time, ny, nx)
-        Output of reconstruct_all_waves() for the second pass.
-    time_vals : np.ndarray of datetime64
-        Full night time grid, same length/order as wave_cubes_kf[i].
-    corr_threshold : float
-        Smoothed per-frame Pearson r at or above which two waves are
-        considered to be reconstructing the same structure. Default 0.7,
-        not 0.5 (gabor_reconstruction.check_duplicate_waves's default,
-        which averages r over the whole night rather than gating per
-        frame) -- calibrated empirically on real data: at 0.5, transient
-        excursions in genuinely-distinct pairs (mean r ~0.3, briefly
-        crossing 0.5 for ~10% of the night) still formed spurious
-        episodes, and connected-components let a moderately-correlated
-        "hub" wave transitively merge otherwise-unrelated waves into
-        oversized groups. At 0.7 (just above the observed p99 of ~0.68
-        across all pairs x frames), only genuinely persistent duplicates
-        cross threshold.
-    smoothing_window : int
-        Rolling-mean window (frames) applied to each pair's correlation
-        time series before thresholding.
-    min_episode_frames : int
-        Minimum contiguous frames of stable group membership to count as a
-        real episode rather than a noise blip.
-    dir_tol_deg, lambda_tol_km : float
-        Normalization scale for combining orientation and wavelength
-        distance in the primary tie-break (not a detection threshold).
-    verbose : bool
-        Print a summary of detected episodes.
-
-    Returns
-    -------
-    kf_results : pd.DataFrame
-        Copy of the input with four new columns:
-            collision_id           -- int, unique per episode; -1 where
-                                       not in collision.
-            collision_group_wave_ids -- str, comma-separated wave labels in
-                                       this episode's group; "" where not
-                                       in collision.
-            collision_primary      -- bool, True if this wave is judged
-                                       the "real" one for its episode
-                                       (always True where not in collision).
-            collision_primary_wave_id -- int, wave_id of whoever won this
-                                       row's episode (same value for every
-                                       member, winner or not); -1 where not
-                                       in collision. Lets a caller label a
-                                       suppressed frame with which family it
-                                       was folded into.
-    """
-    df = kf_results.copy()
-    df["collision_id"] = -1
-    df["collision_group_wave_ids"] = ""
-    df["collision_primary_wave_id"] = -1
-    df["collision_primary"] = True
-
-    n = len(waves_detected)
-    if n < 2 or len(wave_cubes_kf) < 2:
-        if verbose:
-            print("No KF collision check: fewer than 2 waves.")
-        return df
-
-    n_time = wave_cubes_kf[0].shape[0]
-
-    # ── Per-pair smoothed correlation time series ───────────────────────────
-    smoothed = {}
-    for i in range(n):
-        for j in range(i + 1, n):
-            cube_i, cube_j = wave_cubes_kf[i], wave_cubes_kf[j]
-            raw = np.full(n_time, np.nan)
-            for t in range(n_time):
-                a, b = cube_i[t].ravel(), cube_j[t].ravel()
-                if not (np.any(a) and np.any(b)):
-                    continue
-                m = np.isfinite(a) & np.isfinite(b)
-                if m.sum() > 1:
-                    r, _ = pearsonr(a[m], b[m])
-                    if np.isfinite(r):
-                        raw[t] = r
-            smoothed[(i, j)] = (
-                pd.Series(raw).rolling(window=smoothing_window, min_periods=1).mean().to_numpy()
-            )
-
-    # ── Per-frame connected components on the correlation graph ────────────
-    all_ids = list(range(n))
-
-    def _components(edges):
-        parent = {wid: wid for wid in all_ids}
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
-        for a, b in edges:
-            union(a, b)
-        groups = {}
-        for wid in all_ids:
-            groups.setdefault(find(wid), set()).add(wid)
-        return [frozenset(g) for g in groups.values() if len(g) >= 2]
-
-    frame_groups = []
-    for t in range(n_time):
-        edges = [pair for pair, s in smoothed.items()
-                 if np.isfinite(s[t]) and s[t] >= corr_threshold]
-        frame_groups.append(set(_components(edges)))
-
-    # ── Episode detection: a group keeps its identity only while its exact
-    #    membership is stable; joining/leaving starts a new episode. ───────
-    episodes = []
-    open_eps = {}
-    for t in range(n_time + 1):
-        active = frame_groups[t] if t < n_time else set()
-        for g in list(open_eps.keys()):
-            if g not in active:
-                start = open_eps.pop(g)
-                if t - start >= min_episode_frames:
-                    episodes.append((g, start, t - 1))
-        for g in active:
-            if g not in open_eps:
-                open_eps[g] = t
-
-    if not episodes:
-        if verbose:
-            print(f"No correlation-based KF collisions detected (threshold={corr_threshold:.2f}).")
-        return df
-
-    # ── Resolve primary per episode, write back into kf_results ────────────
-    def _circ_diff_180(a, b):
-        d = np.abs(a - b) % 180.0
-        return np.minimum(d, 180.0 - d)
-
-    label_map = {i: w["label"] for i, w in enumerate(waves_detected)}
-    _t_full_ns = time_vals.astype("datetime64[ns]").astype(np.int64)
-
-    next_cid = 0
-    printed = []
-    for group, t_start, t_end in episodes:
-        seg = slice(t_start, t_end + 1)
-        dists = {}
-        for wid in group:
-            gi  = float(waves_detected[wid]["orientation_deg"]) % 180.0
-            gli = float(waves_detected[wid]["wavelength_km"])
-            oi  = waves_kf[wid]["orientation_deg_series"][seg]
-            li  = waves_kf[wid]["wavelength_km_series"][seg]
-            d = np.nanmean(_circ_diff_180(oi % 180.0, gi) / dir_tol_deg
-                            + np.abs(li - gli) / lambda_tol_km)
-            dists[wid] = d if np.isfinite(d) else np.inf
-        primary = min(dists, key=dists.get)
-
-        cid = next_cid
-        next_cid += 1
-        group_str = ", ".join(label_map[w] for w in sorted(group))
-        printed.append((group, t_start, t_end, primary))
-
-        for wid in group:
-            wmask = (df["wave_id"] == wid).to_numpy()
-            wtimes_ns = pd.to_datetime(df.loc[wmask, "time"].values).astype(np.int64)
-            kf_idx = np.searchsorted(_t_full_ns, wtimes_ns).clip(0, n_time - 1)
-            match = np.abs(_t_full_ns[kf_idx] - wtimes_ns) < int(1e9)
-            in_episode = match & (kf_idx >= t_start) & (kf_idx <= t_end)
-            idx = df.index[wmask][in_episode]
-            df.loc[idx, "collision_id"] = cid
-            df.loc[idx, "collision_group_wave_ids"] = group_str
-            df.loc[idx, "collision_primary"] = (wid == primary)
-            df.loc[idx, "collision_primary_wave_id"] = primary
-
-    if verbose:
-        print(f"WARNING: {len(episodes)} correlation-based KF collision episode(s) "
-              f"detected (threshold={corr_threshold:.2f}):")
-        for group, t_start, t_end, primary in printed:
-            members = ", ".join(label_map[w] for w in sorted(group))
-            print(f"  {{{members}}}  frames {t_start}-{t_end} ({t_end - t_start + 1} frames) "
-                  f"-- kept {label_map[primary]}")
-
-    return df
-
-    return df
 
 
 # ---------------------------------------------------------------------------
@@ -1674,7 +1285,8 @@ def compute_binned_wave_stats(
     kf_results : pd.DataFrame
         Output of ``analyze_all_waves_kalman``.  Must contain columns
         ``wave_id``, ``time``, ``wave_active``, ``kf_wavespeed_ms``,
-        ``kf_orient_deg``, ``activity_fraction``.
+        ``kf_orient_deg``, ``activity_fraction``, ``kf_prop_azimuth_deg``,
+        ``amplitude``.
     bin_width_min : int
         Temporal bin width in minutes.  Default 60.
     min_valid_frames : int
@@ -1686,10 +1298,44 @@ def compute_binned_wave_stats(
     pd.DataFrame with columns: wave_id, bin_start, bin_end,
     n_frames_total, n_frames_active, duty_cycle, mean_speed_ms,
     std_speed_ms, mean_orient_deg, std_orient_deg, mean_activity,
-    insufficient_data.
+    mean_lambda_km, std_lambda_km, final_azimuth_deg,
+    kf_wavelength_km_ampwt, kf_wavelength_km_ampwt_std,
+    kf_wavespeed_ms_ampwt, kf_wavespeed_ms_ampwt_std, insufficient_data.
+
+    ``final_azimuth_deg`` is ``wave['azimuth']`` (fixed, full-circle, from the
+    original ω-k detection, exposed here via the ``kf_prop_azimuth_deg``
+    column, which is that same value carried through unchanged) — repeated
+    identically across every bin for a given wave, since it is not itself
+    binned or aggregated. **This is the source of truth for propagation
+    direction.** ``mean_orient_deg`` (the per-bin circular mean of the
+    dynamic, KF-tracked ``kf_orient_deg``) is a useful cross-check but is
+    NOT a substitute for it — comparing wave['azimuth'] against
+    kf_omega_rads's sign as if the latter carried independent direction
+    information was tried, found unsound, and removed; see
+    ``SIGN_DISAGREEMENT_SYNTHETIC_SWEEP.md`` for the full diagnosis. Do not
+    reintroduce that comparison here.
+
+    ``kf_wavelength_km_ampwt``/``kf_wavespeed_ms_ampwt`` (and their ``_std``
+    companions) are amplitude-weighted versions of ``mean_lambda_km``/
+    ``mean_speed_ms``, over the same active-frame set, weighting each frame
+    by its own ``amplitude`` (an SNR proxy) so stronger detections count more.
+    Additive only — the existing plain-mean columns are unchanged.
     """
     if len(kf_results) == 0:
         return pd.DataFrame()
+
+    def _weighted_mean_std(values, weights):
+        """Amplitude-weighted mean/std, ignoring non-finite or non-positive weights."""
+        ok = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+        if not np.any(ok):
+            return np.nan, np.nan
+        v, w = values[ok], weights[ok]
+        wsum = w.sum()
+        wmean = float(np.sum(w * v) / wsum)
+        if len(v) < 2:
+            return wmean, np.nan
+        wstd = float(np.sqrt(np.sum(w * (v - wmean) ** 2) / wsum))
+        return wmean, wstd
 
     bin_width = pd.Timedelta(minutes=bin_width_min)
 
@@ -1714,6 +1360,13 @@ def compute_binned_wave_stats(
     for wave_id in wave_ids:
         wdf = kf_results[kf_results['wave_id'] == wave_id].copy()
         wdf['time_pd'] = pd.to_datetime(wdf['time'])
+
+        # Fixed per wave (not binned) -- wave['azimuth'], carried through
+        # unchanged as kf_prop_azimuth_deg. Source of truth for direction;
+        # see the docstring note above before using anything else for this.
+        _az_vals = wdf['kf_prop_azimuth_deg'].dropna().values if \
+            'kf_prop_azimuth_deg' in wdf.columns else np.array([])
+        final_az = float(_az_vals[0]) if len(_az_vals) > 0 else np.nan
 
         for bin_start in bin_starts:
             bin_end = bin_start + bin_width
@@ -1744,6 +1397,11 @@ def compute_binned_wave_stats(
                     'mean_activity':   np.nan,
                     'mean_lambda_km':  np.nan,
                     'std_lambda_km':   np.nan,
+                    'final_azimuth_deg': final_az,
+                    'kf_wavelength_km_ampwt':     np.nan,
+                    'kf_wavelength_km_ampwt_std': np.nan,
+                    'kf_wavespeed_ms_ampwt':      np.nan,
+                    'kf_wavespeed_ms_ampwt_std':  np.nan,
                     'insufficient_data': True,
                 })
             else:
@@ -1764,6 +1422,17 @@ def compute_binned_wave_stats(
                 lam_mean = float(np.mean(lam_finite))   if len(lam_finite) > 0 else np.nan
                 lam_std  = float(np.std(lam_finite))    if len(lam_finite) > 1 else np.nan
 
+                # Amplitude-weighted wavelength/speed -- additive alongside the
+                # plain means above, weighting each frame by its own amplitude
+                # (SNR proxy) so stronger detections count more. Same
+                # active-frame set as the plain-mean columns.
+                amp_vals = active_frames['amplitude'].values \
+                    if 'amplitude' in active_frames.columns \
+                    else np.full(len(active_frames), np.nan)
+
+                lam_ampwt_mean, lam_ampwt_std = _weighted_mean_std(lam_vals, amp_vals)
+                spd_ampwt_mean, spd_ampwt_std = _weighted_mean_std(spd, amp_vals)
+
                 rows.append({
                     'wave_id':         wave_id,
                     'bin_start':       bin_start,
@@ -1778,6 +1447,11 @@ def compute_binned_wave_stats(
                     'mean_activity':   float(np.nanmean(act)),
                     'mean_lambda_km':  lam_mean,
                     'std_lambda_km':   lam_std,
+                    'final_azimuth_deg': final_az,
+                    'kf_wavelength_km_ampwt':     lam_ampwt_mean,
+                    'kf_wavelength_km_ampwt_std': lam_ampwt_std,
+                    'kf_wavespeed_ms_ampwt':      spd_ampwt_mean,
+                    'kf_wavespeed_ms_ampwt_std':  spd_ampwt_std,
                     'insufficient_data': False,
                 })
 
@@ -1785,6 +1459,66 @@ def compute_binned_wave_stats(
         return pd.DataFrame()
 
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Fully-suppressed-wave audit log
+# ---------------------------------------------------------------------------
+
+def build_kf_merge_log(kf_results: pd.DataFrame, night) -> pd.DataFrame:
+    """
+    One row per wave_id that is fully suppressed for this night -- i.e. it
+    has zero ``collision_primary == True`` frames despite having existed as
+    a detected family (``collision_primary`` defaults True for any frame
+    not involved in a losing collision, so this only fires for a wave that
+    lost every single collision episode it was ever part of, for its entire
+    lifetime).
+
+    Why this table exists: ``compute_binned_wave_stats`` is always called on
+    ``collision_primary``-filtered data (by design -- see its own docstring),
+    so a fully-suppressed wave_id is silently absent from ``kf_binned.csv``
+    with no way to tell "never detected" apart from "detected but fully
+    suppressed." This makes that resolution auditable without changing
+    ``compute_binned_wave_stats`` itself.
+
+    Parameters
+    ----------
+    kf_results : pd.DataFrame
+        The FULL (unfiltered) output of ``analyze_all_waves_kalman``, with
+        collision columns (``collision_primary`` etc.) merged in. Do not
+        pre-filter to ``collision_primary == True`` before calling this --
+        every fully suppressed wave would already be invisible.
+    night : any
+        Night/run identifier to stamp on every row (e.g. ``stem`` or a date).
+        Not derived from ``kf_results`` itself, which carries no such column.
+
+    Returns
+    -------
+    pd.DataFrame with columns: night, wave_id, merged_into_wave_id, n_frames.
+    Empty (but correctly-columned) DataFrame if no wave was fully suppressed.
+    """
+    cols = ['night', 'wave_id', 'merged_into_wave_id', 'n_frames']
+    if len(kf_results) == 0 or 'collision_primary' not in kf_results.columns:
+        return pd.DataFrame(columns=cols)
+
+    rows = []
+    for wave_id in sorted(kf_results['wave_id'].unique()):
+        wdf = kf_results[kf_results['wave_id'] == wave_id]
+        n_total = len(wdf)
+        if n_total == 0 or bool(wdf['collision_primary'].any()):
+            continue  # never detected, or at least sometimes its own primary
+
+        target_ids = wdf.loc[~wdf['collision_primary'], 'collision_primary_wave_id']
+        target_ids = target_ids.dropna()
+        target_ids = target_ids[target_ids >= 0]
+        merged_into = int(target_ids.mode().iloc[0]) if len(target_ids) > 0 else -1
+
+        rows.append(dict(
+            night=night, wave_id=wave_id,
+            merged_into_wave_id=merged_into, n_frames=n_total,
+        ))
+
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
 
 # ---------------------------------------------------------------------------
