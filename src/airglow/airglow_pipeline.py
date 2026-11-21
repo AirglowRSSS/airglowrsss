@@ -161,7 +161,7 @@ def _load_real_data(
     dx_km : float
         Mean isotropic pixel spacing in km.
     """
-    import airglow.Karthik_Test_Mango_L2_1 as MANGO_L2
+    import airglow.MANGO_L2 as MANGO_L2
     import airglow.prepare_agimages as prepare_agimages
 
     # ── Load HDF5 ─────────────────────────────────────────────────────────────

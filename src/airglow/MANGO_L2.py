@@ -1,10 +1,6 @@
-# At the very top, before any other imports
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-import warnings
-warnings.filterwarnings('ignore', category=UserWarning, module='google.protobuf')
-
+import re
+import urllib.request
 import matplotlib.pyplot as plt
 import xarray as xr
 import h5py
@@ -23,32 +19,81 @@ from skimage.feature import peak_local_max
 import numpy as np
 import datetime
 
-import tensorflow as tf
-import joblib
-IMG_SIZE = (64, 64)  # Resize images to a manageable size
-SEQUENCE_LENGTH = 10  # Number of frames in each sequence
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, LSTM, TimeDistributed, Dense
-from tensorflow.keras.models import Sequential
-from sklearn.cluster import KMeans
-from sklearn.manifold import TSNE
+MANGO_ARCHIVE_URL = 'https://data.mangonetwork.org/data/transport/mango/archive'
 
-def runcmd(cmd, verbose = False, *args, **kwargs):
-# Runs a commond line command (useful for downloading data)
+def runcmd(cmd, verbose=False):
+# Runs a command line command (useful for downloading data)
 # From https://www.scrapingbee.com/blog/python-wget/
+#
+# OUTPUTS:
+#   (stdout, stderr) of the command; stdout is None if the command failed
 
-    process = subprocess.Popen(
-        cmd,
-        stdout = subprocess.PIPE,
-        stderr = subprocess.PIPE,
-        text = True,
-        shell = True
-    )
-    std_out, std_err = process.communicate()
-    if verbose:
-        print(std_out.strip(), std_err)
-    pass
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if verbose:
+            print(result.stdout.strip())
+            print(result.stderr.strip())
+        return result.stdout.strip(), result.stderr.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Command '{cmd}' failed with error: {e.stderr}")
+        return None, e.stderr
 
-def load_hdf5_to_xarray(file_path, kernel_size=7, runClassifier = False):
+def download_mango_L1(site, emission, date, asi_directory=None):
+# Download the MANGO level-1 files for one site, emission and night from the MANGO archive
+#
+# INPUTS:
+#   site - MANGO site abbreviation of interest (e.g., "low")
+#   emission - emission of interest ('green' or 'red')
+#   date - datetime object giving the date of interest
+#   asi_directory - (optional) directory the data are downloaded to, in {site}/{year}/{doy}/ below it
+#                   (default: the current directory)
+#
+# OUTPUTS:
+#   downloaded_files - list of the .hdf5 files in the target directory (helpful for later cleanup).
+#                      Files already present are not downloaded again.
+
+    if asi_directory is None:
+        asi_directory = './'
+
+    emission_path = 'greenline' if emission == 'green' else 'redline'
+    target_directory = os.path.join(asi_directory, site, str(date.year), date.strftime('%j'))
+    os.makedirs(target_directory, exist_ok=True)
+
+    # The archive serves a directory listing for each night; download every .hdf5 file it links to
+    url = f'{MANGO_ARCHIVE_URL}/{site}/{emission_path}/level1/{date.year}/{date.strftime("%j")}/'
+    print(url)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            listing = response.read().decode('utf-8', errors='replace')
+    except OSError as e:
+        print(f'Could not read {url}: {e}')
+        listing = ''
+
+    for name in sorted(set(re.findall(r'href="([^"/]+\.hdf5)"', listing))):
+        path = os.path.join(target_directory, name)
+        if not os.path.exists(path):
+            try:
+                urllib.request.urlretrieve(url + name, path + '.part')
+                os.replace(path + '.part', path)
+            except OSError as e:
+                print(f'Could not download {url + name}: {e}')
+
+    downloaded_files = []
+    for root, dirs, files in os.walk(target_directory):
+        for file in files:
+            if file.endswith('.hdf5'):
+                downloaded_files.append(os.path.join(root, file))
+
+    return downloaded_files
+
+def load_hdf5_to_xarray(file_path, kernel_size=7):
 # Function to load data from HDF5 file into xarray DataArrays
 # 
 # Input:
@@ -70,58 +115,7 @@ def load_hdf5_to_xarray(file_path, kernel_size=7, runClassifier = False):
 #           Elevation (float) - elevation for each pixel, in deg (dims: north, east)
 #           Latitude (float) - latitude for each pixel, in deg N (dims: north, east)
 #           Longitude (float) - longtitude for each pixel, in deg E (dims: north, east)
-#           CCDTemperature (float) - CCD temperature, in C (dim: time)
-
-#    # Read in the HDF5 file into a temporary array
-#    data_arrays = {}
-#    with h5py.File(file_path, 'r') as hdf:
-#        for key in hdf.keys():
-#            # Check if the item is a dataset
-#            if isinstance(hdf[key], h5py.Dataset):
-#                # Load the dataset into an xarray DataArray
-#                data_arrays[key] = xr.DataArray(hdf[key][...], name=key)
-#
-#    # Convert Unix times to datetime objects
-#    unix_times_start = data_arrays['UnixTime'][0].values
-#    start_times = pd.to_datetime(unix_times_start, unit='s', utc=True)
-#    
-#    unix_times_stop = data_arrays['UnixTime'][1].values
-#    stop_times = pd.to_datetime(unix_times_stop, unit='s', utc=True)
-#    
-#    # Calculate integration time and ensure it's a float
-#    integration_time_values = (stop_times - start_times).total_seconds()
-#    integration_time_values = integration_time_values.astype(float)
-#    
-#    # Ensure 'time' is numpy.datetime64
-#    start_times_np = np.array(start_times, dtype='datetime64[ns]')
-#
-#    # Rename the dimensions of the ImageData
-#    image_data = data_arrays['ImageData'].rename({'dim_0': 'time', 'dim_1': 'north', 'dim_2': 'east'})
-#    image_data.attrs['description'] = 'Pixel values of image at each time step'
-#
-#    # Process other variables
-#    azimuth = data_arrays['Azimuth'].rename({'dim_0': 'north', 'dim_1': 'east'})
-#    azimuth.attrs['units'] = 'Degrees'
-#    azimuth.attrs['description'] = 'Azimuth of each pixel'
-#    elevation = data_arrays['Elevation'].rename({'dim_0': 'north', 'dim_1': 'east'})
-#    elevation.attrs['units'] = 'Degrees'
-#    elevation.attrs['description'] = 'Elevation of each pixel'
-#    latitude = data_arrays['Latitude'].rename({'dim_0': 'north', 'dim_1': 'east'})
-#    latitude.attrs['units'] = 'Degrees N'
-#    latitude.attrs['description'] = 'Geodetic latitude of each pixel'
-#    longitude = data_arrays['Longitude'].rename({'dim_0': 'north', 'dim_1': 'east'})
-#    longitude.attrs['units'] = 'Degrees E'
-#    longitude.attrs['description'] = 'Geodetic longitude of each pixel'
-#    CCDTemperature = data_arrays['CCDTemperature'].rename({'dim_0': 'time'})
-#    CCDTemperature.attrs['units'] = 'Celcius'
-#    CCDTemperature.attrs['description'] = 'Temperature of CCD'
-#
-#    north_array = xr.DataArray(data_arrays['PixelCoordinates'][0][0,:], dims=('north'))
-#    north_array.attrs['units'] = 'km'
-#    north_array.attrs['description'] = 'Distance in north direction from site at airglow layer'
-#    east_array = xr.DataArray(data_arrays['PixelCoordinates'][1][:,0], dims=('east'))
-#    east_array.attrs['units'] = 'km'
-#    east_array.attrs['description'] = 'Distance in east direction from site at airglow layer'
+#           CCDTemperature (float) - CCD temperature, in C (dim: time); only if the file has it
 
     # Read in the HDF5 file into a temporary array
     data_arrays = {}
@@ -155,17 +149,12 @@ def load_hdf5_to_xarray(file_path, kernel_size=7, runClassifier = False):
                 'PixelCoordinates': 'Coordinates/PixelCoordinates'
             }
     
-        # Load datasets using the appropriate paths
+        # Load datasets using the appropriate paths. CCDTemperature is optional; the rest are required.
         for logical_name, hdf_path in key_mapping.items():
             if hdf_path in hdf and isinstance(hdf[hdf_path], h5py.Dataset):
                 data_arrays[logical_name] = xr.DataArray(hdf[hdf_path][...], name=logical_name)
-
-#    # Convert Unix times to datetime objects
-#    unix_times_start = data_arrays['UnixTime'][0].values
-#    start_times = pd.to_datetime(unix_times_start, unit='s', utc=True)
-#
-#    unix_times_stop = data_arrays['UnixTime'][1].values
-#    stop_times = pd.to_datetime(unix_times_stop, unit='s', utc=True)
+            elif logical_name != 'CCDTemperature':
+                raise KeyError(f"Required dataset '{hdf_path}' not found in {file_path}")
 
     # Convert Unix times to datetime objects
     if is_old_format:
@@ -191,7 +180,7 @@ def load_hdf5_to_xarray(file_path, kernel_size=7, runClassifier = False):
     image_data = data_arrays['ImageData'].rename({'dim_0': 'time', 'dim_1': 'north', 'dim_2': 'east'})
     image_data.attrs['description'] = 'Pixel values of image at each time step'
 
-    # Process other variables (rest of code unchanged)
+    # Process other variables
     azimuth = data_arrays['Azimuth'].rename({'dim_0': 'north', 'dim_1': 'east'})
     azimuth.attrs['units'] = 'Degrees'
     azimuth.attrs['description'] = 'Azimuth of each pixel'
@@ -208,72 +197,53 @@ def load_hdf5_to_xarray(file_path, kernel_size=7, runClassifier = False):
     longitude.attrs['units'] = 'Degrees E'
     longitude.attrs['description'] = 'Geodetic longitude of each pixel'
 
-    CCDTemperature = data_arrays['CCDTemperature'].rename({'dim_0': 'time'})
-    CCDTemperature.attrs['units'] = 'Celcius'
-    CCDTemperature.attrs['description'] = 'Temperature of CCD'
+    # PixelCoordinates is (2, north, east): [0] holds X (east) and varies along the east axis,
+    # [1] holds Y (north) and varies along the north axis (attribute 'Size': '2 (X,Y) x Ipixels x Jpixels')
+    pixel_coords = data_arrays['PixelCoordinates'].values
 
-    north_array = xr.DataArray(data_arrays['PixelCoordinates'][0][0,:], dims=('north'))
+    north_array = xr.DataArray(pixel_coords[1, :, 0], dims=('north'))
     north_array.attrs['units'] = 'km'
     north_array.attrs['description'] = 'Distance in north direction from site at airglow layer'
 
-    east_array = xr.DataArray(data_arrays['PixelCoordinates'][1][:,0], dims=('east'))
+    east_array = xr.DataArray(pixel_coords[0, 0, :], dims=('east'))
     east_array.attrs['units'] = 'km'
     east_array.attrs['description'] = 'Distance in east direction from site at airglow layer'
 
-    # Apply median filter to each image
+    # Apply median filter to each image and replace NaN values with 0.
+    # TODO: zero-filling NaN pixels (e.g., outside the field of view) is a choice to investigate;
+    # keeping them as NaN may be better for later steps that average or Fourier transform the images.
     im_ds = []
     for id in image_data:
-        temp = xr.DataArray(medfilt2d(id,kernel_size=kernel_size), dims=('north','east'))
+        filtered_img = np.nan_to_num(medfilt2d(id, kernel_size=kernel_size), nan=0.0)
+        temp = xr.DataArray(filtered_img, dims=('north','east'))
         im_ds.append(temp)
 
     combined = xr.concat(im_ds, dim=('time'))
-    combined.attrs['description'] = 'Pixel values of image at each time step after 7x7 median filter'
+    combined.attrs['description'] = (f'Pixel values of image at each time step after {kernel_size}x{kernel_size} '
+                                     'median filter (NaN values replaced with 0)')
 
     integration_time = xr.DataArray(integration_time_values, coords={'time': start_times_np}, dims=('time'))
     integration_time.attrs['units'] = 's'
     integration_time.attrs['description'] = 'Integration time of the image'
 
     # Create xarray Dataset
-    ds = xr.Dataset({'integration_time': integration_time,
-                    'ImageData': combined,
-                    'Azimuth': azimuth,
-                    'Elevation': elevation,
-                    'Latitude': latitude,
-                    'Longitude': longitude,
-                    'CCDTemperature': CCDTemperature,
-                    'east': east_array,
-                    'north': north_array})
+    variables = {'integration_time': integration_time,
+                 'ImageData': combined,
+                 'Azimuth': azimuth,
+                 'Elevation': elevation,
+                 'Latitude': latitude,
+                 'Longitude': longitude,
+                 'east': east_array,
+                 'north': north_array}
 
-    if runClassifier is True:
-        # Find the square inscribed in the circle. The side of the square that can be inscribed
-        # in a circle of radius r is sqrt(2)*r. Fine the smallest dimension in the east and north
-        # arrays and use that as the radius. May need to tweak this for imagers that have obstructions
-        # above el_cutoff
-        mask = ds.Elevation > 20.
-        min_r = np.min([np.abs(ds.east.where(mask)).max(),np.abs(ds.north.where(mask)).max()])-100
-        r = np.floor(np.sqrt(2)*min_r/2.)
-        subset = ds.sel(east=slice(-r,r), north=slice(-r,r))
+    if 'CCDTemperature' in data_arrays:
+        CCDTemperature = data_arrays['CCDTemperature'].rename({'dim_0': 'time'})
+        CCDTemperature.attrs['units'] = 'Celsius'
+        CCDTemperature.attrs['description'] = 'Temperature of CCD'
+        variables['CCDTemperature'] = CCDTemperature
 
-        # Chunk the data into sequences and cluster the data
-        new_data, times = load_image_sequence_time(subset)
-        new_clusters = SequenceClassifier(new_data, times)
-        
-        # Map clusters to labels
-        cluster_to_label = {0: True, 5: False, 1: False, 2: False, 3: False, 4: False}
-        
-        # Initialize the "Useable" variable as all False
-        useable = np.zeros(len(ds.time), dtype=bool)
-        
-        # Iterate over the time intervals and classify
-        for cluster, (start, stop) in zip(new_clusters, times):
-            start = np.datetime64(start)  # Convert to numpy.datetime64
-            stop = np.datetime64(stop)   # Convert to numpy.datetime64
-            mask = (ds.time >= start) & (ds.time <= stop)
-            useable[mask] = cluster_to_label[cluster]
-        
-        # Add the "Useable" variable to the dataset
-        ds = ds.assign(Useable=("time", useable))
-    
+    ds = xr.Dataset(variables)
+
     return ds
 
 def load_cloud_and_moon(analysis_parameters, times):
@@ -329,6 +299,9 @@ def load_cloud_and_moon(analysis_parameters, times):
     if len(dns) > 0:
         cloud_df = pd.DataFrame(np.array([dns,sky_temp]).T, columns=['LT','Cloud Temperature'])
         cloud_df.index = pd.to_datetime(dns)
+        if cloud_df.index.tz is None:
+            # Naive times are taken to be UTC
+            cloud_df.index = cloud_df.index.tz_localize(pytz.utc)
         cloud_df.index = cloud_df.index.tz_convert(pytz.utc)
     else:
         # No cloud data
@@ -343,8 +316,9 @@ def load_cloud_and_moon(analysis_parameters, times):
     # Merge the cloud data onto the image data. This is done by finding the previous measurement
     # in cloud_df. May want to look into some sort of interpolation scheme?
     
-    # results_df = pd.merge_asof(image_df, cloud_df, left_index=True, right_index=True,
-                                    # tolerance=pd.Timedelta("60s"),)
+    # merge_asof needs both indexes in the same time unit (pandas >= 3 may infer seconds for one of them)
+    image_df.index = image_df.index.as_unit('ns')
+    cloud_df.index = cloud_df.index.as_unit('ns')
     results_df = pd.merge_asof(image_df, cloud_df.sort_values('LT'), left_index=True, right_index=True,
                                     tolerance=pd.Timedelta("60s"),)
     results_df = results_df.drop(['LT'],axis=1)
@@ -508,45 +482,3 @@ def run_rcp(subset, mask):
             wavespeeds_output.append(np.nan)
 
     return periods_output, wavelengths_output, orientations_output, wavespeeds_output
-
-def SequenceClassifier(new_data, times):
-    # Load the saved model
-    model = tf.keras.models.load_model("CloudClassifier_20241117.keras")
-
-    # Load the trained KMeans clustering model
-    kmeans = joblib.load("kmeans_model_20241117.pkl")
-
-    # Step 2: Predict features using the trained CNN-LSTM model
-    new_features = model.predict(new_data)
-    
-    # Step 3: Use the trained clustering model to classify the new data
-    # (Assuming you have a trained kmeans clustering model from the training phase)
-    new_clusters = kmeans.predict(new_features)
-
-    return new_clusters
-
-def load_image_sequence_time(data_xr, sequence_length=SEQUENCE_LENGTH, img_size=IMG_SIZE):    
-    sequences = []
-    current_sequence = []
-    times = []
-    time_ranges = []
-
-    def format_time(dt64):
-        dt = pd.to_datetime(str(dt64))
-        return dt.strftime('%Y-%m-%d %H:%M:%S')
-    
-    for d in data_xr.ImageData:
-        img = d.data
-#        img = cv2.resize(img, img_size) / img.max()  # Normalize to [0, 1]
-        img = tf.keras.preprocessing.image.img_to_array(img) / img.max()
-        
-        current_sequence.append(img)
-        times.append(format_time(d.time.values))
-        
-        if len(current_sequence) == sequence_length:
-            sequences.append(np.array(current_sequence))
-            time_ranges.append([times[0],times[-1]])
-            current_sequence = []
-            times = []
-    
-    return np.array(sequences), np.array(time_ranges)
